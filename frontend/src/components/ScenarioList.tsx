@@ -26,10 +26,16 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showGuide, setShowGuide] = useState(true);
 
+  const join = (p: string) => {
+    const base = apiBase.endsWith('/') ? apiBase : apiBase + '/';
+    const clean = p.replace(/^\/+/, '');
+    return new URL(clean, base).toString();
+  };
+
   const load = async () => {
     setLoading(true);
     try {
-      const r = await fetch(new URL('/scenarios', apiBase).toString());
+      const r = await fetch(join('/scenarios'));
       const data = (await r.json()) as Scenario[];
       setScenarios(data);
     } catch {}
@@ -40,7 +46,7 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
 
   const saveScenario = async () => {
     const payload: ScenarioCreate = { name, description: desc, details, config_overrides: overrides };
-    const r = await fetch(new URL('/scenarios', apiBase).toString(), {
+    const r = await fetch(join('/scenarios'), {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
     });
     if (r.ok) { await load(); }
@@ -56,7 +62,7 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
       setDetails(s.details ?? '');
       setOverrides({ ...defaultOverrides, ...(s.config_overrides || {}) });
     }
-    const r = await fetch(new URL(`/scenarios/${id}/run`, apiBase).toString(), { method: 'POST' });
+    const r = await fetch(join(`/scenarios/${id}/run`), { method: 'POST' });
     if (r.ok) {
       const body = await r.json();
       onRun(body.id);
@@ -65,7 +71,7 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
 
   const deleteScenario = async (id: string) => {
     if (!confirm('Delete this scenario? This cannot be undone.')) return;
-    const r = await fetch(new URL(`/scenarios/${id}`, apiBase).toString(), { method: 'DELETE' });
+    const r = await fetch(join(`/scenarios/${id}`), { method: 'DELETE' });
     if (r.ok) { await load(); }
   };
 
@@ -127,7 +133,7 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
             <button className="button" onClick={saveScenario}>Save Scenario</button>
             <button className="button" onClick={async () => {
               if (!selectedId) return;
-              const url = new URL(`/scenarios/${selectedId}`, apiBase).toString();
+              const url = join(`/scenarios/${selectedId}`);
               const r = await fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, description: desc, details, config_overrides: overrides }) });
               if (r.ok) { await load(); }
             }} disabled={!selectedId}>Save Changes</button>

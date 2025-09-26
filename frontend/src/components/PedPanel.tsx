@@ -21,10 +21,15 @@ export function PedPanel({ apiBase, runId }: PedPanelProps) {
       return;
     }
     const ac = new AbortController();
+    const join = (p: string) => {
+      const base = apiBase.endsWith('/') ? apiBase : apiBase + '/';
+      const clean = p.replace(/^\/+/, '');
+      return new URL(clean, base).toString();
+    };
     const load = async () => {
       try {
-        const pedUrl = new URL(`/runs/${runId}/ped`, apiBase).toString();
-        const serUrl = new URL(`/runs/${runId}/energy_series?limit=500`, apiBase).toString();
+        const pedUrl = join(`/runs/${runId}/ped`);
+        const serUrl = join(`/runs/${runId}/energy_series?limit=500`);
 
         const [pr, sr] = await Promise.all([
           fetch(pedUrl, { signal: ac.signal }),
@@ -54,7 +59,7 @@ export function PedPanel({ apiBase, runId }: PedPanelProps) {
         setPed(p as PedMetrics);
         setSeries(s);
         if (showDispatch) {
-          const durl = new URL(`/runs/${runId}/optimize`, apiBase).toString();
+          const durl = join(`/runs/${runId}/optimize`);
           const dr = await fetch(durl, { signal: ac.signal });
           if (dr.ok) setDispatch(await dr.json()); else setDispatch(null);
         } else {

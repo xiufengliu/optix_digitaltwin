@@ -7,9 +7,17 @@ import type { SimulationRun, SimulationStatePayload, WebSocketMessage } from './
 
 const DEFAULT_API_BASE = 'http://localhost:8000';
 
-const buildHttpUrl = (path: string, base: string) => new URL(path, base).toString();
+function sanitizeBase(base: string): string {
+  return base.endsWith('/') ? base : base + '/';
+}
+
+const buildHttpUrl = (path: string, base: string) => {
+  const clean = path.replace(/^\/+/, '');
+  return new URL(clean, sanitizeBase(base)).toString();
+};
 const buildWsUrl = (path: string, base: string) => {
-  const url = new URL(path, base);
+  const clean = path.replace(/^\/+/, '');
+  const url = new URL(clean, sanitizeBase(base));
   url.protocol = url.protocol.startsWith('https') ? 'wss:' : 'ws:';
   return url.toString();
 };
@@ -295,7 +303,7 @@ export default function App() {
             onRefresh={loadRuns}
             onDelete={async (runId) => {
               try {
-                const url = new URL(`/runs/${runId}`, apiBase).toString();
+                const url = buildHttpUrl(`/runs/${runId}`, apiBase);
                 const r = await fetch(url, { method: 'DELETE' });
                 if (!r.ok) throw new Error(`Delete failed (${r.status})`);
                 if (selectedRunId === runId) setSelectedRunId(null);
