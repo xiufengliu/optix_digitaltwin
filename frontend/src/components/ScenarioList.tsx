@@ -88,6 +88,37 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
 
   const onChange = (key: string, value: number) => setOverrides({ ...overrides, [key]: value });
 
+  const duplicateScenario = async (id: string) => {
+    const s = scenarios.find((x) => x.id === id);
+    if (!s) return;
+    const payload: ScenarioCreate = { name: `Copy of ${s.name}`.slice(0, 120), description: s.description, details: s.details, config_overrides: s.config_overrides };
+    const r = await fetch(join('/scenarios'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    if (r.ok) await load();
+  };
+
+  const loadCompare = async () => {
+    try {
+      const r = await fetch(join('/runs'));
+      if (!r.ok) return;
+      const runs = await r.json();
+      const top = runs.slice(0, 8);
+      const rows: any[] = [];
+      for (const run of top) {
+        try {
+          const pr = await fetch(join(`/runs/${run.id}/ped`));
+          if (!pr.ok) { rows.push({ name: run.name, status: run.status, ped_ratio: '-', total_gen_mwh: '-', total_demand_mwh: '-' }); continue; }
+          const ped = await pr.json();
+          rows.push({ name: run.name, status: run.status, ped_ratio: Number(ped.ped_ratio).toFixed(3), total_gen_mwh: Number(ped.total_gen_mwh).toFixed(1), total_demand_mwh: Number(ped.total_demand_mwh).toFixed(1) });
+        } catch {
+          rows.push({ name: run.name, status: run.status, ped_ratio: '-', total_gen_mwh: '-', total_demand_mwh: '-' });
+        }
+      }
+      setCompareRows(rows);
+    } catch {}
+  };
+
+  useEffect(() => { loadCompare(); }, []);
+
   return (
     <div style={{ display: 'grid', gridTemplateColumns: '360px 1fr', gap: '1rem', height: '100%' }}>
       <div className="sidebar" style={{ height: '100%', overflowY: 'auto' }}>
@@ -238,33 +269,3 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
     </div>
   );
 }
-  const duplicateScenario = async (id: string) => {
-    const s = scenarios.find((x) => x.id === id);
-    if (!s) return;
-    const payload: ScenarioCreate = { name: `Copy of ${s.name}`.slice(0, 120), description: s.description, details: s.details, config_overrides: s.config_overrides };
-    const r = await fetch(join('/scenarios'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-    if (r.ok) await load();
-  };
-
-  const loadCompare = async () => {
-    try {
-      const r = await fetch(join('/runs'));
-      if (!r.ok) return;
-      const runs = await r.json();
-      const top = runs.slice(0, 8);
-      const rows: any[] = [];
-      for (const run of top) {
-        try {
-          const pr = await fetch(join(`/runs/${run.id}/ped`));
-          if (!pr.ok) { rows.push({ name: run.name, status: run.status, ped_ratio: '-', total_gen_mwh: '-', total_demand_mwh: '-' }); continue; }
-          const ped = await pr.json();
-          rows.push({ name: run.name, status: run.status, ped_ratio: Number(ped.ped_ratio).toFixed(3), total_gen_mwh: Number(ped.total_gen_mwh).toFixed(1), total_demand_mwh: Number(ped.total_demand_mwh).toFixed(1) });
-        } catch {
-          rows.push({ name: run.name, status: run.status, ped_ratio: '-', total_gen_mwh: '-', total_demand_mwh: '-' });
-        }
-      }
-      setCompareRows(rows);
-    } catch {}
-  };
-
-  useEffect(() => { loadCompare(); }, []);
