@@ -88,13 +88,7 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
 
   const onChange = (key: string, value: number) => setOverrides({ ...overrides, [key]: value });
 
-  const duplicateScenario = async (id: string) => {
-    const s = scenarios.find((x) => x.id === id);
-    if (!s) return;
-    const payload: ScenarioCreate = { name: `Copy of ${s.name}`.slice(0, 120), description: s.description, details: s.details, config_overrides: s.config_overrides };
-    const r = await fetch(join('/scenarios'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-    if (r.ok) await load();
-  };
+  // duplicateScenario removed per request
 
   const loadCompare = async () => {
     try {
@@ -143,7 +137,6 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
                 <button className="button" onClick={() => runScenario(s.id)} aria-busy={runBusyId===s.id} aria-label={`Run ${s.name}`}>
                   {runBusyId === s.id ? 'Running…' : 'Run'}
                 </button>
-                <button className="button" onClick={() => duplicateScenario(s.id)} aria-label={`Duplicate ${s.name}`}>Duplicate</button>
               </div>
               <button
                 className="icon-btn"
