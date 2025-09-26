@@ -63,6 +63,24 @@ def _refresh_run_status_if_needed(db, run: SimulationRun) -> SimulationRun:
     return run
 
 
+def _run_to_read_dict(run: SimulationRun) -> dict:
+    """Serialize a SimulationRun into plain types for Pydantic v2.
+
+    Avoids ORM adapter edge-cases by projecting Enum/date/json values.
+    """
+    return {
+        "id": getattr(run, "id", None),
+        "name": getattr(run, "name", None),
+        "session_id": getattr(run, "session_id", None),
+        "scenario_id": getattr(run, "scenario_id", None),
+        "status": getattr(getattr(run, "status", None), "value", None) or str(getattr(run, "status", None) or ""),
+        "created_at": getattr(run, "created_at", None),
+        "updated_at": getattr(run, "updated_at", None),
+        "config": getattr(run, "config", {}) or {},
+        "notes": getattr(run, "notes", None),
+    }
+
+
 @router.post("/runs", response_model=SimulationRunRead, status_code=status.HTTP_201_CREATED, tags=["runs"])
 async def create_run(payload: SimulationRunCreate) -> SimulationRunRead:
     """Persist a simulation run record and optionally spin up an environment session."""
@@ -96,7 +114,7 @@ async def create_run(payload: SimulationRunCreate) -> SimulationRunRead:
         )
         db.add(snapshot_row)
         db.refresh(run)
-        return SimulationRunRead.from_orm(run)
+        return SimulationRunRead.model_validate(_run_to_read_dict(run))
 
 
 @router.get("/runs", response_model=List[SimulationRunRead], tags=["runs"])
@@ -105,7 +123,7 @@ async def list_runs() -> List[SimulationRunRead]:
     with session_scope() as db:
         rows = db.query(SimulationRun).order_by(SimulationRun.created_at.desc()).all()
         refreshed = [_refresh_run_status_if_needed(db, r) for r in rows]
-        return [SimulationRunRead.from_orm(row) for row in refreshed]
+        return [SimulationRunRead.model_validate(_run_to_read_dict(row)) for row in refreshed]
 
 
 @router.get("/runs/{run_id}", response_model=SimulationRunRead, tags=["runs"])
@@ -114,7 +132,7 @@ async def get_run(run_id: str) -> SimulationRunRead:
     with session_scope() as db:
         run = _get_run_or_404(db, run_id)
         run = _refresh_run_status_if_needed(db, run)
-        return SimulationRunRead.from_orm(run)
+        return SimulationRunRead.model_validate(_run_to_read_dict(run))
 
 
 @router.delete("/runs/{run_id}", tags=["runs"])
@@ -462,7 +480,7 @@ async def run_scenario(scenario_id: str) -> SimulationRunRead:
         )
         db.add(run)
         db.flush(); db.refresh(run)
-        return SimulationRunRead.from_orm(run)
+        return SimulationRunRead.model_validate(_run_to_read_dict(run))
 
 
 @router.delete('/scenarios/{scenario_id}', tags=['scenarios'])
