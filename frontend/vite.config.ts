@@ -5,9 +5,14 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
 
-  // ★ 关键：硬注入绝对 API 基址，避免任何 base 为空/相对导致的 new URL 报错
+  // Inject API base (overridden at build time by CLI env if provided)
   define: {
-    'import.meta.env.VITE_API_BASE': JSON.stringify('https://dt.scicloud.site/api'),
+    'import.meta.env.VITE_API_BASE': JSON.stringify(process.env.VITE_API_BASE || 'https://dt.scicloud.site/api'),
+  },
+
+  build: {
+    sourcemap: true,
+    target: 'es2019',
   },
 
   server: {
