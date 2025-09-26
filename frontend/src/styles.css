@@ -12,6 +12,12 @@ body, html, #root {
   height: 100%;
 }
 
+/* Accessibility: focus styles */
+*:focus-visible {
+  outline: 2px solid #60a5fa;
+  outline-offset: 2px;
+}
+
 body {
   display: flex;
   justify-content: center;
@@ -104,6 +110,22 @@ body {
 
 .run-item:hover .icon-btn { opacity: 1; }
 .icon-btn:hover { background: rgba(239, 68, 68, 0.2); }
+
+/* Responsive layout */
+@media (max-width: 980px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr;
+  }
+  .sidebar {
+    max-height: 40vh;
+  }
+  .sidebar-divider { display: none; }
+}
+
+@media (max-width: 600px) {
+  .header { flex-direction: column; align-items: flex-start; gap: 0.5rem; }
+}
 
 .metrics-grid {
   display: grid;

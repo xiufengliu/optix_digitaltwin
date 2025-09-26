@@ -12,6 +12,9 @@ export function PedPanel({ apiBase, runId }: PedPanelProps) {
   const [error, setError] = useState<string | null>(null);
   const [showDispatch, setShowDispatch] = useState(false);
   const [dispatch, setDispatch] = useState<any | null>(null);
+  const [showGen, setShowGen] = useState(true);
+  const [showLoad, setShowLoad] = useState(true);
+  const [limit, setLimit] = useState(500);
   const svgRef = useState<SVGSVGElement | null>(null)[0];
   const [hover, setHover] = useState<{ visible: boolean; x: number; y: number; idx: number; text: string } | null>(null);
 
@@ -29,7 +32,7 @@ export function PedPanel({ apiBase, runId }: PedPanelProps) {
     const load = async () => {
       try {
         const pedUrl = join(`/runs/${runId}/ped`);
-        const serUrl = join(`/runs/${runId}/energy_series?limit=500`);
+        const serUrl = join(`/runs/${runId}/energy_series?limit=${encodeURIComponent(limit)}`);
 
         const [pr, sr] = await Promise.all([
           fetch(pedUrl, { signal: ac.signal }),
@@ -73,13 +76,29 @@ export function PedPanel({ apiBase, runId }: PedPanelProps) {
     load();
     const id = setInterval(load, 3000);
     return () => { clearInterval(id); ac.abort(); };
-  }, [apiBase, runId, showDispatch]);
+  }, [apiBase, runId, showDispatch, limit]);
 
   return (
     <div className="metric-card" style={{ gridColumn: '1 / -1' }}>
       <div className="metric-label">PED (Positive Energy District)</div>
-      <div style={{ display: 'flex', gap: '0.5rem', marginBottom: 8 }}>
-        <button className="button" onClick={() => setShowDispatch(v => !v)}>{showDispatch ? 'Hide Dispatch' : 'Show Dispatch'}</button>
+      <div style={{ display: 'flex', gap: '0.5rem', marginBottom: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <button className="button" onClick={() => setShowDispatch(v => !v)} aria-pressed={showDispatch} aria-label="Toggle dispatch overlays">{showDispatch ? 'Hide Dispatch' : 'Show Dispatch'}</button>
+        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <input type="checkbox" checked={showGen} onChange={(e) => setShowGen(e.target.checked)} aria-label="Toggle generation series" /> Gen
+        </label>
+        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <input type="checkbox" checked={showLoad} onChange={(e) => setShowLoad(e.target.checked)} aria-label="Toggle load series" /> Load
+        </label>
+        <label title="Timeframe" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          Range
+          <select value={limit} onChange={(e) => setLimit(Number(e.target.value))}>
+            <option value={100}>100</option>
+            <option value={500}>500</option>
+            <option value={2000}>2000</option>
+            <option value={10000}>10000</option>
+          </select>
+        </label>
+        <button className="button" onClick={() => exportCsv(series, dispatch, ped)} aria-label="Export CSV">Export CSV</button>
       </div>
       {error && (
         <div style={{ color: '#fca5a5', marginBottom: '0.5rem' }}>{error}</div>
@@ -122,16 +141,16 @@ export function PedPanel({ apiBase, runId }: PedPanelProps) {
             </>
           )}
         </div>
-        <svg ref={(el) => { /* store ref indirectly */ }} width="100%" height="140" viewBox="0 0 600 140" preserveAspectRatio="none"
+        <svg ref={(el) => { /* store ref indirectly */ }} width="100%" height="180" viewBox="0 0 640 180" preserveAspectRatio="none"
           onMouseMove={(e) => {
             try {
               const svg = e.currentTarget as SVGSVGElement;
               const rect = svg.getBoundingClientRect();
-              const xRel = e.clientX - rect.left;
+              const xRel = e.clientX - rect.left - 40; // left axis gutter
               const gens = series.gen_mw; const loads = series.load_mw;
               const n = Math.max(gens.length, loads.length);
-              const stepX = 600 / Math.max(1, n - 1);
-              const idx = Math.max(0, Math.min(n - 1, Math.round(xRel / (rect.width / 600)))) ;
+              const stepX = 560 / Math.max(1, n - 1);
+              const idx = Math.max(0, Math.min(n - 1, Math.round(xRel / (rect.width - 80) * (560 / 560)))) ;
               const g = gens[idx] ?? 0; const l = loads[idx] ?? 0;
               let lines = [`Gen: ${g.toFixed(2)} MW`, `Load: ${l.toFixed(2)} MW`];
               if (dispatch && dispatch.series_mw) {
@@ -152,14 +171,19 @@ export function PedPanel({ apiBase, runId }: PedPanelProps) {
             const loads = series.load_mw;
             const n = Math.max(gens.length, loads.length);
             if (n === 0) return null;
-            const maxVal = Math.max(1, ...gens, ...loads);
-            const stepX = 600 / Math.max(1, n - 1);
-            const toY = (v: number) => 130 - (v / maxVal) * 120;
-            const buildPath = (arr: number[]) => arr.map((v, i) => `${i === 0 ? 'M' : 'L'} ${i * stepX} ${toY(v)}`).join(' ');
+            const maxVal = Math.max(1, ...(showGen ? gens : [0]), ...(showLoad ? loads : [0]));
+            const stepX = 560 / Math.max(1, n - 1);
+            const toY = (v: number) => 150 - (v / maxVal) * 120;
+            const buildPath = (arr: number[]) => arr.map((v, i) => `${i === 0 ? 'M' : 'L'} ${40 + i * stepX} ${toY(v)}`).join(' ');
             return (
               <>
-                <path d={buildPath(gens)} stroke="#22c55e" fill="none" strokeWidth="2" />
-                <path d={buildPath(loads)} stroke="#ef4444" fill="none" strokeWidth="2" />
+                {/* Axes */}
+                <line x1={40} y1={30} x2={40} y2={150} stroke="#334155" />
+                <line x1={40} y1={150} x2={600} y2={150} stroke="#334155" />
+                <text x={8} y={32} fill="#94a3b8" fontSize="10">MW</text>
+                <text x={580} y={170} fill="#94a3b8" fontSize="10">steps</text>
+                {showGen && <path d={buildPath(gens)} stroke="#22c55e" fill="none" strokeWidth="2" />}
+                {showLoad && <path d={buildPath(loads)} stroke="#ef4444" fill="none" strokeWidth="2" />}
                 {dispatch && dispatch.series_mw && (() => {
                   const s = dispatch.series_mw as Record<string, number[]>;
                   const keys = ['pv_to_load_mw','pv_export_mw','batt_to_load_mw','grid_import_mw'];
@@ -170,8 +194,8 @@ export function PedPanel({ apiBase, runId }: PedPanelProps) {
                     grid_import_mw: '#a78bfa',
                   };
                   const maxV = Math.max(maxVal, ...keys.flatMap(k => s[k] || [0]));
-                  const toY2 = (v: number) => 130 - (v / maxV) * 120;
-                  const build = (arr: number[]) => arr.map((v, i) => `${i === 0 ? 'M' : 'L'} ${i * stepX} ${toY2(v)}`).join(' ');
+                  const toY2 = (v: number) => 150 - (v / maxV) * 120;
+                  const build = (arr: number[]) => arr.map((v, i) => `${i === 0 ? 'M' : 'L'} ${40 + i * stepX} ${toY2(v)}`).join(' ');
                   return (
                     <>
                       {keys.map(k => s[k] && (<path key={k} d={build(s[k])} stroke={colors[k]} fill="none" strokeWidth="1.5" />))}
@@ -200,4 +224,37 @@ function LegendItem({ color, label }: { color: string; label: string }) {
       <span style={{ color: '#cbd5e1', fontSize: '0.85rem' }}>{label}</span>
     </span>
   );
+}
+
+function exportCsv(series: EnergySeries | null, dispatch: any | null, ped: PedMetrics | null) {
+  try {
+    const rows: string[] = [];
+    const header = ['step','gen_mw','load_mw','pv_to_load_mw','pv_export_mw','batt_to_load_mw','grid_import_mw'];
+    rows.push(header.join(','));
+    const n = Math.max(series?.gen_mw?.length || 0, series?.load_mw?.length || 0);
+    const s = (k: string) => (dispatch?.series_mw?.[k] as number[] | undefined) || [];
+    for (let i=0; i<n; i++) {
+      const rec = [
+        String((series?.start || 0) + i),
+        String(series?.gen_mw?.[i] ?? ''),
+        String(series?.load_mw?.[i] ?? ''),
+        String(s('pv_to_load_mw')[i] ?? ''),
+        String(s('pv_export_mw')[i] ?? ''),
+        String(s('batt_to_load_mw')[i] ?? ''),
+        String(s('grid_import_mw')[i] ?? ''),
+      ];
+      rows.push(rec.join(','));
+    }
+    if (ped) {
+      rows.push('');
+      Object.entries(ped as any).forEach(([k, v]) => rows.push(`# ${k},${String(v)}`));
+    }
+    const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'digital_twin_series.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch {}
 }

@@ -5,9 +5,10 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
 
 interface ThreeSceneProps {
   navValue?: number | null;
+  reduceMotion?: boolean;
 }
 
-export function ThreeScene({ navValue }: ThreeSceneProps) {
+export function ThreeScene({ navValue, reduceMotion }: ThreeSceneProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cubeRef = useRef<THREE.Mesh>();
   const buildingRef = useRef<THREE.Group>();
@@ -136,11 +137,13 @@ export function ThreeScene({ navValue }: ThreeSceneProps) {
       // Smooth camera controls and keep axes at the current target
       controls.update();
       axes.position.copy(controls.target);
-      if (buildingRef.current) {
-        buildingRef.current.rotation.y += 0.0025;
-      } else if (cubeRef.current) {
-        cubeRef.current.rotation.x += 0.005;
-        cubeRef.current.rotation.y += 0.01;
+      if (!reduceMotion) {
+        if (buildingRef.current) {
+          buildingRef.current.rotation.y += 0.0025;
+        } else if (cubeRef.current) {
+          cubeRef.current.rotation.x += 0.005;
+          cubeRef.current.rotation.y += 0.01;
+        }
       }
       renderer.render(scene, camera);
     };
@@ -167,7 +170,7 @@ export function ThreeScene({ navValue }: ThreeSceneProps) {
       }
       container.removeChild(renderer.domElement);
     };
-  }, []);
+  }, [reduceMotion]);
 
   useEffect(() => {
     if (navValue === undefined || navValue === null) return;

@@ -25,6 +25,9 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
   const [overrides, setOverrides] = useState<Record<string, any>>(defaultOverrides);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showGuide, setShowGuide] = useState(true);
+  const [runBusyId, setRunBusyId] = useState<string | null>(null);
+  const [runError, setRunError] = useState<string | null>(null);
+  const [compareRows, setCompareRows] = useState<any[]>([]);
 
   const join = (p: string) => {
     const base = apiBase.endsWith('/') ? apiBase : apiBase + '/';
@@ -53,6 +56,7 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
   };
 
   const runScenario = async (id: string) => {
+    setRunError(null); setRunBusyId(id);
     // Also select + populate the form before running so details are visible
     const s = scenarios.find((x) => x.id === id);
     if (s) {
@@ -62,11 +66,18 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
       setDetails(s.details ?? '');
       setOverrides({ ...defaultOverrides, ...(s.config_overrides || {}) });
     }
-    const r = await fetch(join(`/scenarios/${id}/run`), { method: 'POST' });
-    if (r.ok) {
-      const body = await r.json();
-      onRun(body.id);
-    }
+    try {
+      const r = await fetch(join(`/scenarios/${id}/run`), { method: 'POST' });
+      if (r.ok) {
+        const body = await r.json();
+        onRun(body.id);
+      } else {
+        const txt = await r.text();
+        setRunError(`Run failed (${r.status}): ${txt}`);
+      }
+    } catch (e: any) {
+      setRunError(e?.message ?? String(e));
+    } finally { setRunBusyId(null); }
   };
 
   const deleteScenario = async (id: string) => {
@@ -98,7 +109,10 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
                 )}
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                <button className="button" onClick={() => runScenario(s.id)}>Run</button>
+                <button className="button" onClick={() => runScenario(s.id)} aria-busy={runBusyId===s.id} aria-label={`Run ${s.name}`}>
+                  {runBusyId === s.id ? 'Running…' : 'Run'}
+                </button>
+                <button className="button" onClick={() => duplicateScenario(s.id)} aria-label={`Duplicate ${s.name}`}>Duplicate</button>
               </div>
               <button
                 className="icon-btn"
@@ -114,6 +128,9 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
       </div>
       <div className="main-content">
         <div className="header"><h2>Create / Edit Scenario</h2></div>
+        {runError && (
+          <div className="metric-card" style={{ color: '#fecaca' }}>{runError}</div>
+        )}
         <div className="metric-card">
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
             <label>Name<input style={{ width: '100%' }} value={name} onChange={e => setName(e.target.value)} /></label>
@@ -185,7 +202,69 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
             </div>
           )}
         </div>
+
+        {/* Compare runs */}
+        <div className="metric-card">
+          <div className="header" style={{ justifyContent: 'space-between' }}>
+            <h3 style={{ margin: 0 }}>Compare Runs (latest)</h3>
+            <button className="button" onClick={loadCompare}>Refresh</button>
+          </div>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr>
+                  <th style={{ textAlign: 'left', padding: '6px 8px' }}>Name</th>
+                  <th style={{ textAlign: 'left', padding: '6px 8px' }}>Status</th>
+                  <th style={{ textAlign: 'right', padding: '6px 8px' }}>PED Ratio</th>
+                  <th style={{ textAlign: 'right', padding: '6px 8px' }}>Gen (MWh)</th>
+                  <th style={{ textAlign: 'right', padding: '6px 8px' }}>Demand (MWh)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {compareRows.map((r, i) => (
+                  <tr key={i}>
+                    <td style={{ padding: '6px 8px' }}>{r.name}</td>
+                    <td style={{ padding: '6px 8px', color: '#94a3b8' }}>{r.status}</td>
+                    <td style={{ padding: '6px 8px', textAlign: 'right' }}>{r.ped_ratio}</td>
+                    <td style={{ padding: '6px 8px', textAlign: 'right' }}>{r.total_gen_mwh}</td>
+                    <td style={{ padding: '6px 8px', textAlign: 'right' }}>{r.total_demand_mwh}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
       </div>
     </div>
   );
 }
+  const duplicateScenario = async (id: string) => {
+    const s = scenarios.find((x) => x.id === id);
+    if (!s) return;
+    const payload: ScenarioCreate = { name: `Copy of ${s.name}`.slice(0, 120), description: s.description, details: s.details, config_overrides: s.config_overrides };
+    const r = await fetch(join('/scenarios'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    if (r.ok) await load();
+  };
+
+  const loadCompare = async () => {
+    try {
+      const r = await fetch(join('/runs'));
+      if (!r.ok) return;
+      const runs = await r.json();
+      const top = runs.slice(0, 8);
+      const rows: any[] = [];
+      for (const run of top) {
+        try {
+          const pr = await fetch(join(`/runs/${run.id}/ped`));
+          if (!pr.ok) { rows.push({ name: run.name, status: run.status, ped_ratio: '-', total_gen_mwh: '-', total_demand_mwh: '-' }); continue; }
+          const ped = await pr.json();
+          rows.push({ name: run.name, status: run.status, ped_ratio: Number(ped.ped_ratio).toFixed(3), total_gen_mwh: Number(ped.total_gen_mwh).toFixed(1), total_demand_mwh: Number(ped.total_demand_mwh).toFixed(1) });
+        } catch {
+          rows.push({ name: run.name, status: run.status, ped_ratio: '-', total_gen_mwh: '-', total_demand_mwh: '-' });
+        }
+      }
+      setCompareRows(rows);
+    } catch {}
+  };
+
+  useEffect(() => { loadCompare(); }, []);

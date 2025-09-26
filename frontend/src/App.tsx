@@ -60,6 +60,7 @@ export default function App() {
   const [sidebarWidth, setSidebarWidth] = useState(320);
   const [draggingSidebar, setDraggingSidebar] = useState(false);
   const [bottomCollapsed, setBottomCollapsed] = useState(false);
+  const [reduceMotion, setReduceMotion] = useState(false);
 
   const appendLog = useCallback((entry: string) => {
     setLogs((prev) => {
@@ -323,6 +324,9 @@ export default function App() {
               </div>
               <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
                 <button className="button" onClick={() => setTab('scenarios')}>Scenarios</button>
+                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }} title="Reduce motion">
+                  <input type="checkbox" checked={reduceMotion} onChange={(e) => setReduceMotion(e.target.checked)} aria-label="Reduce motion" /> Reduce motion
+                </label>
                 <button className="button" onClick={() => setViewTab('3d')} disabled={viewTab==='3d'}>3D</button>
                 <button className="button" onClick={() => setViewTab('charts')} disabled={viewTab==='charts'}>Charts</button>
                 <button className="button" onClick={() => handleStep(1)} disabled={!selectedRunId || selectedRun?.status !== 'running'}>Step Once</button>
@@ -388,7 +392,7 @@ export default function App() {
               >
                 {viewTab === '3d' ? (
                   <div className="viewer-panel" style={{ minHeight: 320, height: '100%' }}>
-                    <ThreeScene navValue={metrics.fund_nav ?? 0} />
+                    <ThreeScene navValue={metrics.fund_nav ?? 0} reduceMotion={reduceMotion} />
                   </div>
                 ) : (
                   <div className="metrics-grid" style={{ height: '100%', overflow: 'auto' }}>
