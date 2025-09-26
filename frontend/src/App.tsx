@@ -37,7 +37,7 @@ export default function App() {
     () => (import.meta.env?.VITE_API_BASE as string | undefined) ?? DEFAULT_API_BASE,
     [],
   );
-  const wsBase = useMemo(() => buildWsUrl('/', apiBase), [apiBase]);
+  // Build WS URLs directly from apiBase to preserve https→wss mapping
 
   const [runs, setRuns] = useState<SimulationRun[]>([]);
   const [loadingRuns, setLoadingRuns] = useState(false);
@@ -153,7 +153,7 @@ export default function App() {
   useEffect(() => {
     if (!selectedRunId) return;
 
-    const url = buildWsUrl(`/runs/${selectedRunId}/ws`, wsBase);
+    const url = buildWsUrl(`/runs/${selectedRunId}/ws`, apiBase);
     setWsStatus('connecting');
     appendLog(`Connecting to ${url}`);
 
@@ -191,7 +191,7 @@ export default function App() {
     return () => {
       socket.close();
     };
-  }, [appendLog, selectedRunId, wsBase]);
+  }, [appendLog, selectedRunId, apiBase]);
 
   const handleSelectRun = (runId: string) => {
     setSelectedRunId(runId);
