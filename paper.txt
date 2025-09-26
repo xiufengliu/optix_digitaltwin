@@ -1,0 +1,561 @@
+\chapter{Case study: Social housing block at Grønnevej, Virum (DK)}
+\label{ch:case-study}
+
+This chapter applies the modelling framework to a real asset: a multi-apartment social housing block at \textbf{Grønnevej~255, 6–8, 2830 Virum} (Lyngby–Taarbæk, DK). The building lies in the Eastern Denmark market area \textbf{DK2} and is supplied by the \emph{Vestforbrænding} district-heating network. The case study is developed within the \emph{OPTIX} initiative on Positive Energy Districts.\footnote{See project context in the Introduction.}
+
+\section{Scope and objectives}
+\label{sec:scope}
+
+This chapter applies the modelling framework to the social–housing block at Grønnevej~255, 6–8, 2830~Virum (DK2). The objectives are to: (i) quantify annual electricity and heat balances at the building boundary; (ii) assess grid imports/exports and district-heating use; and (iii) compute operating costs and Scope-2 \(\mathrm{CO_2}\) emissions using auditable inputs and transparent assumptions.
+
+The analysis uses hourly resolution over the full simulation year. Prices, demand profiles, weather/PV inputs and emission factors are sourced from official datasets and pre-processed with the same methods documented in the Methodology chapter; the present chapter only applies those inputs to the case study. All results are reported as delivered energy at the building buses (electricity and heat), with economic figures in EUR and emissions in \(\mathrm{t\,CO_2}\).
+
+\medskip
+\noindent\textbf{System boundary.}
+The building’s electrical boundary includes building loads, PV generation on the rooftop, optional battery storage (in enhanced scenarios), and the point of common coupling to the DK2 distribution grid. The thermal boundary includes the space-heating and DHW demand, the district-heating (DH) substation delivering heat to the building, and optional on-site thermal storage. Unless otherwise stated, DH prices are modelled as delivered-energy tariffs and DH emissions as location-based factors from the local operator.
+
+\medskip
+\noindent\textbf{Decision logic.}
+Across scenarios we enforce a PV-first merit order that prioritises the least-loss pathways (direct use before storage and export). Where present, dispatch from storage carries a small positive cost to avoid simultaneous charge/discharge at the hourly time step.
+
+% ----------------------------------------------------
+
+\section{Chapter roadmap}
+\label{sec:roadmap}
+
+The remainder of the chapter is structured as follows. First, we summarise the site-specific inputs used for the case study (building characteristics, electricity and DH tariffs, emission factors, and weather/PV data). Next, we define the scenarios analysed, from the baseline configuration to progressively more advanced options (PV capacity increases, battery storage, thermal storage and demand-side flexibility). We then present the results—annual energy balances, operating costs and Scope-2 \(\mathrm{CO_2}\) emissions—together with a discussion of the main drivers. Finally, we report a set of sensitivity checks that are most relevant for Positive Energy District design (price signals, DH efficiency, PV sizing and storage parameters).
+
+
+
+
+\section{SCENARIO 1}
+
+\section{Scenario 1: Baseline}
+
+\subsection{Purpose}
+The purpose of the baseline scenario is to establish a reference for energy consumption, costs, grid interaction, and emissions. This scenario represents the status quo of the building without any additional optimisation measures or new technologies beyond those currently installed. It serves as the foundation for comparing alternative scenarios in subsequent analyses.  
+
+\subsection{Description}
+In the baseline configuration, the building is equipped with rooftop photovoltaic (PV) panels that partially cover its electricity demand. However, the analysis shows a strong dependence on electricity imports from the grid, especially during periods of low solar generation, which makes the building highly sensitive to fluctuations in hourly market prices.  
+
+Thermal demand is assumed to be entirely covered by district heating (DH), reflecting the current infrastructure in place. No additional flexibility measures (e.g., batteries, demand-response) are introduced at this stage.  
+
+\subsection{Methodological Note}
+Due to the realistic constraints of the baseline, this scenario may lead to an infeasible optimisation problem. For this reason, in addition to the optimisation model, a simulation-based approach has been implemented to ensure that annual energy balances can be analysed even when optimisation fails. The dedicated script \texttt{scripts/simulate\_baseline\_annual.py} is used for this purpose.  
+
+\subsection{Expected Outcomes}
+From this scenario, the following reference indicators are derived:
+\begin{itemize}
+    \item \textbf{Energy consumption}: quantification of annual electricity and thermal demand.  
+    \item \textbf{Renewable penetration}: share of electricity demand covered by rooftop PV production.  
+    \item \textbf{Grid interaction}: amount of electricity imported from the grid and exposure to market price fluctuations.  
+    \item \textbf{Costs}: annual energy expenditure based on electricity and district heating tariffs.  
+    \item \textbf{Emissions}: CO$_2$ emissions associated with grid electricity imports and district heating supply.  
+\end{itemize}
+
+This baseline provides the essential benchmark for evaluating the impact of additional technologies and optimisation strategies in the subsequent scenarios.
+
+
+\subsection{Flussi energetici, priorità ed efficienze nello scenario \textit{baseline} (PyPSA) DON'T CONSIDER THIS}
+\label{subsec:flows-baseline}
+
+In PyPSA non esiste un campo esplicito di ``priorità'': l'ordine d'impiego delle sorgenti e dei percorsi emerge dalla minimizzazione del costo operativo orario, nel rispetto dei vincoli fisici. In forma semplificata, con generatori $g\in\mathcal{G}$, link $\ell\in\mathcal{L}$ e snapshot $t\in\mathcal{T}$,
+\begin{equation}
+\min \sum_{t\in\mathcal{T}}
+\Bigg(\;\sum_{g\in\mathcal{G}} c^{G}_{g,t}\,p^{G}_{g,t}
+\;+\;\sum_{\ell\in\mathcal{L}} c^{L}_{\ell,t}\,p^{L}_{\ell,t}\;\Bigg),
+\end{equation}
+soggetta a: (i) bilancio nodale per ciascun bus $b$ e istante $t$, (ii) limiti di capacità/dispatch, (iii) relazioni di efficienza sui link e (iv) ulteriori vincoli (segno, estendibilità, SoC degli storage, ecc.). Per i link vale la convenzione di segno
+\[
+p^{L}_{\ell,t}(\text{bus1}) \;=\; -\,\eta_{\ell}\,p^{L}_{\ell,t}(\text{bus0}),
+\]
+dove $\eta_{\ell}\in(0,1]$ è l'efficienza del link.\footnote{Per chiarezza: $p^{L}(\text{bus0})>0$ indica flusso da \texttt{bus0} verso \texttt{bus1}; il valore su \texttt{bus1} è negativo e pari a $-\eta\,p^{L}(\text{bus0})$.}
+
+\paragraph{Componenti e parametri (mappatura).}
+\begin{itemize}
+  \item \textbf{Rooftop PV} su \texttt{PV Bus}: generatore con $c^{G}_{\text{PV},t}=0$; $p^{\text{nom}}_{\text{PV}}$ calcolata da superficie $\times$ efficienze (modulo+inverter) e profilo $p^{\max\_pu}_{\text{PV},t}=\text{irradianza}/1000$ (STC).
+  \item \textbf{PV $\rightarrow$ Building} (\texttt{Link ``PV Autoconsumo''}): \texttt{PV Bus} $\to$ \texttt{Building Elec}, costo $c^{L}=0$, efficienza $\eta_{\text{auto}}=1$.
+  \item \textbf{Grid} su \texttt{Grid Elec Sell}: generatore con $c^{G}_{\text{Grid},t}=\text{prezzo\_rete}(t)$ (può essere anche negativo), potenza estendibile.
+  \item \textbf{Grid $\rightarrow$ Building} (\texttt{Link ``Grid Import''}): \texttt{Grid Elec Sell} $\to$ \texttt{Building Elec}, costo $c^{L}=0$, efficienza del trasformatore $\eta_{\text{tr}}\in(0,1]$.
+  \item \textbf{PV $\rightarrow$ Grid} (\texttt{Link ``PV Export''}): \texttt{PV Bus} $\to$ \texttt{Grid Elec Buy}, efficienza $\eta_{\text{exp}}\in(0,1]$, costo orario del link $c^{L}_{\text{exp},t}=-\,\text{prezzo\_export}(t)$ (negativo $\Rightarrow$ ricavo).
+  \item \textbf{Export Sink} su \texttt{Grid Elec Buy}: \emph{StorageUnit} che può solo caricare ($p^{pu}_{\max}=0$) e non può scaricare; assorbe l'energia esportata ed elimina ogni rientro, prevenendo arbitraggio.
+  \item \textbf{Load elettrico} su \texttt{Building Elec}: profilo di domanda $P_{\text{load},t}$ (MW).
+  \item \textbf{Heating} su \texttt{District Heating}: generatore termico con costo $c^{G}_{\text{heat}}$; trasferimento al building tramite \texttt{Link ``Heat import''} con efficienza $\eta_{\text{heat}}$.
+\end{itemize}
+
+\paragraph{Grandezze tracciate: potenziale vs effettivo ed efficienze incluse.}
+Nel seguito usiamo kWh orari (dispatch in MW moltiplicato per 1 h $\times\,1000$).
+\begin{itemize}
+  \item \textbf{PV generation} (\emph{effettiva}, lato \texttt{PV Bus}): dalla serie di dispatch del generatore PV. Non include le perdite dei link a valle; non è la potenza \emph{potenziale} $p^{\text{nom}}p^{\max\_pu}$ ma quella effettivamente utilizzata dal modello.
+  \item \textbf{PV $\to$ Building} (\emph{effettivo}): flusso sul link \texttt{PV Autoconsumo}. Con $\eta_{\text{auto}}=1$, il lato \texttt{bus0} coincide con il lato edificio.
+  \item \textbf{Self-consumption} (\emph{effettivo}): $\min\{\text{PV}\!\to\!\text{Building},\,\text{Load}\}$, quindi lato building, senza perdite aggiuntive.
+  \item \textbf{PV $\to$ Grid (export)} (\emph{effettivo}, \emph{post-perdite}): somma dei flussi di export calcolati come $p^{L}(\text{bus0})\cdot\eta$ per ogni link di export; misura quanta energia \emph{arriva in rete}.
+  \item \textbf{Grid Import} (\emph{effettivo}, \emph{post-perdite}): energia al building ricavata da $-\!p^{L}(\text{bus1})$ sul link \texttt{Grid Import} (già dopo le perdite del trasformatore).
+  \item \textbf{Grid Export} (\emph{effettivo}, \emph{post-perdite}): somma dei contributi $p^{L}(\text{bus0})\cdot\eta$ dei link di export (lato rete).
+  \item \textbf{Heat load} (\emph{effettivo}): domanda termica sul bus \texttt{Building Heat}. \textbf{Heat produced} è la produzione del generatore su \texttt{District Heating} (non include le perdite del link termico).
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcccc}
+\hline
+\textbf{Flusso / Serie} & \textbf{Lato bus} & \textbf{Efficienze incluse} & \textbf{Tipo} \\
+\hline
+PV generation & \texttt{PV Bus} (gen) & No (link a valle) & Effettivo (dispatch) \\
+PV $\to$ Building & Link \texttt{PV Autoconsumo} & $\eta_{\text{auto}}=1$ & Effettivo \\
+Self-consumption & Lato Building & Idem sopra & Effettivo \\
+PV $\to$ Grid (export) & Lato rete & Sì ($\eta_{\text{exp}}$) & Effettivo \\
+Grid Import & Lato Building & Sì ($\eta_{\text{tr}}$) & Effettivo \\
+Grid Export & Lato rete & Sì (link di export) & Effettivo \\
+Heat load & \texttt{Building Heat} (load) & n/a & Effettivo \\
+Heat produced & \texttt{District Heating} (gen) & No (perdite su link) & Effettivo \\
+\hline
+\end{tabular}
+\caption{Convenzioni di misura, efficienze e natura delle grandezze nello scenario \textit{baseline}.}
+\end{table}
+
+\paragraph{Come emergono le priorità.}
+Dalla struttura dei costi e delle efficienze discende l'ordine d'impiego:
+\begin{enumerate}[label=\alph*)]
+  \item \textbf{PV $\to$ Building} (costo nullo e $\eta=1$) fin dove possibile;
+  \item \textbf{PV $\to$ Grid} (ricavo se $\text{prezzo\_export}(t)>0$) per il solo surplus; la presenza di \texttt{Export Sink} e bus separati evita rientri;
+  \item \textbf{Grid $\to$ Building} (costo $\ge0$ effettivo pari a $c^{G}_{\text{Grid},t}/\eta_{\text{tr}}$) per coprire i deficit.
+\end{enumerate}
+Se $\text{prezzo\_rete}(t)<0$, il generatore \texttt{Grid} ha $c^{G}_{\text{Grid},t}<0$ e l'import può diventare conveniente; simmetricamente, un $\text{prezzo\_export}(t)<0$ rende $c^{L}_{\text{exp},t}>0$, scoraggiando l'export. La separazione \texttt{Grid Elec Sell}/\texttt{Grid Elec Buy} e l'\texttt{Export Sink} impediscono qualsiasi ciclo di arbitraggio import$\to$export.
+
+\paragraph{Cosa mostrano i grafici.}
+\begin{itemize}
+  \item \textbf{Serie temporali}: \emph{PV generation} è il dispatch PV lato \texttt{PV Bus}; \emph{Grid Import} ed \emph{Export} sono \emph{post-efficienza} (import lato building, export lato rete); i carichi elettrico/termico sono le rispettive domande.
+  \item \textbf{Energy balance (barre annue)}: usa i totali annui di PV (dispatch), import (post-perdite), export (post-perdite), carico elettrico e carico termico. Il termico è rappresentato come produzione vs domanda, non come bilancio chiuso con perdite esplicite.
+  \item \textbf{PV split}: scompone PV totale (dispatch), auto-consumo (senza perdite, $\eta=1$), export (post-perdite, lato rete) ed eventuale curtailment (residuo lato PV).
+\end{itemize}
+
+\paragraph{Validazione del bilancio energetico (lato elettrico).}
+Il controllo calcola per ogni ora $h$ il residuo
+\[
+\varepsilon_h \;=\; \big|\,E_{\text{IN}}(h)-E_{\text{OUT}}(h)\,\big|,
+\]
+dove tipicamente $E_{\text{IN}}=\text{PV}\!\to\!\text{Building}+\text{Grid Import}$ (entrambi lato building o equivalenti) ed $E_{\text{OUT}}=\text{Load}+\text{Grid Export}$ (export lato rete, post-perdite). Si riportano poi:
+\begin{itemize}
+  \item \emph{Max hourly error}: $\max_h \varepsilon_h$;
+  \item \emph{Mean hourly error}: $\frac{1}{|\mathcal{T}|}\sum_h \varepsilon_h$;
+  \item \emph{Annual balance error}: $\sum_h \varepsilon_h$ e la sua percentuale rispetto all'energia annua del carico elettrico.
+\end{itemize}
+Residui non nulli ma piccoli possono derivare da differenze di \emph{lato di misura} (PV totale al \texttt{PV Bus} vs export misurato lato rete) e dall'applicazione esplicita delle efficienze sui link.
+
+\paragraph{Sintesi.}
+Tutte le grandezze tracciate sono \emph{effettive} (dispatch) e coerenti con le efficienze: l'import e l'export sono sempre conteggiati \emph{post-perdita} sul lato fisicamente rilevante (building o rete), mentre la PV totale è il dispatch al \texttt{PV Bus}. La logica delle priorità è una conseguenza diretta dei \emph{marginal cost} e delle efficienze di rete, senza regole ad hoc, ed è robusta anche in presenza di prezzi di rete negativi grazie alla separazione dei bus e al \texttt{Sink} di export.
+
+
+\section{Scenario 2: High PV Deployment}
+
+\subsection{Purpose}
+The purpose of the high PV scenario is to explore the maximum potential of solar generation on the rooftop of the social housing building. Unlike the baseline, where PV coverage is limited, this scenario maximises the available surface area for photovoltaic deployment, while storage and heating remain at baseline levels. The goal is to evaluate maximum local renewable electricity generation, the potential for self-consumption without battery storage, and the expected increase in grid export.  
+
+\subsection{Description}
+In this configuration, the rooftop is fully exploited for PV installation, applying regulatory and safety constraints in accordance with Danish building and fire codes. The scenario therefore represents the upper bound of solar energy generation that can be achieved locally, subject to national regulations and physical roof constraints. No battery systems are included, so any excess production beyond self-consumption is exported to the grid.  
+\subsection{Regulatory and Technical Assessment of Rooftop Surface}
+The available rooftop area for PV deployment is restricted by Danish regulations, which include:  
+\begin{enumerate}
+  \item \textbf{BR18 – Bygningsreglementet 2018} \cite{BR18}, which imposes fall-protection requirements (parapets $\geq \SI{1.1}{\metre}$ or safety lines) and safe access to technical areas.  
+  \item \textbf{DBI Retningslinje 024 – Fire safety for solar PV systems} \cite{DBI024}, which establishes fire safety clearances (minimum \SI{1.0}{\metre}) and buffers around skylights, chimneys, or emergency exits (\SI{0.5}{\metre}).  
+  \item \textbf{EN 516 / EN 795} \cite{EN516,EN795}, which define minimum widths for maintenance walkways (\SI{0.6}{\metre}) and anchoring systems.  
+\end{enumerate}
+
+Applying these restrictions, the gross rooftop area $A_g = \SI{963}{\metre\squared}$ is reduced to a net usable area of approximately \SI{760.6}{\metre\squared}. With a filling factor $\eta = 0.90$ for an east–west low-tilt (\(10^{\circ}\)) layout, the effective PV surface is calculated as:
+\[
+A_{\text{PV}} = \eta \times (A_g - \sum \text{losses})
+= 0.90 \times \SI{760.6}{\metre\squared}
+\approx \SI{684}{\metre\squared}.
+\]
+
+\subsection{System Capacity}
+Using bifacial high-density modules of \SI{600}{Wp} each with a surface of \SI{2.4}{\metre\squared}, the rooftop can host:
+\[
+N = \frac{684}{2.4} \approx 285 \quad \text{modules}.
+\]
+The maximum installed DC capacity is:
+\[
+P_{\text{DC,max}} = 285 \times 0.600 \approx \mathbf{\SI{171}{kWp}}.
+\]
+
+\subsection{Expected Outcomes}
+\begin{itemize}
+  \item \textbf{Electricity generation:} significant increase in annual PV output compared to the baseline.  
+  \item \textbf{Self-consumption:} higher share of demand covered by local PV, though without storage the matching between generation and demand remains limited.  
+  \item \textbf{Grid export:} a marked increase in electricity exported to the grid, especially during peak solar hours.  
+  \item \textbf{Costs and emissions:} reduced grid import leads to lower costs and associated emissions.  
+\end{itemize}
+
+\paragraph{Conclusion.}  
+With the minimum regulatory reductions applied (BR18, DBI 024, EN 516), the rooftop can host up to \textbf{\SI{171}{kWp}} of PV capacity, covering approximately 71\% of the geometric rooftop surface. This scenario provides the upper bound of local renewable electricity generation and sets the stage for evaluating the integration of storage and flexibility measures in subsequent scenarios.
+
+
+\section{Scenario 3: High PV with Battery Storage (Export-Only-from-PV)}
+
+\subsection{Purpose and Scope}
+This scenario complements the maximum rooftop PV deployment (as in Scenario~2) with electrical storage to: (i) increase PV self-consumption, (ii) reduce grid dependency---especially peak imports---and (iii) enable peak shaving. Three battery sizes are tested, each with a nominal four-hour autonomy, to quantify marginal benefits as storage capacity increases.
+
+\subsection{Model–Code Alignment and Key Parameters}
+The implementation follows the PyPSA-based code \texttt{pv\_battery\_2.py}, using configuration values from \texttt{component\_params.yml}. The most relevant parameters are:
+\begin{itemize}
+  \item \textbf{Grid}: capacity limit $P^{\text{grid}}_{\max}=\SI{0.25}{MW}$, transformer efficiency $\eta_{\text{tr}}=0.94$, hourly import prices from \texttt{grid\_prices.csv}, and emission factor $57.3~\mathrm{kg/MWh}$ (\texttt{grid.capacity\_mw}, \texttt{grid.transformer\_efficiency}, \texttt{grid.price\_profile}, \texttt{grid.CO2\_emissions\_kg\_per\_mwh}).
+  \item \textbf{PV field}: same rooftop surface of Scenario~2 (\SI{684}{m^2}), module efficiency $\approx 0.225$, inverter efficiency $0.97$--$0.98$, export efficiency $0.95$ (\texttt{surface\_m2}, \texttt{efficiency\_pv}, \texttt{inverter\_efficiency}, \texttt{efficiency\_export}).
+  \item \textbf{Battery}: round-trip efficiency $\eta_{\text{rt}}=0.90$ (split as $\eta_{\text{store}}=\eta_{\text{dispatch}}=\sqrt{0.90}$), SoC window $[15\%,85\%]$, cyclic operation and neutral initial/final SoC at $50\%$ (\texttt{efficiency\_round\_trip}, \texttt{e\_min\_pu}, \texttt{e\_max\_pu}, \texttt{e\_cyclic}, \texttt{e\_initial}).
+\end{itemize}
+
+\subsection{Battery Sizing Rationale}
+Power $P_{\mathrm{nom}}$ (MW) and energy $E_{\mathrm{nom}}$ (MWh) are linked by autonomy $t$ (h):
+\[
+t=\frac{E_{\mathrm{nom}}}{P_{\mathrm{nom}}},\qquad C=\frac{P_{\mathrm{nom}}}{E_{\mathrm{nom}}}=\frac{1}{t},
+\]
+where $C$ is the C-rate. A four-hour battery ($t=4$~h, $C=0.25~\mathrm{h^{-1}}$) is consistent with firming daily PV surpluses and evening peaks in residential contexts \cite{Villalba2024}. For an evening peak of about \SI{80}{kW} in the social building (165 apartments), a $P_{\mathrm{nom}}=\SI{0.08}{MW}$ device implies $E_{\mathrm{nom}}=\SI{0.32}{MWh}$. Commercial lithium-ion systems report round-trip efficiencies near $90\%$ \cite{TeslaPW2_2025}; we therefore set $\eta_{\text{rt}}=0.90$ in the model.
+
+\subsection{Electrical Flow Priorities and Economic Signals}
+In PyPSA, flow ``priorities'' are induced by marginal costs subject to capacity/efficiency constraints \cite{Brown2018PyPSA}. The intended order in Scenario~3 is:
+\begin{enumerate}
+  \item \textbf{PV\,$\to$\,Building} (self-consumption);
+  \item \textbf{PV\,$\to$\,Battery} (charge);
+  \item \textbf{PV\,$\to$\,Export} (surplus only, from the PV bus);
+  \item \textbf{Battery\,$\to$\,Building} (discharge);
+  \item \textbf{Grid Import}.
+\end{enumerate}
+This is implemented via micro-penalties on link marginal costs (more negative $\,\Rightarrow\,$higher priority):
+\[
+c^{L}_{\text{PV}\to\text{Load}}=-10^{-6}
+< c^{L}_{\text{PV}\to\text{Batt}}=-5\cdot10^{-9}
+< c^{L}_{\text{PV}\to\text{Export}}=-10^{-9}
+< c^{L}_{\text{Batt}\to\text{Load}}=0
+< \frac{c^{G}_{\text{Grid},t}}{\eta_{\text{tr}}}.
+\]
+\textbf{Alignment note.} In the current script, the PV export link is created with \texttt{marginal\_cost = -0.1}. Since $-0.1 \ll -10^{-6}$, this would inadvertently \emph{prioritise export} over local use and battery charge. To enforce the thesis priorities, set:
+\begin{quote}
+\texttt{marginal\_cost = eps\_export} \quad (i.e.\ \texttt{-1e-9})
+\end{quote}
+for the \texttt{"PV Export"} link. This small fix restores the desired hierarchy while keeping export-only-from-PV.
+
+\paragraph{Export-only-from-PV topology.}
+Export is allowed only from the PV bus to the grid buy bus. An \texttt{Export Sink} (\texttt{StorageUnit} with $p^{pu}_{\max}=0$) at the grid buy bus absorbs exported energy and prevents any physical or economic re-entry, eliminating arbitrage.
+
+\subsection{Assumptions on Battery Operation and Degradation}
+A SoC window of $[15\%,85\%]$ is imposed to avoid overcharge/over-discharge and mitigate degradation \cite{Fichera2021}. Annual cyclicity ($e_0=e_T$) and a neutral initial/final level at $50\%$ prevent end-of-horizon artefacts and make scenario results comparable.
+
+\subsection{Battery Configurations Tested}
+All cases use the same PV layout as Scenario~2. Three sizes are analysed (4~h autonomy; $\eta_{\text{rt}}=0.90$):
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Case} & $P_{\mathrm{nom}}$ [MW] & $E_{\mathrm{nom}}$ [MWh] & $E/P$ [h] \\
+\midrule
+pv\_battery\_1 & 0.04 & 0.16 & 4 \\
+pv\_battery\_2 & 0.08 & 0.32 & 4 \\
+pv\_battery\_3 & 0.16 & 0.64 & 4 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Outputs and KPIs}
+For each configuration the model reports hourly flows (PV$\to$load/storage/export; battery charge/discharge; grid import), and annual KPIs: self-consumption ratio, self-sufficiency ratio, curtailed PV, exported energy, peak grid import, energy cost, and CO$_2$ emissions.
+
+\subsection{Comparative Analysis with Scenarios 1 and 2}
+\begin{itemize}
+  \item \textbf{vs.\ Scenario 1 (Baseline).} Scenario~3 reduces annual grid imports and associated CO$_2$ emissions/costs by adding both PV capacity (as in Scenario~2) and storage-based flexibility.
+  \item \textbf{vs.\ Scenario 2 (High PV).} With identical PV area, Scenario~3 shifts midday surplus into evening demand, increasing self-consumption and enabling peak shaving; grid export decreases accordingly.
+  \item \textbf{Across pv\_battery\_1/2/3.} Increasing $P$ and $E$ strengthens peak shaving and import reduction. Diminishing returns may occur if storage saturates frequently or if winter PV surplus is limited.
+\end{itemize}
+
+\subsection{Methodological Robustness}
+As in the baseline, realistic constraints (grid capacity, efficiency, prices) can occasionally render optimisation infeasible. When this occurs, a simulation-only routine is used to compute annual balances (cf.\ baseline simulator). The configuration and code guarantee traceability from input assumptions to KPIs, ensuring replicability of results within OPTIX WP3~T3.1.
+
+
+
+\section{Scenario 4: PV-to-Heat with Heat Pump and Thermal Storage}
+
+\subsection{Purpose and Scope}
+Scenario~4 focuses on the \emph{heating} sector and on \emph{sector coupling}, by converting locally generated PV electricity into heat via a heat pump (HP) and by buffering heat in a thermal energy storage (TES). The aims are: (i) to increase on-site utilisation of renewable electricity via power-to-heat, (ii) to provide operational flexibility on the heat side, and (iii) to reduce peak heat demand and reliance on district heating (DH).
+
+\subsection{Model Implementation and Consistency with the Code}
+\label{subsec:implementation-consistency}
+
+The network formulation implements a \textbf{PV–driven heat pump} that operates \emph{only} when photovoltaic power is available and routes its thermal output either to the building or to the thermal energy storage (TES). Grid export is permitted \emph{exclusively} from the PV bus. This mirrors the thesis intent (“convert PV electricity into thermal energy”) and does not rely on a grid–powered air–water HP.
+
+Concretely, in the code:
+\begin{itemize}
+  \item The heat pump is a \texttt{Link} from \textbf{PV Bus} to \textbf{Heat Source Bus} with efficiency equal to the COP 
+  (declared as \texttt{"Heat Pump", efficiency = cop}), i.e., a multiplier 
+  \(Q_{\mathrm{th}} = \mathrm{COP}\cdot W_{\mathrm{PV}}\).
+  \item The dispatch priority favours (i) using HP heat to supply the building load 
+  (\texttt{"Thermal Discharge"}) before (ii) charging the TES 
+  (\texttt{"Thermal Charge"}), while keeping export as a relief valve only on the PV bus.
+  \item The \emph{export-only-from-PV} topology is enforced with the \texttt{"PV Export"} link 
+  (PV Bus\,$\to$\,Grid Elec Buy) priced at the time-varying feed-in value, together with an
+  \texttt{Export Sink} \texttt{StorageUnit} that absorbs exported energy and prevents any re-import, thus eliminating arbitrage.
+\end{itemize}
+
+These modelling choices are encoded in \texttt{thermal\_storage.py} (bus and link creation; introduction of tiny \texttt{eps} marginal costs to implement priorities; dynamic export price set as 
+\(c^{L}_{\mathrm{PV\to Grid}}(t) = -\,p_{\mathrm{export}}(t) + \varepsilon\)). 
+They are fully consistent with the methodological goals of this chapter: \emph{PV-first} for heat provision and export as a last resort.
+
+
+\subsection{Heat Pump: Modelling and Performance}
+The HP is represented as a conversion link with an \textbf{effective COP} applied to PV electricity. The instantaneous coefficient of performance is:
+\[
+\mathrm{COP}(t)=\frac{Q_{\text{th}}(t)}{W_{\text{el}}(t)}\,,
+\]
+and its seasonal value is used in the model to map hourly PV power into thermal output. This abstraction is appropriate for a PV-coupled power-to-heat configuration: it enforces that the HP \emph{does not} draw electricity from the grid and that heat production is bounded by PV availability and by the HP nominal power. If required for sensitivity analysis, the COP can be varied across heating seasons or outdoor temperatures (EN\,14825 approach) without altering the control logic.
+
+\subsection{Operational CO\texorpdfstring{$_2$}{2} emissions of heat pumps: PV--driven vs.\ grid--fed}
+\label{subsec:hp_emissions_pv_vs_grid}
+
+\paragraph{Boundary and accounting choice.}
+We report \emph{operational} (Scope~2, location-based) emissions at the building meter. 
+Life-cycle impacts (manufacturing, transport, end-of-life of PV modules and heat pump) are outside this operational boundary and may be covered separately in an LCA appendix.
+
+\paragraph{PV-driven HP (location-based).}
+If the heat pump (HP) is supplied \emph{exclusively} by on-site PV and never draws electricity from the grid, the electricity used has zero operational CO$_2$ at the meter. 
+Therefore,
+\[
+\mathrm{Emis}_{\mathrm{HP,PV}}(t)=0\quad\forall t,
+\]
+and the heat-based factor is \(\mathrm{EF}_{\mathrm{HP,th}}=0\). 
+This is consistent with standard location-based Scope~2 practice for on-site renewables.
+
+\paragraph{Grid-fed HP (location-based).}
+When the HP is supplied by the grid, operational emissions follow the well-established relation that divides the electricity emission factor by the HP efficiency (COP/SCOP) \cite{Pistochini2022,Howarth2024}. 
+Let \(\mathrm{EF}_{\mathrm{el}}(t)\) be the grid CO$_2$ intensity \([\mathrm{kgCO_2/MWh_{el}}]\) and \(\mathrm{COP}(t)\) the (instantaneous or seasonal) coefficient of performance defined according to EN~14825 \cite{EN14825:2022}. 
+The electricity required to deliver \(Q_{\mathrm{th}}(t)\) is \(W_{\mathrm{el}}(t)=Q_{\mathrm{th}}(t)/\mathrm{COP}(t)\), hence
+\[
+\mathrm{Emis}_{\mathrm{HP,grid}}(t)=\frac{Q_{\mathrm{th}}(t)}{\mathrm{COP}(t)}\,\mathrm{EF}_{\mathrm{el}}(t),
+\qquad
+\boxed{\ \mathrm{EF}_{\mathrm{HP,th}}(t)=\dfrac{\mathrm{EF}_{\mathrm{el}}(t)}{\mathrm{COP}(t)}\ }\;[\mathrm{kgCO_2/MWh_{th}}].
+\]
+If local upstream losses (e.g., transformer, inverter, storage) are material, aggregate them in \(\eta_{\mathrm{tr}}\in(0,1]\) and use \(\mathrm{EF}_{\mathrm{HP,th}}^{\mathrm{eff}}=\mathrm{EF}_{\mathrm{el}}/(\eta_{\mathrm{tr}}\mathrm{COP})\).
+
+\paragraph{Certified factors for Denmark.}
+Two authoritative options are common:
+(i) the IEA \emph{production-mix} CO$_2$ intensity (methodology and country data) \cite{IEA:CO2kWhMethod,IEA:EF2024}, and 
+(ii) the AIB \emph{residual-mix} factor for supplied electricity without Guarantees of Origin \cite{AIB:ResidualMix2023}. 
+For time-resolved studies, Energinet’s \emph{Energi Data Service} provides hourly CO$_2$ series for DK1/DK2 \cite{Energinet:EDS}.
+
+\paragraph{Numerical illustration (grid-fed).}
+Using a project value \(\mathrm{EF}_{\mathrm{el}}=57.3~\mathrm{kgCO_2/MWh_{el}}\) and \(\mathrm{COP}=3.5\),
+\[
+\mathrm{EF}_{\mathrm{HP,th}}=\frac{57.3}{3.5}
+=16.37~\mathrm{kgCO_2/MWh_{th}}
+=16.37~\mathrm{gCO_2/kWh_{th}}.
+\]
+If instead a national production-mix factor of, e.g., \(90~\mathrm{gCO_2/kWh_{el}}\) is adopted (IEA recent year), then \(\mathrm{EF}_{\mathrm{HP,th}}=25.7~\mathrm{gCO_2/kWh_{th}}\). 
+Conversely, with a higher residual-mix factor (AIB), the heat factor increases proportionally.
+These choices must be stated explicitly in the methodology to avoid confusion between site reporting (location-based) and consequential system indicators.
+
+
+\subsection{Thermal Storage: State Equation and Losses}
+The TES is modelled as a \texttt{Store} with state-of-charge (SoC) bounds and standing losses, with cyclic boundary conditions (initial/final SoC equal). The energy balance per time step is:
+\[
+e(t{+}1)=e(t)\,(1{-}\lambda)+\eta_{\mathrm{ch}}\,p_{\mathrm{ch}}(t)-\frac{1}{\eta_{\mathrm{dis}}}\,p_{\mathrm{dis}}(t)\,,
+\quad e_{\min}\le e(t)\le e_{\max},
+\]
+where $\lambda$ is the hourly standing loss and $\eta_{\mathrm{ch}},\eta_{\mathrm{dis}}$ are charge/discharge efficiencies. The adopted settings (SoC window, cyclic operation, dispatch with small positive marginal cost to avoid cycling when not needed) in the code are consistent with best practice for short-term thermal storage used for daily shifting. :contentReference[oaicite:1]{index=1}
+
+
+
+\subsection{Operational Priorities: Enforcement via Marginal Costs}
+Flow ``priorities'' are induced via the objective function (linear costs) and \texttt{eps} multipliers. With $\,\mathrm{BASE}=\max\{50,\max_t(\text{price}_{\mathrm{export}}(t))+10\}$, the code assigns:
+\[
+\begin{aligned}
+c^{L}_{\mathrm{PV\to HP}} &= -10\,\mathrm{BASE}, \qquad
+c^{L}_{\mathrm{HP\to BldHeat}} = -9\,\mathrm{BASE}, \\
+c^{L}_{\mathrm{PV\to BldElec}} &= -7\,\mathrm{BASE}, \qquad
+c^{L}_{\mathrm{HP\to TES}} = -5\,\mathrm{BASE}, \\
+c^{L}_{\mathrm{PV\to Batt}} &= -4\,\mathrm{BASE}, \qquad
+c^{L}_{\mathrm{TES\to BldHeat}} = +2{\cdot}10^{-4}, \\
+c^{L}_{\mathrm{Batt\to BldElec}} &= +2{\cdot}10^{-4}, \qquad
+c^{L}_{\mathrm{PV\to Grid}}(t) = -\,\text{price}_{\mathrm{export}}(t)+\varepsilon_{\mathrm{micro}}.
+\end{aligned}
+\]
+This yields a \emph{quasi-lexicographic} order: \textbf{PV\,$\to$\,HP\,$\to$\,Building Heat} $\succ$ \textbf{PV\,$\to$\,Building Elec} $\succ$ \textbf{PV\,$\to$\,HP\,$\to$\,TES} $\succ$ \textbf{PV\,$\to$\,Battery} $\succ$ \textbf{PV\,$\to$\,Grid}, with DH and grid import governed by their (non-negative) real costs. Export is permitted \emph{only} from the PV bus. These priorities implement the thesis strategy: first satisfy thermal demand with PV-to-heat, then use residual PV for electric self-consumption and short-term buffering, and export only if local options saturate. :contentReference[oaicite:2]{index=2}
+
+\subsection[Why prioritizing PV to heat via HP minimizes CO2]
+{Why Prioritizing PV $\rightarrow$ Heat (via HP) Over PV $\rightarrow$ Electricity:
+a CO$_2$ Emissions Analysis}
+
+
+\textbf{Assumptions (case-specific):}
+\begin{itemize}
+  \item Heat Pump (HP) coefficient of performance (COP) = 3.5, i.e., $1~\text{MWh}_e \rightarrow 3.5~\text{MWh}_{th}$.
+  \item Grid electricity emission factor: $EF_{\text{grid}} \approx 57.3$ kgCO\(_2\)/MWh\(_e\).
+  \item District heating emission factor: $EF_{\text{DH}} \approx 33.9$ kgCO\(_2\)/MWh\(_{th}\).
+  \item Photovoltaic (PV) generation is treated as having zero marginal operational emissions (embedded lifecycle emissions are excluded from the comparison).
+\end{itemize}
+
+\noindent
+Given $1~\text{MWh}_e$ of PV electricity, we compare two alternative uses:
+
+\paragraph*{(A) PV $\rightarrow$ Electricity (direct self-consumption)}
+Here, $1~\text{MWh}_e$ of PV displaces $1~\text{MWh}_e$ of grid import. The avoided emissions are:
+\begin{equation}
+\Delta \text{CO}_{2}^{\text{Elec}} 
+= 1~\text{MWh}_e \cdot EF_{\text{grid}}
+= 1 \cdot 57.3
+= 57.3~\text{kgCO}_2.
+\end{equation}
+
+\paragraph*{(B) PV $\rightarrow$ Heat via HP (thermal-first strategy)}
+With COP = 3.5, $1~\text{MWh}_e$ of PV yields $3.5~\text{MWh}_{th}$ of useful heat. If this heat displaces district heating, the avoided emissions are:
+\begin{equation}
+\Delta \text{CO}_{2}^{\text{HP}}
+= (1~\text{MWh}_e \cdot \text{COP}) \cdot EF_{\text{DH}}
+= (1 \cdot 3.5) \cdot 33.9
+= 118.65~\text{kgCO}_2.
+\end{equation}
+
+\noindent
+\textbf{Numerical outcome:} with the given factors,
+\[
+\Delta \text{CO}_{2}^{\text{HP}} = 118.65~\text{kgCO}_2 
+\quad\text{vs}\quad
+\Delta \text{CO}_{2}^{\text{Elec}} = 57.3~\text{kgCO}_2,
+\]
+so using PV to produce heat via an HP avoids \emph{more than twice} the CO\(_2\) compared to direct electrical self-consumption.
+
+\paragraph*{General prioritization criterion (CO\(_2\)-optimality)}
+In terms of emissions, prioritizing the chain PV $\rightarrow$ HP $\rightarrow$ thermal load is rational whenever:
+\begin{equation}
+\text{COP} \cdot EF_{\text{DH}} \;>\; EF_{\text{grid}}.
+\end{equation}
+With the values above:
+\[
+3.5 \cdot 33.9 = 118.65 \;>\; 57.3,
+\]
+\(\Rightarrow\) \emph{thermal-first priority holds}.
+
+\paragraph*{Operational implications}
+\begin{itemize}
+  \item \textbf{Flow ordering:} First route PV to the HP (to satisfy space/water heating and/or charge the thermal energy storage, TES), then allocate residual PV to electrical uses/battery; only after that consider export or grid import.
+  \item \textbf{Role of TES:} Thermal storage time-shifts the $3.5~\text{MWh}_{th}$ produced per $1~\text{MWh}_e$ of PV, increasing the number of hours in which the thermal-first rule is technically feasible and thus maximizing avoided emissions.
+  \item \textbf{Limits:} Thermal-first remains optimal as long as there is unmet thermal demand (or free TES capacity) and the HP is not saturated. In the absence of thermal demand or TES headroom, residual PV can be used for electrical loads or export.
+\end{itemize}
+
+\paragraph*{Conclusion}
+With COP$=3.5$, $EF_{\text{DH}} \approx 33.9$ kg/MWh\(_{th}\), and $EF_{\text{grid}} \approx 57.3$ kg/MWh\(_e\), allocating PV \emph{first} to thermal needs via an HP avoids $\approx 118.65$ kgCO\(_2\) per MWh\(_e\) of PV, compared to $\approx 57.3$ kgCO\(_2\) if used for direct electricity. Consequently, the CO\(_2\)-optimal dispatch is PV $\rightarrow$ HP/TES $\rightarrow$ electricity $\rightarrow$ export/import.
+
+
+\subsection{Differences vs.\ Scenarios 1--3}
+\begin{itemize}
+  \item \textbf{vs.\ Scenario 1 (Baseline).} Scenario~4 introduces sector coupling and thermal flexibility, reducing both grid imports (indirectly, by shifting PV away from export and from electric residuals) and DH usage when HP and TES are available.
+  \item \textbf{vs.\ Scenario 2 (High PV).} Instead of exporting a large midday surplus, Scenario~4 converts PV into heat (directly to the building or to TES), improving local renewable utilisation and lowering DH demand peaks.
+  \item \textbf{vs.\ Scenario 3 (PV + Battery).} While Scenario~3 increases \emph{electric} self-consumption and provides electric peak shaving, Scenario~4 prioritises \emph{thermal} self-consumption by PV-to-heat. Combined analysis (Scen.\,3+4) highlights trade-offs between electric and thermal buffers under the same PV resource.
+\end{itemize}
+
+\subsection{Emissions and KPIs}
+CO$_2$ accounting reflects: (i) avoided grid imports (Scope~2) and DH usage, and (ii) the embodied HP electricity $W_{\mathrm{el}}=Q_{\mathrm{th}}/\mathrm{COP}$. Reported KPIs include: HP thermal output, TES charge/discharge and SoC, DH energy, PV export, peak heat demand after TES, and resulting CO$_2$ emissions and operating costs. The PyPSA implementation ensures traceability from inputs (PV, prices, loads) to outputs (flows, KPIs) with reproducible settings (cyclic stores, bounded SoC). :contentReference[oaicite:3]{index=3}
+
+
+
+
+\section{Scenario 5: Demand-Side Management (DSM)}
+\label{sec:scenario5-dsm}
+
+\subsection*{Description}
+This scenario simulates the impact of \textbf{demand-side management (DSM)} by shifting \emph{flexible} electrical or thermal loads (e.g., EV charging, appliance cycles, pre-heating/cooling, specific pool/stadium operations) in response to local renewable generation or price signals, without changing the annual energy consumption.
+
+\subsection*{Purpose}
+The goal is to \textbf{quantify the value of load flexibility} in (i) reducing operating costs, (ii) increasing self-consumption of variable renewables (PV), (iii) lowering grid imports and non-remunerative exports, and (iv) cutting associated emissions for a social housing building in Denmark. DSM is implemented in a PyPSA-based system model that includes PV, a battery, a heat pump (HP) and a thermal energy storage (TES).
+
+\subsection{Flexible-load share}
+We distinguish \emph{inflexible} loads (must be met immediately; e.g., lighting, refrigeration) from \emph{flexible} loads (schedulable without significant comfort loss; e.g., EV charging, dishwashers, heating with thermal inertia).
+We assume that a fraction of the total demand is \textbf{flexible and time-shiftable}:
+\begin{itemize}
+  \item \texttt{flexible\_load\_share = 0.3}
+\end{itemize}
+This implies that \textbf{30\% of the demand} can be scheduled. The choice is consistent with evidence from pilots and literature: the H2020 RESPOND project reported \(25\text{--}40\%\) residential flexibility, while studies such as \cite{lund2020flexibility} consider \(20\text{--}30\%\) realistic with smart appliances.
+
+\subsection{Temporal shifting logic}
+A second key parameter is the admissible \emph{shifting window}. We use:
+\begin{itemize}
+  \item \texttt{max\_shift\_hours = 3}
+\end{itemize}
+Any energy buffered by DSM via \emph{charge} must be \emph{dispatched} within \textbf{3 hours}. We model DSM as a \textbf{virtual storage of demand}:
+\begin{itemize}
+  \item Energy capacity sized on the flexible share times the maximum shift hours,
+  \item A constraint that enforces release within the 3-hour window (via energy capacity and/or rolling constraints),
+  \item Lossless operation, i.e., \(\eta_{\text{charge}}=\eta_{\text{dispatch}}=1.0\).
+\end{itemize}
+The choice of 3 hours is consistent with applications where thermal inertia enables pre-heating/cooling over \(2\text{--}3\) hours \cite{arteconi2012review} and appliance/EV programs shift \(1\text{--}4\) hours \cite{palensky2011demand}.
+
+\subsection{DSM energy balance (correct formulation)}
+Let \(L_{\text{inf}}(t)\) denote inflexible demand. The flexible baseline profile is \emph{not} fixed in time; instead, we replace it by a DSM buffer with \texttt{charge}(t) and \texttt{dispatch}(t). The \textbf{net demand seen by the system} is:
+\[
+L_{\text{net}}(t) \;=\; L_{\text{inf}}(t) \;+\; \texttt{charge}(t) \;-\; \texttt{dispatch}(t).
+\]
+This expression \emph{does} make sense because the original flexible baseline is \emph{removed} from the fixed load and handled through the DSM buffer. At the annual level, DSM is energy-neutral:
+\[
+\sum_{t}\texttt{charge}(t) \;=\; \sum_{t}\texttt{dispatch}(t),
+\]
+subject to the maximum-shift constraint (enforced via the buffer energy capacity). With a lossless virtual store and no standing losses, the state-of-charge (SOC) update is:
+\[
+\text{SOC}(t) \;=\; \text{SOC}(t-1) \;+\; \texttt{charge}(t) \;-\; \texttt{dispatch}(t),
+\]
+with \(0 \le \text{SOC}(t) \le E_{\text{DSM}}\) and \(E_{\text{DSM}} = \alpha \cdot P^{\text{flex}}_{\text{peak}} \cdot \texttt{max\_shift\_hours}\), where \(\alpha\) scales the design (e.g., based on the flexible-share peak).
+
+
+
+\subsection{Implementation in the model (high level)}
+\begin{itemize}
+  \item The flexible portion of demand is represented by a \textbf{virtual demand store} (one for electricity, optionally one for heat). \texttt{charge}(t) temporarily \emph{increases} demand when we want to absorb surplus PV (or low prices). \texttt{dispatch}(t) \emph{reduces} demand later within the 3-hour window.
+  \item The inflexible load remains as a standard fixed load.
+  \item Operating constraints: energy capacity, power limits, neutrality \(\sum \texttt{charge}=\sum \texttt{dispatch}\), and max-shift via capacity/window logic.
+  \item (Priority heuristics and cost signals—e.g., PV-first vs price-driven—are handled in a later subsection dedicated to control rules.)
+\end{itemize}
+
+\subsection{Expected effects}
+DSM enables:
+\begin{itemize}
+  \item Aligning flexible loads with PV peaks to \textbf{increase self-consumption},
+  \item \textbf{Avoiding exports} when local use is preferable,
+  \item \textbf{Reducing grid imports} during high-price hours,
+  \item Improving \textbf{autarky} and operational \textbf{resilience}.
+\end{itemize}
+Compared to electrochemical storage, DSM incurs no charging losses and no capex, making it an economically attractive complement for smart buildings.
+
+\subsection{Evaluation metrics}
+We assess: total and specific cost (€/MWh), PV self-consumption (\%), reduction in imports (MWh), avoided exports/curtailment (MWh), energy shifted by DSM (MWh) and equivalent shifting hours, and avoided emissions (tCO\textsubscript{2}) versus the baseline.
+
+\subsection{Hierarchy of Priorities for PV Use and Demand-Side Management}
+\label{subsec:priorita_pv_dsm}
+
+\paragraph{Guiding principle.}
+Every PV kWh is first used in the \emph{most direct} way, then in the \emph{smartest} way, and only lastly in the \emph{most inertial} way. The aim is to minimise conversions, standing losses, and round–trip losses. In this framework, DSM is not an energy store but a \emph{demand buffer} that anticipates or postpones electrical/thermal tasks to hours that are cheaper and cleaner.
+
+\paragraph{Charging side (routing of PV).}
+When PV is available, energy is routed through a clear hierarchy:
+\begin{enumerate}
+  \item \textbf{Direct supply to immediate needs.}
+        Priority is given to direct uses that avoid intermediate storage and related losses. In thermal terms, this means covering the \emph{immediate heat demand} via the heat pump (HP) whenever feasible; in electrical terms, it means feeding \emph{instantaneous building electric loads} directly from PV.
+  \item \textbf{DSM ``charging'' (smart shifting).}
+        If direct needs are saturated and PV remains, the model engages DSM as a demand buffer. Concretely, flexible tasks are time–shifted towards PV–rich hours:
+        \begin{itemize}
+          \item \emph{Thermal DSM (pre–heating)} is implemented as a flow on the building heat side (\textit{Building Heat $\rightarrow$ DSM Heat Store}). There is no explicit HP$\rightarrow$DSM link; however, by construction and due to the routing order, the energy driving this pre–heating is effectively PV via the HP.
+          \item \emph{Electrical DSM} (\textit{Building Elec $\rightarrow$ DSM Elec Store}) anticipates flexible electrical activities to soak up PV peaks and flatten the residual demand profile.
+        \end{itemize}
+  \item \textbf{Physical storage (inertial uses).}
+        Only after direct uses and DSM shifting do we route PV to physical stores: first to the \emph{thermal energy storage (TES)}, which suffers standing losses, and then to the \emph{battery}, which incurs round–trip losses.
+  \item \textbf{Export.}
+        If internal sinks are saturated, the residual PV is exported. Export is valued at the hourly market price and a negligible micro–offset is used only to break numerical ties, never to make export preferable to internal uses.
+\end{enumerate}
+
+\paragraph{Discharging side (release order).}
+To avoid simultaneous charge/discharge cycles within the same time step, releases carry a small positive operating penalty. The release order mirrors the philosophy above: first free \emph{behavioural flexibility} (electrical and thermal DSM dispatch), then discharge \emph{physical stores} (battery and TES). External supplies---\emph{grid import} for electricity and \emph{district heating} for heat---remain governed by real prices (and, where applicable, CO\textsubscript{2} factors), without artificial priorities.
+
+\paragraph{Structural safeguards.}
+Two modelling choices enforce coherent flows:
+\begin{enumerate}
+  \item \emph{Export only from PV.} Export pathways originate exclusively from the PV side; no export is allowed from building buses.
+  \item \emph{Separated network buses (Sell/Buy).} Grid Sell/Buy buses are kept distinct to prevent accounting loops and to decouple import valuation from export valuation.
+\end{enumerate}
+
+In addition, the HP is supplied from the PV side by design (any fallback from the grid is strongly penalised), preserving the PV–maximisation logic across both the electrical and thermal domains.
+
+\paragraph{Outcome.}
+This layered priority chain---\emph{PV $\rightarrow$ immediate heat (HP)}, \emph{PV $\rightarrow$ thermal DSM pre–heating (via Building Heat)}, \emph{PV $\rightarrow$ instantaneous building electric loads (before TES)}, \emph{electrical DSM}, \emph{TES}, \emph{battery}, \emph{export}, and finally \emph{external imports}---maximises overall efficiency, reduces operating cost, and systematically mitigates emissions. Exact numerical weights and tie–breaking rules are presented in the following subsection on priority parametrisation.
+
