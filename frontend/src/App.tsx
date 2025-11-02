@@ -3,6 +3,7 @@ import { RunList } from './components/RunList';
 import { ThreeScene } from './components/ThreeScene';
 import { PedPanel } from './components/PedPanel';
 import { ScenarioList } from './components/ScenarioList';
+import { AdvancedVisualizations } from './components/AdvancedVisualizations';
 import type { SimulationRun, SimulationStatePayload, WebSocketMessage } from './types';
 
 const DEFAULT_API_BASE = 'http://localhost:8000';
@@ -48,7 +49,7 @@ export default function App() {
   const [logs, setLogs] = useState<string[]>([]);
   const [wsStatus, setWsStatus] = useState<'idle' | 'connecting' | 'open' | 'closed'>('idle');
   const [tab, setTab] = useState<'runs' | 'scenarios'>('runs');
-  const [viewTab, setViewTab] = useState<'3d' | 'charts'>('3d');
+  const [viewTab, setViewTab] = useState<'3d' | 'charts' | 'advanced'>('3d');
   const [autoRun, setAutoRun] = useState(false);
   const [autoSteps, setAutoSteps] = useState(12);
   const [autoIntervalMs, setAutoIntervalMs] = useState(800);
@@ -78,23 +79,28 @@ export default function App() {
       setRuns(data);
 
       if (data.length === 0) {
-        setSelectedRunId(null);
+        setSelectedRunId((prev) => {
+          if (prev !== null) return null;
+          return prev;
+        });
         return;
       }
 
-      const currentExists = selectedRunId ? data.some((run) => run.id === selectedRunId) : false;
-      if (!currentExists) {
-        setSelectedRunId(data[0].id);
-      } else if (!selectedRunId) {
-        setSelectedRunId(data[0].id);
-      }
+      // Only update selectedRunId if current selection is invalid or missing
+      setSelectedRunId((prev) => {
+        const currentExists = prev ? data.some((run) => run.id === prev) : false;
+        if (!currentExists && data.length > 0) {
+          return data[0].id;
+        }
+        return prev;
+      });
     } catch (error) {
       console.error(error);
       appendLog(`Error loading runs: ${(error as Error).message}`);
     } finally {
       setLoadingRuns(false);
     }
-  }, [apiBase, appendLog, selectedRunId]);
+  }, [apiBase, appendLog]);
 
   useEffect(() => {
     loadRuns();
@@ -329,6 +335,7 @@ export default function App() {
                 </label>
                 <button className="button" onClick={() => setViewTab('3d')} disabled={viewTab==='3d'}>3D</button>
                 <button className="button" onClick={() => setViewTab('charts')} disabled={viewTab==='charts'}>Charts</button>
+                <button className="button" onClick={() => setViewTab('advanced')} disabled={viewTab==='advanced'}>Advanced</button>
                 <button className="button" onClick={() => handleStep(1)} disabled={!selectedRunId || selectedRun?.status !== 'running'}>Step Once</button>
                 <button className="button" onClick={() => handleStep(12)} disabled={!selectedRunId || selectedRun?.status !== 'running'}>Step ×12</button>
                 <button className="button" onClick={() => setAutoRun(v => !v)} disabled={!selectedRunId || selectedRun?.status !== 'running'}>
@@ -394,9 +401,25 @@ export default function App() {
                   <div className="viewer-panel" style={{ minHeight: 320, height: '100%' }}>
                     <ThreeScene navValue={metrics.fund_nav ?? 0} reduceMotion={reduceMotion} />
                   </div>
-                ) : (
+                ) : viewTab === 'charts' ? (
                   <div className="metrics-grid" style={{ height: '100%', overflow: 'auto' }}>
                     <PedPanel apiBase={apiBase} runId={selectedRunId} />
+                  </div>
+                ) : (
+                  <div style={{ height: '100%', width: '100%', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+                    <AdvancedVisualizations
+                      apiBase={apiBase}
+                      runId={selectedRunId}
+                      currentStep={metrics.timestep || 0}
+                      maxSteps={Math.max(metrics.timestep || 0, 1000)}
+                      onStepChange={(step) => {
+                        // Step to a specific point in history
+                        // Note: This would require a new API endpoint to load historical state
+                        // For now, we'll just log it
+                        console.log('Navigate to step:', step);
+                      }}
+                      onBack={() => setViewTab('3d')}
+                    />
                   </div>
                 )}
               </div>
