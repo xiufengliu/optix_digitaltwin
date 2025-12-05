@@ -8,7 +8,7 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, status
 
 from .db import session_scope
-from .models import SimulationRun, SimulationSnapshot, SimulationStatus, Scenario
+from .models import SimulationRun, SimulationSnapshot, SimulationStatus, Scenario, DigitalTwin
 from .optimizer import MeritOrderOptimizer, build_config_from_overrides
 from .schemas import (
     SimulationRunCreate,
@@ -18,6 +18,9 @@ from .schemas import (
     ScenarioCreate,
     ScenarioRead,
     ScenarioUpdate,
+    DigitalTwinCreate,
+    DigitalTwinRead,
+    DigitalTwinUpdate,
 )
 from .simulation_manager import SimulationManager
 
@@ -404,12 +407,21 @@ async def optimize_run_merit_order(run_id: str) -> dict:
 @router.post('/scenarios', response_model=ScenarioRead, tags=['scenarios'])
 async def create_scenario(payload: ScenarioCreate) -> ScenarioRead:
     with session_scope() as db:
+        # If linked to a digital twin, merge its config
+        config = payload.config_overrides or {}
+        if payload.digital_twin_id:
+            dt = db.get(DigitalTwin, payload.digital_twin_id)
+            if dt:
+                dt_config = _dt_to_config_overrides(dt.components or [], dt.connections or [])
+                config = {**dt_config, **config}
+        
         scenario = Scenario(
             id=str(uuid4()),
             name=payload.name,
             description=payload.description,
             details=payload.details,
-            config_overrides=payload.config_overrides or {},
+            config_overrides=config,
+            digital_twin_id=payload.digital_twin_id,
         )
         db.add(scenario)
         db.flush(); db.refresh(scenario)
@@ -446,6 +458,13 @@ async def update_scenario(scenario_id: str, payload: ScenarioUpdate) -> Scenario
             sc.details = payload.details
         if payload.config_overrides is not None:
             sc.config_overrides = payload.config_overrides
+        if payload.digital_twin_id is not None:
+            sc.digital_twin_id = payload.digital_twin_id
+            # Optionally merge DT config into overrides
+            dt = db.get(DigitalTwin, payload.digital_twin_id)
+            if dt:
+                dt_config = _dt_to_config_overrides(dt.components or [], dt.connections or [])
+                sc.config_overrides = {**dt_config, **(sc.config_overrides or {})}
         db.add(sc); db.flush(); db.refresh(sc)
         return ScenarioRead.from_orm(sc)
 
@@ -545,3 +564,218 @@ async def run_stream(websocket: WebSocket, run_id: str) -> None:
     except Exception as exc:  # pragma: no cover - defensive handler
         await websocket.send_json({"type": "error", "message": str(exc)})
         await websocket.close(code=1011)
+
+
+# ------------------ Digital Twins ------------------
+
+def _dt_to_read_dict(dt: DigitalTwin) -> dict:
+    return {
+        "id": dt.id,
+        "name": dt.name,
+        "description": dt.description,
+        "created_at": dt.created_at,
+        "updated_at": dt.updated_at,
+        "components": dt.components or [],
+        "connections": dt.connections or [],
+    }
+
+
+@router.post('/digital-twins', response_model=DigitalTwinRead, tags=['digital-twins'])
+async def create_digital_twin(payload: DigitalTwinCreate) -> DigitalTwinRead:
+    """Create a new digital twin configuration."""
+    with session_scope() as db:
+        dt = DigitalTwin(
+            id=str(uuid4()),
+            name=payload.name,
+            description=payload.description,
+            components=[c.model_dump() for c in payload.components],
+            connections=[c.model_dump(by_alias=True) for c in payload.connections],
+        )
+        db.add(dt)
+        db.flush()
+        db.refresh(dt)
+        return DigitalTwinRead.model_validate(_dt_to_read_dict(dt))
+
+
+@router.get('/digital-twins', response_model=List[DigitalTwinRead], tags=['digital-twins'])
+async def list_digital_twins() -> List[DigitalTwinRead]:
+    """List all digital twin configurations."""
+    with session_scope() as db:
+        rows = db.query(DigitalTwin).order_by(DigitalTwin.created_at.desc()).all()
+        return [DigitalTwinRead.model_validate(_dt_to_read_dict(r)) for r in rows]
+
+
+@router.get('/digital-twins/{dt_id}', response_model=DigitalTwinRead, tags=['digital-twins'])
+async def get_digital_twin(dt_id: str) -> DigitalTwinRead:
+    """Get a specific digital twin configuration."""
+    with session_scope() as db:
+        dt = db.get(DigitalTwin, dt_id)
+        if dt is None:
+            raise HTTPException(status_code=404, detail='Digital twin not found')
+        return DigitalTwinRead.model_validate(_dt_to_read_dict(dt))
+
+
+@router.patch('/digital-twins/{dt_id}', response_model=DigitalTwinRead, tags=['digital-twins'])
+async def update_digital_twin(dt_id: str, payload: DigitalTwinUpdate) -> DigitalTwinRead:
+    """Update a digital twin configuration."""
+    with session_scope() as db:
+        dt = db.get(DigitalTwin, dt_id)
+        if dt is None:
+            raise HTTPException(status_code=404, detail='Digital twin not found')
+        if payload.name is not None:
+            dt.name = payload.name
+        if payload.description is not None:
+            dt.description = payload.description
+        if payload.components is not None:
+            dt.components = [c.model_dump() for c in payload.components]
+        if payload.connections is not None:
+            dt.connections = [c.model_dump(by_alias=True) for c in payload.connections]
+        db.add(dt)
+        db.flush()
+        db.refresh(dt)
+        return DigitalTwinRead.model_validate(_dt_to_read_dict(dt))
+
+
+@router.delete('/digital-twins/{dt_id}', tags=['digital-twins'])
+async def delete_digital_twin(dt_id: str) -> dict:
+    """Delete a digital twin configuration."""
+    with session_scope() as db:
+        dt = db.get(DigitalTwin, dt_id)
+        if dt is None:
+            raise HTTPException(status_code=404, detail='Digital twin not found')
+        db.delete(dt)
+        return {"status": "deleted", "id": dt_id}
+
+
+@router.post('/digital-twins/{dt_id}/run', response_model=SimulationRunRead, tags=['digital-twins'])
+async def run_digital_twin(dt_id: str) -> SimulationRunRead:
+    """Create and start a simulation run from a digital twin configuration."""
+    manager = SimulationManager.get_global()
+    with session_scope() as db:
+        dt = db.get(DigitalTwin, dt_id)
+        if dt is None:
+            raise HTTPException(status_code=404, detail='Digital twin not found')
+
+        # Convert digital twin components to simulation config overrides
+        config_overrides = _dt_to_config_overrides(dt.components or [], dt.connections or [])
+
+        try:
+            sim_session = manager.create_session(config_overrides=config_overrides)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        run = SimulationRun(
+            id=str(uuid4()),
+            name=f"Run of {dt.name}",
+            notes=None,
+            config={
+                'data_path': str(manager.settings.data_path),
+                'investment_freq': manager.settings.investment_freq,
+                'enable_forecasts': manager.settings.enable_forecasts,
+                'model_dir': str(manager.settings.model_dir),
+                'scaler_dir': str(manager.settings.scaler_dir),
+                'digital_twin_config': {'components': dt.components, 'connections': dt.connections},
+            },
+            status=SimulationStatus.RUNNING,
+            session_id=sim_session.session_id,
+            digital_twin_id=dt.id,
+        )
+        db.add(run)
+        db.flush()
+        db.refresh(run)
+        return SimulationRunRead.model_validate(_run_to_read_dict(run))
+
+
+@router.get('/digital-twins/{dt_id}/ped-analysis', tags=['digital-twins'])
+async def analyze_digital_twin_ped(dt_id: str) -> dict:
+    """Analyze PED potential of a digital twin configuration."""
+    with session_scope() as db:
+        dt = db.get(DigitalTwin, dt_id)
+        if dt is None:
+            raise HTTPException(status_code=404, detail='Digital twin not found')
+
+        components = dt.components or []
+        gen_kw = 0.0
+        load_kw = 0.0
+        storage_kwh = 0.0
+        heat_kw = 0.0
+
+        for c in components:
+            ctype = c.get('type', '')
+            params = c.get('params', {})
+
+            if ctype == 'solar_pv':
+                gen_kw += float(params.get('capacity_kwp', 0))
+            elif ctype == 'wind_turbine':
+                gen_kw += float(params.get('capacity_kw', 0))
+            elif ctype == 'chp_unit':
+                gen_kw += float(params.get('electrical_kw', 0))
+                heat_kw += float(params.get('thermal_kw', 0))
+            elif ctype == 'smart_building':
+                load_kw += float(params.get('load_kw', 0))
+            elif ctype == 'load_center':
+                load_kw += float(params.get('base_load_kw', 0))
+            elif ctype == 'battery_storage':
+                storage_kwh += float(params.get('capacity_kwh', 0))
+            elif ctype == 'thermal_storage':
+                storage_kwh += float(params.get('capacity_kwh', 0))
+            elif ctype == 'heat_pump':
+                heat_kw += float(params.get('capacity_kw', 0))
+            elif ctype == 'district_heating':
+                heat_kw += float(params.get('capacity_kw', 0))
+
+        ratio = gen_kw / load_kw if load_kw > 0 else 0
+        is_ped = ratio >= 1.0
+
+        return {
+            'generation_kw': gen_kw,
+            'load_kw': load_kw,
+            'storage_kwh': storage_kwh,
+            'heat_capacity_kw': heat_kw,
+            'ped_ratio': ratio,
+            'is_ped_achievable': is_ped,
+            'recommendations': _get_ped_recommendations(gen_kw, load_kw, storage_kwh, ratio),
+        }
+
+
+def _dt_to_config_overrides(components: list, connections: list) -> dict:
+    """Convert digital twin components to simulation config overrides."""
+    overrides = {}
+    total_pv = 0.0
+    total_battery = 0.0
+    total_load = 0.0
+
+    for c in components:
+        ctype = c.get('type', '')
+        params = c.get('params', {})
+
+        if ctype == 'solar_pv':
+            total_pv += float(params.get('capacity_kwp', 0)) / 1000  # kW to MW
+        elif ctype == 'battery_storage':
+            total_battery += float(params.get('capacity_kwh', 0)) / 1000  # kWh to MWh
+        elif ctype == 'smart_building':
+            total_load += float(params.get('load_kw', 0)) / 1000
+        elif ctype == 'load_center':
+            total_load += float(params.get('base_load_kw', 0)) / 1000
+
+    if total_pv > 0:
+        overrides['owned_solar_capacity_mw'] = total_pv
+    if total_battery > 0:
+        overrides['owned_battery_capacity_mwh'] = total_battery
+
+    return overrides
+
+
+def _get_ped_recommendations(gen_kw: float, load_kw: float, storage_kwh: float, ratio: float) -> list:
+    """Generate recommendations to achieve PED status."""
+    recs = []
+    if ratio < 1.0:
+        deficit = load_kw - gen_kw
+        recs.append(f"Add {deficit:.0f} kW of generation capacity to achieve PED")
+        if storage_kwh < load_kw * 4:
+            recs.append(f"Consider adding {(load_kw * 4 - storage_kwh):.0f} kWh storage for 4h autonomy")
+    else:
+        recs.append("PED target achievable with current configuration")
+        if storage_kwh < gen_kw * 2:
+            recs.append("Consider more storage to maximize self-consumption")
+    return recs

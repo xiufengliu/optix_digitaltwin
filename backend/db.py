@@ -64,6 +64,10 @@ def _run_light_migrations() -> None:
                 conn.exec_driver_sql(
                     "ALTER TABLE simulation_runs ADD COLUMN scenario_id VARCHAR(36)"
                 )
+            if "digital_twin_id" not in cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE simulation_runs ADD COLUMN digital_twin_id VARCHAR(36)"
+                )
             # Add scenarios.details if missing
             res2 = conn.exec_driver_sql("PRAGMA table_info(scenarios)")
             cols2 = {row[1] for row in res2.fetchall()}  # type: ignore[index]
@@ -71,6 +75,11 @@ def _run_light_migrations() -> None:
                 conn.exec_driver_sql(
                     "ALTER TABLE scenarios ADD COLUMN details TEXT"
                 )
+            if "digital_twin_id" not in cols2:
+                conn.exec_driver_sql(
+                    "ALTER TABLE scenarios ADD COLUMN digital_twin_id VARCHAR(36)"
+                )
+            conn.commit()
     except Exception:
         # If anything goes wrong, we fail silently to avoid breaking startup.
         pass

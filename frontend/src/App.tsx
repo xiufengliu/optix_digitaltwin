@@ -1,9 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { RunList } from './components/RunList';
-import { ThreeScene } from './components/ThreeScene';
 import { PedPanel } from './components/PedPanel';
 import { ScenarioList } from './components/ScenarioList';
-import { AdvancedVisualizations } from './components/AdvancedVisualizations';
+import { DigitalTwinBuilder, type DigitalTwinConfig } from './components/DigitalTwinBuilder';
+import { DigitalTwin3DView } from './components/DigitalTwin3DView';
 import type { SimulationRun, SimulationStatePayload, WebSocketMessage } from './types';
 
 const DEFAULT_API_BASE = 'http://localhost:8000';
@@ -34,10 +34,13 @@ function formatNumber(value?: number | null): string {
 }
 
 export default function App() {
-  const apiBase = useMemo(
-    () => (import.meta.env?.VITE_API_BASE as string | undefined) ?? DEFAULT_API_BASE,
-    [],
-  );
+  // Use same origin if VITE_API_BASE is empty or not set
+  const apiBase = useMemo(() => {
+    const envBase = import.meta.env?.VITE_API_BASE as string | undefined;
+    if (envBase && envBase.trim()) return envBase;
+    // Use current origin (works with nginx proxy)
+    return window.location.origin;
+  }, []);
   // Build WS URLs directly from apiBase to preserve https→wss mapping
 
   const [runs, setRuns] = useState<SimulationRun[]>([]);
@@ -48,8 +51,10 @@ export default function App() {
   const [currentState, setCurrentState] = useState<SimulationStatePayload | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [wsStatus, setWsStatus] = useState<'idle' | 'connecting' | 'open' | 'closed'>('idle');
-  const [tab, setTab] = useState<'runs' | 'scenarios'>('runs');
-  const [viewTab, setViewTab] = useState<'3d' | 'charts' | 'advanced'>('3d');
+  const [tab, setTab] = useState<'runs' | 'scenarios' | 'builder'>('runs');
+  const [viewTab, setViewTab] = useState<'3d' | 'charts'>('3d');
+  const [builderView, setBuilderView] = useState<'2d' | '3d'>('2d');
+  const [dtConfig, setDtConfig] = useState<DigitalTwinConfig | null>(null);
   const [autoRun, setAutoRun] = useState(false);
   const [autoSteps, setAutoSteps] = useState(12);
   const [autoIntervalMs, setAutoIntervalMs] = useState(800);
@@ -328,40 +333,37 @@ export default function App() {
                 <h1>Digital Twin Console</h1>
                 <p style={{ color: '#64748b' }}>WebSocket status: {wsStatus}</p>
               </div>
-              <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-                <button className="button" onClick={() => setTab('scenarios')}>Scenarios</button>
-                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }} title="Reduce motion">
-                  <input type="checkbox" checked={reduceMotion} onChange={(e) => setReduceMotion(e.target.checked)} aria-label="Reduce motion" /> Reduce motion
+              <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                {/* Navigation */}
+                <button className="button" onClick={() => setTab('builder')}>🏗️ Digital Twin</button>
+                <button className="button button-secondary" onClick={() => setTab('scenarios')}>Scenarios</button>
+                
+                <span style={{ width: 1, height: 24, background: '#475569', margin: '0 0.25rem' }} />
+                
+                {/* View tabs */}
+                <button className="button" onClick={() => setViewTab('3d')} style={{ background: viewTab==='3d' ? '#2563eb' : '#475569' }}>3D</button>
+                <button className="button" onClick={() => setViewTab('charts')} style={{ background: viewTab==='charts' ? '#2563eb' : '#475569' }}>Charts</button>
+                
+                <span style={{ width: 1, height: 24, background: '#475569', margin: '0 0.25rem' }} />
+                
+                {/* Simulation controls */}
+                <button className="button" onClick={() => handleStep(1)} disabled={!selectedRunId || selectedRun?.status !== 'running'}>Step</button>
+                <button className="button" onClick={() => handleStep(12)} disabled={!selectedRunId || selectedRun?.status !== 'running'}>×12</button>
+                <button className="button" onClick={() => setAutoRun(v => !v)} disabled={!selectedRunId || selectedRun?.status !== 'running'} style={{ background: autoRun ? '#dc2626' : '#2563eb' }}>
+                  {autoRun ? '⏸ Pause' : '▶ Auto'}
+                </button>
+                
+                {/* Auto settings */}
+                <input type="number" value={autoSteps} min={1} max={288} onChange={(e) => setAutoSteps(Math.max(1, Math.min(288, Number(e.target.value))))} style={{ width: 50 }} title="Steps per interval" />
+                <input type="number" value={autoIntervalMs} min={100} step={100} onChange={(e) => setAutoIntervalMs(Math.max(100, Number(e.target.value)))} style={{ width: 60 }} title="Interval (ms)" />
+                
+                {/* Options */}
+                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: '0.8rem', color: '#94a3b8' }}>
+                  <input type="checkbox" checked={reduceMotion} onChange={(e) => setReduceMotion(e.target.checked)} /> Reduce motion
                 </label>
-                <button className="button" onClick={() => setViewTab('3d')} disabled={viewTab==='3d'}>3D</button>
-                <button className="button" onClick={() => setViewTab('charts')} disabled={viewTab==='charts'}>Charts</button>
-                <button className="button" onClick={() => setViewTab('advanced')} disabled={viewTab==='advanced'}>Advanced</button>
-                <button className="button" onClick={() => handleStep(1)} disabled={!selectedRunId || selectedRun?.status !== 'running'}>Step Once</button>
-                <button className="button" onClick={() => handleStep(12)} disabled={!selectedRunId || selectedRun?.status !== 'running'}>Step ×12</button>
-                <button className="button" onClick={() => setAutoRun(v => !v)} disabled={!selectedRunId || selectedRun?.status !== 'running'}>
-                  {autoRun ? 'Pause' : 'Auto'}
+                <button className="button button-secondary" onClick={() => setBottomCollapsed(v => !v)} style={{ padding: '0.35rem 0.5rem' }}>
+                  {bottomCollapsed ? '▼' : '▲'}
                 </button>
-                <button className="button" onClick={() => setBottomCollapsed(v => !v)}>
-                  {bottomCollapsed ? 'Show Bottom' : 'Hide Bottom'}
-                </button>
-                <span style={{ color: '#94a3b8', fontSize: '0.85rem' }}>steps/interval</span>
-                <input
-                  type="number"
-                  value={autoSteps}
-                  min={1}
-                  max={288}
-                  onChange={(e) => setAutoSteps(Math.max(1, Math.min(288, Number(e.target.value))))}
-                  style={{ width: 64 }}
-                />
-                <span style={{ color: '#94a3b8', fontSize: '0.85rem' }}>ms</span>
-                <input
-                  type="number"
-                  value={autoIntervalMs}
-                  min={100}
-                  step={100}
-                  onChange={(e) => setAutoIntervalMs(Math.max(100, Number(e.target.value)))}
-                  style={{ width: 72 }}
-                />
               </div>
             </div>
 
@@ -398,28 +400,26 @@ export default function App() {
                 }}
               >
                 {viewTab === '3d' ? (
-                  <div className="viewer-panel" style={{ minHeight: 320, height: '100%' }}>
-                    <ThreeScene navValue={metrics.fund_nav ?? 0} reduceMotion={reduceMotion} />
-                  </div>
-                ) : viewTab === 'charts' ? (
-                  <div className="metrics-grid" style={{ height: '100%', overflow: 'auto' }}>
-                    <PedPanel apiBase={apiBase} runId={selectedRunId} />
+                  <div className="viewer-panel" style={{ minHeight: 320, height: '100%', position: 'relative' }}>
+                    <div style={{ position: 'absolute', top: 8, right: 8, zIndex: 20, display: 'flex', gap: 8, alignItems: 'center', background: 'rgba(15,23,42,0.65)', padding: '6px 8px', borderRadius: 6, border: '1px solid rgba(148,163,184,0.2)' }}>
+                      <button className="button" onClick={() => setTab('builder')} style={{ fontSize: 11, padding: '4px 8px' }}>
+                        🏗️ Edit Digital Twin
+                      </button>
+                    </div>
+                    <DigitalTwin3DView config={dtConfig} animate={!reduceMotion} />
+                    {!dtConfig && (
+                      <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', textAlign: 'center', color: '#64748b' }}>
+                        <div style={{ fontSize: 48, marginBottom: 12 }}>🏗️</div>
+                        <div>No digital twin configured</div>
+                        <button className="button" onClick={() => setTab('builder')} style={{ marginTop: 12 }}>
+                          Create Digital Twin
+                        </button>
+                      </div>
+                    )}
                   </div>
                 ) : (
-                  <div style={{ height: '100%', width: '100%', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-                    <AdvancedVisualizations
-                      apiBase={apiBase}
-                      runId={selectedRunId}
-                      currentStep={metrics.timestep || 0}
-                      maxSteps={Math.max(metrics.timestep || 0, 1000)}
-                      onStepChange={(step) => {
-                        // Step to a specific point in history
-                        // Note: This would require a new API endpoint to load historical state
-                        // For now, we'll just log it
-                        console.log('Navigate to step:', step);
-                      }}
-                      onBack={() => setViewTab('3d')}
-                    />
+                  <div className="metrics-grid" style={{ height: '100%', overflow: 'auto' }}>
+                    <PedPanel apiBase={apiBase} runId={selectedRunId} />
                   </div>
                 )}
               </div>
@@ -492,6 +492,38 @@ export default function App() {
             </div>
           </div>
           <ScenarioList apiBase={apiBase} onRun={(runId) => { setTab('runs'); setSelectedRunId(runId); loadRuns(); }} />
+        </main>
+      )}
+      {tab === 'builder' && (
+        <main className="main-content" style={{ gridColumn: '1 / -1', display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
+          <div className="header" style={{ flexShrink: 0 }}>
+            <div>
+              <h1>🏗️ Digital Twin Builder</h1>
+              <p style={{ color: '#64748b', margin: 0 }}>Drag and drop components to design your PED system</p>
+            </div>
+            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+              <button className="button" onClick={() => setBuilderView('2d')} disabled={builderView === '2d'}>2D Editor</button>
+              <button className="button" onClick={() => setBuilderView('3d')} disabled={builderView === '3d'}>3D Preview</button>
+              <button className="button" onClick={() => setTab('scenarios')}>Scenarios</button>
+              <button className="button" onClick={() => setTab('runs')}>Back to Runs</button>
+            </div>
+          </div>
+          <div style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
+            {builderView === '2d' ? (
+              <DigitalTwinBuilder 
+                onConfigChange={setDtConfig} 
+                initialConfig={dtConfig} 
+                apiBase={apiBase}
+                onRunSimulation={(runId) => {
+                  setSelectedRunId(runId);
+                  setTab('runs');
+                  loadRuns();
+                }}
+              />
+            ) : (
+              <DigitalTwin3DView config={dtConfig} animate={!reduceMotion} />
+            )}
+          </div>
         </main>
       )}
     </div>

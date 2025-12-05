@@ -69,15 +69,35 @@ body {
   background: #2563eb;
   color: white;
   border: none;
-  padding: 0.5rem 1rem;
+  padding: 0.5rem 0.75rem;
   border-radius: 0.5rem;
   cursor: pointer;
   font-weight: 600;
+  font-size: 0.85rem;
+  white-space: nowrap;
+  min-width: fit-content;
 }
 
 .button:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+.button:hover:not(:disabled) {
+  background: #1d4ed8;
+}
+
+.button-sm {
+  padding: 0.35rem 0.6rem;
+  font-size: 0.8rem;
+}
+
+.button-secondary {
+  background: #475569;
+}
+
+.button-secondary:hover:not(:disabled) {
+  background: #334155;
 }
 
 .run-item {
@@ -220,3 +240,96 @@ body {
   border-radius: 4px;
 }
 .vsplit-divider:hover { background: rgba(148,163,184,0.35); }
+
+/* Digital Twin Builder styles */
+.dt-builder {
+  display: flex;
+  height: 100%;
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+.dt-palette {
+  width: 220px;
+  border-right: 1px solid #334155;
+  padding: 12px;
+  overflow-y: auto;
+}
+
+.dt-palette-item {
+  padding: 8px 10px;
+  background: #1e293b;
+  border-radius: 6px;
+  cursor: grab;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  border: 2px solid transparent;
+  transition: all 0.15s;
+}
+
+.dt-palette-item:hover {
+  border-color: currentColor;
+}
+
+.dt-palette-item:active {
+  cursor: grabbing;
+}
+
+.dt-canvas {
+  flex: 1;
+  position: relative;
+  background: linear-gradient(#0f172a 1px, transparent 1px),
+              linear-gradient(90deg, #0f172a 1px, transparent 1px),
+              #1e293b;
+  background-size: 20px 20px;
+  overflow: hidden;
+}
+
+.dt-component {
+  position: absolute;
+  width: 60px;
+  height: 60px;
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  cursor: move;
+  transition: box-shadow 0.15s;
+}
+
+.dt-component.selected {
+  box-shadow: 0 0 12px rgba(255, 255, 255, 0.3);
+}
+
+.dt-properties {
+  width: 260px;
+  border-left: 1px solid #334155;
+  padding: 12px;
+  overflow-y: auto;
+}
+
+.dt-ped-status {
+  margin-top: 20px;
+  padding: 12px;
+  background: #1e293b;
+  border-radius: 8px;
+}
+
+.dt-ped-achievable {
+  background: #166534;
+  padding: 4px 8px;
+  border-radius: 4px;
+  text-align: center;
+  margin-top: 6px;
+}
+
+.dt-ped-not-achievable {
+  background: #7f1d1d;
+  padding: 4px 8px;
+  border-radius: 4px;
+  text-align: center;
+  margin-top: 6px;
+}

@@ -70,3 +70,42 @@ export interface EnergySeries {
   gen_mw: number[];
   load_mw: number[];
 }
+
+// Digital Twin Builder Types
+export type DTComponentType = 
+  | 'smart_building'
+  | 'solar_pv'
+  | 'battery_storage'
+  | 'wind_turbine'
+  | 'district_heating'
+  | 'smart_grid'
+  | 'ev_charger'
+  | 'heat_pump'
+  | 'chp_unit'
+  | 'thermal_storage'
+  | 'load_center';
+
+export interface DTComponent {
+  id: string;
+  type: DTComponentType;
+  name: string;
+  x: number;
+  y: number;
+  params: Record<string, number | string | boolean>;
+}
+
+export interface DTConnection {
+  id: string;
+  from: string;
+  to: string;
+  type: 'electricity' | 'heat' | 'both';
+  capacity_kw?: number;
+}
+
+export interface DigitalTwinConfig {
+  id: string;
+  name: string;
+  components: DTComponent[];
+  connections: DTConnection[];
+  created_at: string;
+}

@@ -5,9 +5,9 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
 
-  // Inject API base (overridden at build time by CLI env if provided)
+  // Use same origin by default (empty string means relative to current host)
   define: {
-    'import.meta.env.VITE_API_BASE': JSON.stringify(process.env.VITE_API_BASE || 'http://localhost:8000'),
+    'import.meta.env.VITE_API_BASE': JSON.stringify(process.env.VITE_API_BASE || ''),
   },
 
   build: {
@@ -19,9 +19,7 @@ export default defineConfig({
     host: true,
     port: 5173,
     strictPort: true,
-    // allowedHosts can be set via environment variable for production deployments
     allowedHosts: process.env.VITE_ALLOWED_HOSTS ? process.env.VITE_ALLOWED_HOSTS.split(',') : [],
-    // HMR will use the default protocol (ws) for localhost, or can be overridden via env
     hmr: process.env.VITE_HMR_HOST ? { 
       protocol: process.env.VITE_HMR_PROTOCOL || 'wss', 
       host: process.env.VITE_HMR_HOST, 
@@ -34,7 +32,6 @@ export default defineConfig({
     host: true,
     port: 5173,
     strictPort: true,
-    // allowedHosts can be set via environment variable for production deployments
     allowedHosts: process.env.VITE_ALLOWED_HOSTS ? process.env.VITE_ALLOWED_HOSTS.split(',') : [],
   },
 })

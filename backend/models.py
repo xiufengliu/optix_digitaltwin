@@ -36,6 +36,7 @@ class SimulationRun(Base):
     config = Column(JSON().with_variant(SqliteJSON, "sqlite"), nullable=False, default=dict)
     notes = Column(Text, nullable=True)
     scenario_id = Column(String(36), ForeignKey("scenarios.id", ondelete="SET NULL"), nullable=True)
+    digital_twin_id = Column(String(36), ForeignKey("digital_twins.id", ondelete="SET NULL"), nullable=True)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -62,6 +63,7 @@ class Scenario(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
     config_overrides = Column(JSON().with_variant(SqliteJSON, "sqlite"), nullable=False, default=dict)
+    digital_twin_id = Column(String(36), ForeignKey("digital_twins.id", ondelete="SET NULL"), nullable=True)
 
     def to_dict(self):
         return {
@@ -72,6 +74,7 @@ class Scenario(Base):
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "config_overrides": self.config_overrides,
+            "digital_twin_id": self.digital_twin_id,
         }
 
 
@@ -85,3 +88,30 @@ class SimulationSnapshot(Base):
     timestep = Column(Integer, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     payload = Column(JSON().with_variant(SqliteJSON, "sqlite"), nullable=False)
+
+
+class DigitalTwin(Base):
+    """User-created digital twin configurations with components and connections."""
+
+    __tablename__ = "digital_twins"
+
+    id = Column(String(36), primary_key=True)
+    name = Column(String(120), nullable=False)
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # Components: list of {id, type, name, x, y, params}
+    components = Column(JSON().with_variant(SqliteJSON, "sqlite"), nullable=False, default=list)
+    # Connections: list of {id, from, to, type, capacity_kw}
+    connections = Column(JSON().with_variant(SqliteJSON, "sqlite"), nullable=False, default=list)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "components": self.components,
+            "connections": self.connections,
+        }

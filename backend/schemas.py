@@ -80,6 +80,7 @@ class ScenarioCreate(BaseModel):
     description: Optional[str] = None
     details: Optional[str] = None
     config_overrides: Dict[str, Any] = Field(default_factory=dict)
+    digital_twin_id: Optional[str] = None
 
 
 class ScenarioRead(BaseModel):
@@ -90,6 +91,7 @@ class ScenarioRead(BaseModel):
     created_at: datetime
     updated_at: datetime
     config_overrides: Dict[str, Any]
+    digital_twin_id: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -99,3 +101,52 @@ class ScenarioUpdate(BaseModel):
     description: Optional[str] = None
     details: Optional[str] = None
     config_overrides: Optional[Dict[str, Any]] = None
+    digital_twin_id: Optional[str] = None
+
+
+# -------- Digital Twin Schemas --------
+
+class DTComponentSchema(BaseModel):
+    id: str
+    type: str
+    name: str
+    x: float
+    y: float
+    params: Dict[str, Any] = Field(default_factory=dict)
+
+
+class DTConnectionSchema(BaseModel):
+    id: str
+    from_id: str = Field(alias='from')
+    to_id: str = Field(alias='to')
+    type: str = 'electricity'
+    capacity_kw: Optional[float] = None
+
+    class Config:
+        populate_by_name = True
+
+
+class DigitalTwinCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    components: list[DTComponentSchema] = Field(default_factory=list)
+    connections: list[DTConnectionSchema] = Field(default_factory=list)
+
+
+class DigitalTwinRead(BaseModel):
+    id: str
+    name: str
+    description: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+    components: list[Dict[str, Any]]
+    connections: list[Dict[str, Any]]
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DigitalTwinUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    components: Optional[list[DTComponentSchema]] = None
+    connections: Optional[list[DTConnectionSchema]] = None
