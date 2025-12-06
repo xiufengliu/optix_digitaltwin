@@ -298,9 +298,18 @@ export default function App() {
     }
   };
 
-  // Auto-run loop
+  // Check if simulation is completed (all agents terminated)
+  const isSimulationComplete = currentState?.terminations && 
+    Object.values(currentState.terminations).some(t => t === true);
+
+  // Auto-run loop - stops when simulation completes
   useEffect(() => {
     if (!autoRun || !selectedRunId || tab !== 'runs' || selectedRun?.status !== 'running') return;
+    if (isSimulationComplete) {
+      setAutoRun(false);
+      appendLog('✓ Simulation completed!');
+      return;
+    }
     let cancelled = false;
     let timer: number | undefined;
 
@@ -312,7 +321,7 @@ export default function App() {
 
     timer = window.setTimeout(tick, 0);
     return () => { cancelled = true; if (timer) window.clearTimeout(timer); };
-  }, [autoRun, autoSteps, autoIntervalMs, selectedRunId, tab, selectedRun?.status]);
+  }, [autoRun, autoSteps, autoIntervalMs, selectedRunId, tab, selectedRun?.status, isSimulationComplete]);
 
   const metrics = currentState?.metrics ?? {};
 
@@ -418,10 +427,17 @@ export default function App() {
                 
                 <span style={{ width: 1, height: 24, background: '#475569', margin: '0 0.25rem' }} />
                 
+                {/* Simulation status */}
+                {isSimulationComplete && (
+                  <span style={{ padding: '4px 10px', background: '#166534', borderRadius: 4, fontSize: 12, fontWeight: 600 }}>
+                    ✓ Completed
+                  </span>
+                )}
+                
                 {/* Simulation controls */}
-                <button className="button" onClick={() => handleStep(1)} disabled={!selectedRunId || selectedRun?.status !== 'running'}>Step</button>
-                <button className="button" onClick={() => handleStep(12)} disabled={!selectedRunId || selectedRun?.status !== 'running'}>×12</button>
-                <button className="button" onClick={() => setAutoRun(v => !v)} disabled={!selectedRunId || selectedRun?.status !== 'running'} style={{ background: autoRun ? '#dc2626' : '#2563eb' }}>
+                <button className="button" onClick={() => handleStep(1)} disabled={!selectedRunId || selectedRun?.status !== 'running' || isSimulationComplete}>Step</button>
+                <button className="button" onClick={() => handleStep(12)} disabled={!selectedRunId || selectedRun?.status !== 'running' || isSimulationComplete}>×12</button>
+                <button className="button" onClick={() => setAutoRun(v => !v)} disabled={!selectedRunId || selectedRun?.status !== 'running' || isSimulationComplete} style={{ background: autoRun ? '#dc2626' : '#2563eb' }}>
                   {autoRun ? '⏸ Pause' : '▶ Auto'}
                 </button>
                 
