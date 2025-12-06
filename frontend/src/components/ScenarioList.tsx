@@ -139,8 +139,8 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
   });
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '360px 1fr', gap: '1rem', height: '100%', overflow: 'hidden' }}>
-      <div className="sidebar" style={{ height: '100%', overflowY: 'auto' }}>
+    <div style={{ display: 'grid', gridTemplateColumns: '360px 1fr', gap: '1rem', height: '100%', minHeight: 0 }}>
+      <div className="sidebar" style={{ height: '100%', overflowY: 'auto', minHeight: 0 }}>
         <div className="header" style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
           <h2 style={{ flex: 1 }}>Scenarios</h2>
           <button className="button" onClick={() => { setSelectedId(null); setName('My Scenario'); setDesc(''); setDetails(''); setOverrides({ ...defaultOverrides }); setShowGuide(true); }}>New</button>
@@ -194,7 +194,7 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
           })}
         </div>
       </div>
-      <div className="main-content" style={{ height: '100%', overflowY: 'auto' }}>
+      <div className="main-content" style={{ height: '100%', overflowY: 'auto', minHeight: 0, padding: 0 }}>
         <div className="header"><h2>Create / Edit Scenario</h2></div>
         {runError && (
           <div className="metric-card" style={{ color: '#fecaca' }}>{runError}</div>
