@@ -240,15 +240,53 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     }
   };
 
+  // Connection validation rules - which components can connect
+  const VALID_CONNECTIONS: Record<DTComponentType, { targets: DTComponentType[]; type: 'electricity' | 'heat' | 'both' }> = {
+    solar_pv: { targets: ['smart_building', 'battery_storage', 'smart_grid', 'ev_charger', 'load_center', 'heat_pump'], type: 'electricity' },
+    wind_turbine: { targets: ['smart_building', 'battery_storage', 'smart_grid', 'ev_charger', 'load_center', 'heat_pump'], type: 'electricity' },
+    battery_storage: { targets: ['smart_building', 'smart_grid', 'ev_charger', 'load_center', 'solar_pv', 'wind_turbine'], type: 'electricity' },
+    smart_grid: { targets: ['smart_building', 'battery_storage', 'ev_charger', 'load_center', 'heat_pump'], type: 'electricity' },
+    ev_charger: { targets: ['smart_building', 'smart_grid', 'battery_storage'], type: 'electricity' },
+    load_center: { targets: ['smart_building', 'smart_grid', 'battery_storage'], type: 'electricity' },
+    heat_pump: { targets: ['smart_building', 'thermal_storage', 'district_heating'], type: 'heat' },
+    district_heating: { targets: ['smart_building', 'thermal_storage', 'heat_pump'], type: 'heat' },
+    thermal_storage: { targets: ['smart_building', 'heat_pump', 'district_heating'], type: 'heat' },
+    chp_unit: { targets: ['smart_building', 'smart_grid', 'battery_storage', 'thermal_storage'], type: 'both' },
+    smart_building: { targets: ['smart_grid', 'ev_charger', 'load_center'], type: 'electricity' },
+  };
+
+  const validateConnection = (fromId: string, toId: string): { valid: boolean; type: 'electricity' | 'heat' | 'both'; error?: string } => {
+    const fromComp = components.find(c => c.id === fromId);
+    const toComp = components.find(c => c.id === toId);
+    if (!fromComp || !toComp) return { valid: false, type: 'electricity', error: 'Component not found' };
+    
+    const rules = VALID_CONNECTIONS[fromComp.type];
+    if (!rules.targets.includes(toComp.type)) {
+      // Try reverse direction
+      const reverseRules = VALID_CONNECTIONS[toComp.type];
+      if (reverseRules.targets.includes(fromComp.type)) {
+        return { valid: true, type: reverseRules.type };
+      }
+      return { valid: false, type: 'electricity', error: `Cannot connect ${COMPONENT_DEFS[fromComp.type].label} to ${COMPONENT_DEFS[toComp.type].label}` };
+    }
+    return { valid: true, type: rules.type };
+  };
+
   const handleComponentClick = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     if (connectingFrom && connectingFrom !== id) {
-      // Create connection
+      // Validate and create connection
+      const validation = validateConnection(connectingFrom, id);
+      if (!validation.valid) {
+        alert(validation.error);
+        setConnectingFrom(null);
+        return;
+      }
       const newConn: DTConnection = {
         id: `conn-${Date.now()}`,
         from: connectingFrom,
         to: id,
-        type: 'electricity',
+        type: validation.type,
         capacity_kw: 100
       };
       setConnections(prev => [...prev, newConn]);
@@ -293,23 +331,91 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
 
   const selectedComp = components.find(c => c.id === selectedId);
 
-  // Calculate PED potential
-  const calcPedPotential = () => {
-    let genKw = 0, loadKw = 0, storageKwh = 0;
-    components.forEach(c => {
-      if (c.type === 'solar_pv') genKw += Number(c.params.capacity_kwp || 0);
-      if (c.type === 'wind_turbine') genKw += Number(c.params.capacity_kw || 0);
-      if (c.type === 'chp_unit') genKw += Number(c.params.electrical_kw || 0);
-      if (c.type === 'smart_building') loadKw += Number(c.params.load_kw || 0);
-      if (c.type === 'load_center') loadKw += Number(c.params.base_load_kw || 0);
-      if (c.type === 'battery_storage') storageKwh += Number(c.params.capacity_kwh || 0);
-      if (c.type === 'thermal_storage') storageKwh += Number(c.params.capacity_kwh || 0);
-    });
-    const ratio = loadKw > 0 ? genKw / loadKw : 0;
-    return { genKw, loadKw, storageKwh, ratio, isPed: ratio >= 1 };
+  // Check if component is properly connected
+  const getComponentStatus = (compId: string): 'valid' | 'isolated' | 'warning' => {
+    const hasConnection = connections.some(c => c.from === compId || c.to === compId);
+    if (!hasConnection) return 'isolated';
+    return 'valid';
   };
 
-  const ped = calcPedPotential();
+  // Calculate comprehensive PED metrics with annual estimates
+  const calcPedMetrics = () => {
+    let genKw = 0, loadKw = 0, storageKwh = 0, thermalStorageKwh = 0;
+    let solarKwp = 0, windKw = 0, chpKw = 0, heatPumpKw = 0;
+    let evChargerKw = 0, batteryKwh = 0;
+    
+    components.forEach(c => {
+      if (c.type === 'solar_pv') { solarKwp += Number(c.params.capacity_kwp || 0); genKw += Number(c.params.capacity_kwp || 0); }
+      if (c.type === 'wind_turbine') { windKw += Number(c.params.capacity_kw || 0); genKw += Number(c.params.capacity_kw || 0); }
+      if (c.type === 'chp_unit') { chpKw += Number(c.params.electrical_kw || 0); genKw += Number(c.params.electrical_kw || 0); }
+      if (c.type === 'smart_building') loadKw += Number(c.params.load_kw || 0);
+      if (c.type === 'load_center') loadKw += Number(c.params.base_load_kw || 0);
+      if (c.type === 'ev_charger') evChargerKw += Number(c.params.num_ports || 0) * Number(c.params.power_per_port_kw || 0);
+      if (c.type === 'heat_pump') heatPumpKw += Number(c.params.capacity_kw || 0);
+      if (c.type === 'battery_storage') { batteryKwh += Number(c.params.capacity_kwh || 0); storageKwh += Number(c.params.capacity_kwh || 0); }
+      if (c.type === 'thermal_storage') thermalStorageKwh += Number(c.params.capacity_kwh || 0);
+    });
+
+    // Annual estimates (Denmark typical values)
+    const solarCF = 0.11; // ~1000 kWh/kWp/year in Denmark
+    const windCF = 0.25;  // ~2200 kWh/kW/year
+    const chpCF = 0.6;    // 60% capacity factor
+    const loadFactor = 0.35; // Office building load factor
+    
+    const annualGenMwh = (solarKwp * solarCF + windKw * windCF + chpKw * chpCF) * 8.76; // 8760h/1000
+    const annualLoadMwh = loadKw * loadFactor * 8.76;
+    
+    // Self-consumption estimate (simplified - depends on storage)
+    const storageHours = loadKw > 0 ? batteryKwh / loadKw : 0;
+    const baseSelfConsumption = 0.3; // 30% without storage
+    const selfConsumptionBoost = Math.min(storageHours * 0.1, 0.4); // +10% per hour of storage, max +40%
+    const selfConsumptionRate = Math.min(baseSelfConsumption + selfConsumptionBoost, 0.85);
+    
+    const selfConsumedMwh = Math.min(annualGenMwh * selfConsumptionRate, annualLoadMwh);
+    const gridExportMwh = annualGenMwh - selfConsumedMwh;
+    const gridImportMwh = Math.max(annualLoadMwh - selfConsumedMwh, 0);
+    const selfSufficiencyRate = annualLoadMwh > 0 ? selfConsumedMwh / annualLoadMwh : 0;
+    
+    // Cost estimates (EUR, Denmark 2024 prices)
+    const gridImportPrice = 0.30; // €/kWh avg
+    const gridExportPrice = 0.08; // €/kWh feed-in
+    const annualGridCost = gridImportMwh * 1000 * gridImportPrice - gridExportMwh * 1000 * gridExportPrice;
+    
+    // CAPEX estimates (simplified)
+    const capexSolar = solarKwp * 1200; // €1200/kWp
+    const capexBattery = batteryKwh * 400; // €400/kWh
+    const capexWind = windKw * 1500; // €1500/kW
+    const totalCapex = capexSolar + capexBattery + capexWind;
+    
+    // CO2 estimates (kg/year)
+    const gridEmissionFactor = 0.14; // kg CO2/kWh Denmark grid
+    const annualCO2 = gridImportMwh * 1000 * gridEmissionFactor;
+    const baselineCO2 = annualLoadMwh * 1000 * gridEmissionFactor;
+    const co2Savings = baselineCO2 - annualCO2;
+    
+    // PED status
+    const netBalance = annualGenMwh - annualLoadMwh;
+    const ratio = annualLoadMwh > 0 ? annualGenMwh / annualLoadMwh : 0;
+    const isPed = netBalance >= 0;
+    const shortfallKw = isPed ? 0 : (annualLoadMwh - annualGenMwh) / 8.76 / solarCF; // kWp needed
+    
+    return {
+      // Instantaneous
+      genKw, loadKw, storageKwh, ratio, isPed,
+      // Annual estimates
+      annualGenMwh, annualLoadMwh, netBalance,
+      selfConsumptionRate, selfSufficiencyRate,
+      gridImportMwh, gridExportMwh,
+      // Economics
+      annualGridCost, totalCapex,
+      // Environment
+      annualCO2, co2Savings,
+      // Recommendations
+      shortfallKw,
+    };
+  };
+
+  const ped = calcPedMetrics();
 
   const clearAll = () => {
     if (confirm('Clear all components?')) {
@@ -660,17 +766,91 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
           ))}
         </div>
 
-        {/* PED Status */}
-        <div style={{ marginTop: 20, padding: 12, background: '#1e293b', borderRadius: 8 }}>
-          <h4 style={{ margin: '0 0 8px', fontSize: 12, color: '#94a3b8' }}>PED Potential</h4>
-          <div style={{ fontSize: 11, lineHeight: 1.6 }}>
-            <div>Generation: <b style={{ color: '#22c55e' }}>{ped.genKw.toFixed(0)} kW</b></div>
-            <div>Load: <b style={{ color: '#ef4444' }}>{ped.loadKw.toFixed(0)} kW</b></div>
-            <div>Storage: <b style={{ color: '#3b82f6' }}>{ped.storageKwh.toFixed(0)} kWh</b></div>
-            <div style={{ marginTop: 6, padding: '4px 8px', borderRadius: 4, background: ped.isPed ? '#166534' : '#7f1d1d', textAlign: 'center' }}>
-              {ped.isPed ? '✓ PED Achievable' : `Ratio: ${(ped.ratio * 100).toFixed(0)}%`}
+        {/* PED Dashboard */}
+        <div style={{ marginTop: 20, padding: 10, background: '#1e293b', borderRadius: 8, fontSize: 10 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+            <h4 style={{ margin: 0, fontSize: 12, color: '#94a3b8' }}>PED Status</h4>
+            <span style={{ padding: '2px 6px', borderRadius: 4, fontSize: 9, background: ped.isPed ? '#166534' : '#7f1d1d' }}>
+              {ped.isPed ? '✓ PED' : `${(ped.ratio * 100).toFixed(0)}%`}
+            </span>
+          </div>
+          
+          {/* Annual Energy Balance Bar */}
+          <div style={{ marginBottom: 8 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
+              <span style={{ color: '#64748b' }}>Annual Balance</span>
+              <span style={{ color: ped.netBalance >= 0 ? '#22c55e' : '#ef4444' }}>
+                {ped.netBalance >= 0 ? '+' : ''}{ped.netBalance.toFixed(1)} MWh
+              </span>
+            </div>
+            <div style={{ height: 6, background: '#334155', borderRadius: 3, overflow: 'hidden' }}>
+              <div style={{ 
+                height: '100%', 
+                width: `${Math.min(ped.ratio * 100, 100)}%`,
+                background: ped.isPed ? 'linear-gradient(90deg, #22c55e, #16a34a)' : 'linear-gradient(90deg, #ef4444, #dc2626)',
+                borderRadius: 3
+              }} />
             </div>
           </div>
+
+          {/* Key Metrics */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4, marginBottom: 8 }}>
+            <div style={{ padding: 4, background: '#0f172a', borderRadius: 4 }}>
+              <div style={{ color: '#64748b', fontSize: 9 }}>Generation</div>
+              <div style={{ color: '#22c55e', fontWeight: 600 }}>{ped.annualGenMwh.toFixed(0)} MWh/y</div>
+            </div>
+            <div style={{ padding: 4, background: '#0f172a', borderRadius: 4 }}>
+              <div style={{ color: '#64748b', fontSize: 9 }}>Consumption</div>
+              <div style={{ color: '#ef4444', fontWeight: 600 }}>{ped.annualLoadMwh.toFixed(0)} MWh/y</div>
+            </div>
+            <div style={{ padding: 4, background: '#0f172a', borderRadius: 4 }}>
+              <div style={{ color: '#64748b', fontSize: 9 }}>Self-Consumption</div>
+              <div style={{ color: '#eab308', fontWeight: 600 }}>{(ped.selfConsumptionRate * 100).toFixed(0)}%</div>
+            </div>
+            <div style={{ padding: 4, background: '#0f172a', borderRadius: 4 }}>
+              <div style={{ color: '#64748b', fontSize: 9 }}>Self-Sufficiency</div>
+              <div style={{ color: '#3b82f6', fontWeight: 600 }}>{(ped.selfSufficiencyRate * 100).toFixed(0)}%</div>
+            </div>
+          </div>
+
+          {/* Grid Interaction */}
+          <div style={{ padding: 6, background: '#0f172a', borderRadius: 4, marginBottom: 8 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span style={{ color: '#64748b' }}>Grid Import:</span>
+              <span style={{ color: '#f97316' }}>{ped.gridImportMwh.toFixed(1)} MWh/y</span>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span style={{ color: '#64748b' }}>Grid Export:</span>
+              <span style={{ color: '#22c55e' }}>{ped.gridExportMwh.toFixed(1)} MWh/y</span>
+            </div>
+          </div>
+
+          {/* Economics & Environment */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4 }}>
+            <div style={{ padding: 4, background: '#0f172a', borderRadius: 4 }}>
+              <div style={{ color: '#64748b', fontSize: 9 }}>Est. Grid Cost</div>
+              <div style={{ color: '#f97316', fontWeight: 600 }}>€{(ped.annualGridCost/1000).toFixed(1)}k/y</div>
+            </div>
+            <div style={{ padding: 4, background: '#0f172a', borderRadius: 4 }}>
+              <div style={{ color: '#64748b', fontSize: 9 }}>Est. CAPEX</div>
+              <div style={{ color: '#8b5cf6', fontWeight: 600 }}>€{(ped.totalCapex/1000).toFixed(0)}k</div>
+            </div>
+            <div style={{ padding: 4, background: '#0f172a', borderRadius: 4 }}>
+              <div style={{ color: '#64748b', fontSize: 9 }}>CO₂ Emissions</div>
+              <div style={{ color: '#94a3b8', fontWeight: 600 }}>{(ped.annualCO2/1000).toFixed(1)} t/y</div>
+            </div>
+            <div style={{ padding: 4, background: '#0f172a', borderRadius: 4 }}>
+              <div style={{ color: '#64748b', fontSize: 9 }}>CO₂ Savings</div>
+              <div style={{ color: '#22c55e', fontWeight: 600 }}>{(ped.co2Savings/1000).toFixed(1)} t/y</div>
+            </div>
+          </div>
+
+          {/* Recommendation */}
+          {!ped.isPed && ped.shortfallKw > 0 && (
+            <div style={{ marginTop: 8, padding: 6, background: '#1e3a5f', borderRadius: 4, fontSize: 9 }}>
+              💡 Add ~{ped.shortfallKw.toFixed(0)} kWp solar to achieve PED
+            </div>
+          )}
         </div>
 
         {/* Actions */}
@@ -773,20 +953,34 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
               <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
                 <polygon points="0 0, 10 3.5, 0 7" fill="#64748b" />
               </marker>
+              <marker id="arrowhead-heat" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                <polygon points="0 0, 10 3.5, 0 7" fill="#ef4444" />
+              </marker>
             </defs>
             {connections.map(conn => {
               const fromComp = components.find(c => c.id === conn.from);
               const toComp = components.find(c => c.id === conn.to);
               if (!fromComp || !toComp) return null;
               const color = conn.type === 'heat' ? '#ef4444' : conn.type === 'both' ? '#a855f7' : '#3b82f6';
+              const x1 = fromComp.x + 30, y1 = fromComp.y + 30;
+              const x2 = toComp.x + 30, y2 = toComp.y + 30;
               return (
                 <g key={conn.id} onClick={() => setSelectedId(conn.id)} style={{ cursor: 'pointer', pointerEvents: 'stroke' }}>
                   <line
-                    x1={fromComp.x + 30} y1={fromComp.y + 30}
-                    x2={toComp.x + 30} y2={toComp.y + 30}
+                    x1={x1} y1={y1} x2={x2} y2={y2}
                     stroke={color} strokeWidth={3} strokeDasharray={conn.type === 'heat' ? '8,4' : 'none'}
                     markerEnd="url(#arrowhead)"
                   />
+                  {/* Animated flow dot */}
+                  <circle r="4" fill={color}>
+                    <animateMotion dur="2s" repeatCount="indefinite" path={`M${x1},${y1} L${x2},${y2}`} />
+                  </circle>
+                  <circle r="4" fill={color}>
+                    <animateMotion dur="2s" repeatCount="indefinite" begin="0.66s" path={`M${x1},${y1} L${x2},${y2}`} />
+                  </circle>
+                  <circle r="4" fill={color}>
+                    <animateMotion dur="2s" repeatCount="indefinite" begin="1.33s" path={`M${x1},${y1} L${x2},${y2}`} />
+                  </circle>
                 </g>
               );
             })}
@@ -797,6 +991,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
             const def = COMPONENT_DEFS[comp.type];
             const isSelected = selectedId === comp.id;
             const isConnecting = connectingFrom === comp.id;
+            const status = getComponentStatus(comp.id);
             return (
               <div
                 key={comp.id}
@@ -810,17 +1005,34 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
                   width: 60,
                   height: 60,
                   background: `${def.color}22`,
-                  border: `2px solid ${isSelected || isConnecting ? '#fff' : def.color}`,
+                  border: `2px solid ${isSelected || isConnecting ? '#fff' : status === 'isolated' ? '#f97316' : def.color}`,
                   borderRadius: 8,
                   display: 'flex',
                   flexDirection: 'column',
                   alignItems: 'center',
                   justifyContent: 'center',
                   cursor: 'move',
-                  boxShadow: isSelected ? '0 0 12px rgba(255,255,255,0.3)' : 'none',
+                  boxShadow: isSelected ? '0 0 12px rgba(255,255,255,0.3)' : status === 'isolated' ? '0 0 8px rgba(249,115,22,0.5)' : 'none',
                   transition: 'box-shadow 0.15s'
                 }}
               >
+                {/* Status badge */}
+                <div style={{
+                  position: 'absolute',
+                  top: -6,
+                  right: -6,
+                  width: 14,
+                  height: 14,
+                  borderRadius: '50%',
+                  background: status === 'valid' ? '#22c55e' : '#f97316',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: 8,
+                  border: '2px solid #0f172a'
+                }}>
+                  {status === 'valid' ? '✓' : '!'}
+                </div>
                 <span style={{ fontSize: 24 }}>{def.icon}</span>
                 <span style={{ fontSize: 9, color: '#94a3b8', marginTop: 2, textAlign: 'center', maxWidth: 56, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {comp.name}
