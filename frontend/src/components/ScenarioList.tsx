@@ -238,12 +238,13 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
             ) : (
               <>
                 <button className="button" onClick={saveScenario}>Save Scenario</button>
-                <button className="button" onClick={async () => {
-                  if (!selectedId) return;
-                  const url = join(`/scenarios/${selectedId}`);
-                  const r = await fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, description: desc, details, config_overrides: overrides }) });
-                  if (r.ok) { await load(); }
-                }} disabled={!selectedId}>Save Changes</button>
+                {selectedId && (
+                  <button className="button" onClick={async () => {
+                    const url = join(`/scenarios/${selectedId}`);
+                    const r = await fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, description: desc, details, config_overrides: overrides }) });
+                    if (r.ok) { await load(); }
+                  }}>Save Changes</button>
+                )}
               </>
             )}
           </div>
