@@ -211,8 +211,9 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
             {selectedId && isPaperScenario(scenarios.find(s => s.id === selectedId)?.name || '') ? (
               <>
                 <button className="button" onClick={async () => {
-                  // Save As: create a new copy with modified name
-                  const copyName = name.includes('(Copy)') ? name : `${name} (Copy)`;
+                  // Save As: create a new user scenario - remove "Scenario X:" prefix
+                  const baseName = name.replace(/^Scenario \d+:\s*/, '');
+                  const copyName = `My ${baseName}`;
                   const payload = { name: copyName, description: desc, details, config_overrides: overrides };
                   const r = await fetch(join('/scenarios'), {
                     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
@@ -221,7 +222,8 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
                     const newScenario = await r.json();
                     await load(); 
                     setSelectedId(newScenario.id);
-                    alert('New scenario created from paper scenario!');
+                    setName(copyName);
+                    alert('New user scenario created!');
                   }
                 }}>Save As New</button>
                 <span style={{ fontSize: 11, color: '#94a3b8' }}>Paper scenarios are read-only. Changes apply to this session only.</span>
