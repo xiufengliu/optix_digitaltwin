@@ -113,8 +113,15 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
 
   useEffect(() => { loadCompare(); }, []);
 
-  // Paper scenarios (S1-S5) cannot be deleted
-  const isPaperScenario = (name: string) => /^Scenario [1-5]:/.test(name);
+  // Paper scenarios (S1-S5) - exact names only, not copies
+  const PAPER_SCENARIO_NAMES = [
+    'Scenario 1: Baseline',
+    'Scenario 2: High PV Deployment', 
+    'Scenario 3: High PV + Battery (4h)',
+    'Scenario 4: High PV + Large Battery',
+    'Scenario 5: DSM (Flexible Demand)',
+  ];
+  const isPaperScenario = (name: string) => PAPER_SCENARIO_NAMES.includes(name);
   
   // Sort: paper scenarios first (S1-S5 in order), then user scenarios
   const sortedScenarios = [...scenarios].sort((a, b) => {
