@@ -115,6 +115,21 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
 
   // Paper scenarios (S1-S5) cannot be deleted
   const isPaperScenario = (name: string) => /^Scenario [1-5]:/.test(name);
+  
+  // Sort: paper scenarios first (S1-S5 in order), then user scenarios
+  const sortedScenarios = [...scenarios].sort((a, b) => {
+    const aIsPaper = isPaperScenario(a.name);
+    const bIsPaper = isPaperScenario(b.name);
+    if (aIsPaper && bIsPaper) {
+      // Extract scenario number and sort ascending
+      const aNum = parseInt(a.name.match(/Scenario (\d)/)?.[1] || '0');
+      const bNum = parseInt(b.name.match(/Scenario (\d)/)?.[1] || '0');
+      return aNum - bNum;
+    }
+    if (aIsPaper) return -1; // Paper scenarios first
+    if (bIsPaper) return 1;
+    return 0; // Keep original order for user scenarios
+  });
 
   return (
     <div style={{ display: 'grid', gridTemplateColumns: '360px 1fr', gap: '1rem', height: '100%' }}>
@@ -125,7 +140,7 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
           <button className="button" onClick={load} disabled={loading}>Refresh</button>
         </div>
         <div style={{ marginTop: '1rem' }}>
-          {scenarios.map((s) => {
+          {sortedScenarios.map((s) => {
             const isPaper = isPaperScenario(s.name);
             return (
             <div 
