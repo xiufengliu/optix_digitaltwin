@@ -48,27 +48,27 @@ function createComponentModel(type: DTComponentType, params: Record<string, any>
       const floors = params.floors || 5;
       const height = floors * 0.6;
       const building = new THREE.Mesh(
-        new THREE.BoxGeometry(2, height, 1.5),
+        new THREE.BoxGeometry(2.4, height, 1.5),
         new THREE.MeshStandardMaterial({ color: 0x4a5568 })
       );
       building.position.y = height / 2;
       group.add(building);
       
-      // Windows
+      // Windows - 4 per floor
       for (let f = 0; f < floors; f++) {
-        for (let w = 0; w < 3; w++) {
+        for (let w = 0; w < 4; w++) {
           const window = new THREE.Mesh(
-            new THREE.BoxGeometry(0.4, 0.3, 0.02),
+            new THREE.BoxGeometry(0.35, 0.3, 0.02),
             new THREE.MeshStandardMaterial({ color: 0x87ceeb, emissive: 0x2244aa, emissiveIntensity: 0.3 })
           );
-          window.position.set(w * 0.6 - 0.6, f * 0.6 + 0.4, 0.76);
+          window.position.set(w * 0.55 - 0.825, f * 0.6 + 0.4, 0.76);
           group.add(window);
         }
       }
       
       // Roof
       const roof = new THREE.Mesh(
-        new THREE.BoxGeometry(2.1, 0.1, 1.6),
+        new THREE.BoxGeometry(2.5, 0.1, 1.6),
         new THREE.MeshStandardMaterial({ color: 0x2d3748 })
       );
       roof.position.y = height + 0.05;
@@ -419,8 +419,8 @@ function createLabel(text: string, position: THREE.Vector3, yOffset: number): TH
   const material = new THREE.SpriteMaterial({ map: texture, transparent: true });
   const sprite = new THREE.Sprite(material);
   sprite.position.copy(position);
-  sprite.position.y = yOffset + 1.5;
-  sprite.scale.set(2.5, 0.6, 1);
+  sprite.position.y = yOffset + 0.3;
+  sprite.scale.set(1.8, 0.45, 1);
   return sprite;
 }
 
@@ -453,10 +453,11 @@ class EnergyFlowParticles {
     
     const material = new THREE.PointsMaterial({
       color: color,
-      size: 0.2,
+      size: 0.15,
       transparent: true,
-      opacity: 0.9,
-      blending: THREE.AdditiveBlending
+      opacity: 1,
+      blending: THREE.AdditiveBlending,
+      sizeAttenuation: true
     });
     
     this.particles = new THREE.Points(geometry, material);
@@ -465,7 +466,7 @@ class EnergyFlowParticles {
   updateParticlePosition(i: number) {
     const t = this.progress[i];
     this.positions[i * 3] = this.startPos.x + (this.endPos.x - this.startPos.x) * t;
-    this.positions[i * 3 + 1] = this.startPos.y + (this.endPos.y - this.startPos.y) * t + Math.sin(t * Math.PI) * 0.4;
+    this.positions[i * 3 + 1] = this.startPos.y + (this.endPos.y - this.startPos.y) * t + Math.sin(t * Math.PI) * 0.25;
     this.positions[i * 3 + 2] = this.startPos.z + (this.endPos.z - this.startPos.z) * t;
   }
 
@@ -496,11 +497,16 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
   const draggedRef = useRef<{ id: string; model: THREE.Group; offset: THREE.Vector3 } | null>(null);
   const planeRef = useRef(new THREE.Plane(new THREE.Vector3(0, 1, 0), 0));
   const animateRef = useRef(animate);
+  const onComponentMoveRef = useRef(onComponentMove);
   
-  // Keep animateRef in sync with prop
+  // Keep refs in sync with props
   useEffect(() => {
     animateRef.current = animate;
   }, [animate]);
+  
+  useEffect(() => {
+    onComponentMoveRef.current = onComponentMove;
+  }, [onComponentMove]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -512,45 +518,91 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
 
     const w = container.clientWidth || 600;
     const h = container.clientHeight || 400;
-    const camera = new THREE.PerspectiveCamera(50, w / h, 0.1, 500);
-    camera.position.set(12, 10, 12);
+    const camera = new THREE.PerspectiveCamera(45, w / h, 0.1, 500);
+    camera.position.set(5, 4, 5);
     cameraRef.current = camera;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(w, h);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
+    controls.enablePan = true;
+    controls.screenSpacePanning = true;
+    controls.mouseButtons = {
+      LEFT: THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.DOLLY,
+      RIGHT: THREE.MOUSE.PAN
+    };
+    controls.touches = {
+      ONE: THREE.TOUCH.ROTATE,
+      TWO: THREE.TOUCH.DOLLY_PAN
+    };
+    controls.target.set(0, 1, 0);
     controlsRef.current = controls;
 
-    // Lighting
-    scene.add(new THREE.AmbientLight(0xffffff, 0.5));
-    const sun = new THREE.DirectionalLight(0xffffff, 1);
-    sun.position.set(10, 20, 10);
+    // Lighting with shadows
+    scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+    const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+    sun.position.set(15, 25, 15);
     sun.castShadow = true;
+    sun.shadow.mapSize.width = 2048;
+    sun.shadow.mapSize.height = 2048;
+    sun.shadow.camera.near = 0.5;
+    sun.shadow.camera.far = 100;
+    sun.shadow.camera.left = -20;
+    sun.shadow.camera.right = 20;
+    sun.shadow.camera.top = 20;
+    sun.shadow.camera.bottom = -20;
     scene.add(sun);
     
     const fill = new THREE.DirectionalLight(0x4488ff, 0.3);
     fill.position.set(-10, 5, -10);
     scene.add(fill);
 
-    // Ground
+    // Improved ground with gradient
+    const groundCanvas = document.createElement('canvas');
+    groundCanvas.width = 512;
+    groundCanvas.height = 512;
+    const gctx = groundCanvas.getContext('2d')!;
+    const gradient = gctx.createRadialGradient(256, 256, 0, 256, 256, 360);
+    gradient.addColorStop(0, '#1e293b');
+    gradient.addColorStop(1, '#0f172a');
+    gctx.fillStyle = gradient;
+    gctx.fillRect(0, 0, 512, 512);
+    const groundTexture = new THREE.CanvasTexture(groundCanvas);
+    
     const ground = new THREE.Mesh(
       new THREE.PlaneGeometry(60, 60),
-      new THREE.MeshStandardMaterial({ color: 0x1a2332, roughness: 0.9 })
+      new THREE.MeshStandardMaterial({ map: groundTexture, roughness: 0.9 })
     );
     ground.rotation.x = -Math.PI / 2;
     ground.receiveShadow = true;
     scene.add(ground);
 
-    const grid = new THREE.GridHelper(60, 30, 0x2a3a4a, 0x1a2a3a);
+    const grid = new THREE.GridHelper(60, 30, 0x3b82f6, 0x1e3a5f);
     grid.position.y = 0.01;
     scene.add(grid);
+
+    // Skybox gradient
+    const skyCanvas = document.createElement('canvas');
+    skyCanvas.width = 2;
+    skyCanvas.height = 512;
+    const sctx = skyCanvas.getContext('2d')!;
+    const skyGrad = sctx.createLinearGradient(0, 0, 0, 512);
+    skyGrad.addColorStop(0, '#0f172a');
+    skyGrad.addColorStop(0.5, '#1e293b');
+    skyGrad.addColorStop(1, '#334155');
+    sctx.fillStyle = skyGrad;
+    sctx.fillRect(0, 0, 2, 512);
+    const skyTexture = new THREE.CanvasTexture(skyCanvas);
+    scene.background = skyTexture;
 
     const labelsGroup = new THREE.Group();
     scene.add(labelsGroup);
@@ -564,6 +616,15 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
         flowParticlesRef.current.forEach(fp => fp.update());
         rotatingPartsRef.current.forEach(part => {
           part.rotation.z += 0.02;
+        });
+        
+        // Pulse active generators
+        const time = Date.now() * 0.003;
+        modelsRef.current.forEach(model => {
+          if (model.userData.isGenerator) {
+            const pulse = 1 + Math.sin(time) * 0.03;
+            model.scale.set(pulse, pulse, pulse);
+          }
         });
       }
       
@@ -588,7 +649,7 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
     };
 
     const onPointerDown = (e: PointerEvent) => {
-      if (!onComponentMove) return;
+      if (!onComponentMoveRef.current) return;
       getMousePosition(e);
       raycasterRef.current.setFromCamera(mouseRef.current, camera);
       
@@ -613,7 +674,7 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
     const onPointerMove = (e: PointerEvent) => {
       if (!draggedRef.current) {
         // Hover effect
-        if (onComponentMove) {
+        if (onComponentMoveRef.current) {
           getMousePosition(e);
           raycasterRef.current.setFromCamera(mouseRef.current, camera);
           let hovering = false;
@@ -646,15 +707,15 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
     };
 
     const onPointerUp = () => {
-      if (draggedRef.current && onComponentMove) {
+      if (draggedRef.current && onComponentMoveRef.current) {
         const { id, model } = draggedRef.current;
         // Convert back to 2D canvas coordinates
         const scale = 0.035;
-        const offsetX = -300 * scale;
-        const offsetZ = -200 * scale;
+        const offsetX = -5;
+        const offsetZ = 8;
         const canvasX = (model.position.x - offsetX) / scale;
         const canvasY = (model.position.z - offsetZ) / scale;
-        onComponentMove(id, canvasX, canvasY);
+        onComponentMoveRef.current(id, canvasX, canvasY);
       }
       draggedRef.current = null;
       controls.enabled = true;
@@ -676,7 +737,7 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
       renderer.dispose();
       container.removeChild(renderer.domElement);
     };
-  }, [onComponentMove]); // animate handled via ref
+  }, []); // animate and onComponentMove handled via refs
 
   useEffect(() => {
     const scene = sceneRef.current;
@@ -694,8 +755,11 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
     if (!config) return;
 
     const scale = 0.035;
-    const offsetX = -300 * scale;
-    const offsetZ = -200 * scale;
+    const offsetX = -5;
+    const offsetZ = 8;
+
+    // Generator types for pulse animation
+    const GENERATORS = new Set(['solar_pv', 'wind_turbine', 'chp_unit']);
 
     // Create models
     config.components.forEach((comp: DTComponent) => {
@@ -703,6 +767,18 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
       const x = comp.x * scale + offsetX;
       const z = comp.y * scale + offsetZ;
       model.position.set(x, 0, z);
+      
+      // Enable shadows on all meshes
+      model.traverse(child => {
+        if ((child as THREE.Mesh).isMesh) {
+          child.castShadow = true;
+          child.receiveShadow = true;
+        }
+      });
+      
+      // Mark generators for pulse animation
+      model.userData.isGenerator = GENERATORS.has(comp.type);
+      
       scene.add(model);
       modelsRef.current.set(comp.id, model);
 
@@ -722,7 +798,6 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
 
     // Create connections with correct flow direction
     // Generators: energy flows OUT; Consumers: energy flows IN
-    const GENERATORS = new Set(['solar_pv', 'wind_turbine', 'chp_unit']);
     const CONSUMERS = new Set(['smart_building', 'ev_charger', 'load_center', 'heat_pump']);
     
     config.connections.forEach((conn: DTConnection) => {
@@ -752,14 +827,6 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
       flowEnd.y = 0.5;
 
       const flowColor = conn.type === 'heat' ? 0xef4444 : conn.type === 'both' ? 0xa855f7 : 0x3b82f6;
-      
-      // Connection tube (static, no direction)
-      const curve = new THREE.LineCurve3(fromModel.position.clone().setY(0.5), toModel.position.clone().setY(0.5));
-      const tube = new THREE.Mesh(
-        new THREE.TubeGeometry(curve, 8, 0.04, 8, false),
-        new THREE.MeshStandardMaterial({ color: flowColor, transparent: true, opacity: 0.4 })
-      );
-      scene.add(tube);
 
       // Particles flow in correct direction
       const particles = new EnergyFlowParticles(flowStart, flowEnd, flowColor, 18);

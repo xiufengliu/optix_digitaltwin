@@ -48,6 +48,7 @@ class SimulationRunRead(BaseModel):
     name: Optional[str]
     session_id: Optional[str]
     scenario_id: Optional[str]
+    digital_twin_id: Optional[str] = None
     status: str
     created_at: datetime
     updated_at: datetime

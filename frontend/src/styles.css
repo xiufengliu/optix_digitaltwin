@@ -145,6 +145,503 @@ body {
 
 @media (max-width: 600px) {
   .header { flex-direction: column; align-items: flex-start; gap: 0.5rem; }
+  
+  .main-content {
+    padding: 0.75rem;
+    gap: 0.5rem;
+  }
+  
+  .metrics-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 0.5rem;
+  }
+  
+  .metric-card {
+    padding: 0.6rem;
+  }
+  
+  .metric-value {
+    font-size: 1.1rem;
+  }
+  
+  .metric-label {
+    font-size: 0.65rem;
+  }
+  
+  .button {
+    padding: 0.4rem 0.5rem;
+    font-size: 0.75rem;
+  }
+  
+  .sidebar {
+    max-height: 35vh;
+    padding: 0.75rem;
+  }
+  
+  .run-item {
+    padding: 0.5rem 0.75rem;
+    margin-bottom: 0.5rem;
+  }
+  
+  .viewer-panel {
+    min-height: 200px;
+  }
+  
+  .log-panel {
+    max-height: 120px;
+    padding: 0.5rem;
+    font-size: 0.75rem;
+  }
+  
+  /* Split panels stack vertically on mobile */
+  .split-container {
+    flex-direction: column;
+  }
+  
+  .split-pane {
+    min-height: 120px !important;
+  }
+  
+  .split-divider {
+    width: 100%;
+    height: 6px;
+    cursor: row-resize;
+  }
+  
+  /* Digital Twin Builder mobile */
+  .dt-builder {
+    flex-direction: column;
+  }
+  
+  .dt-palette {
+    width: 100%;
+    max-height: 120px;
+    border-right: none;
+    border-bottom: 1px solid #334155;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 8px;
+  }
+  
+  .dt-palette-item {
+    margin-bottom: 0;
+    padding: 6px 8px;
+    font-size: 0.75rem;
+  }
+  
+  .dt-properties {
+    width: 100%;
+    max-height: 200px;
+    border-left: none;
+    border-top: 1px solid #334155;
+  }
+  
+  .dt-canvas {
+    min-height: 250px;
+  }
+  
+  .dt-component {
+    width: 50px;
+    height: 50px;
+    font-size: 0.7rem;
+  }
+}
+
+/* Extra small screens */
+@media (max-width: 400px) {
+  .metrics-grid {
+    grid-template-columns: 1fr;
+  }
+  
+  .header h1 {
+    font-size: 1.1rem;
+  }
+  
+  .sidebar {
+    max-height: 30vh;
+  }
+}
+
+/* Scenario page */
+.scenario-container {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.scenario-mobile-tabs {
+  display: none;
+}
+
+.scenario-grid {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  gap: 1rem;
+  min-height: 600px;
+}
+
+.scenario-sidebar {
+  overflow-y: auto;
+  max-height: 80vh;
+}
+
+.scenario-edit-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+/* Compare panel hidden on desktop - only in mobile tab */
+.scenario-compare-panel {
+  display: none;
+}
+
+/* Desktop compare inside edit panel */
+.desktop-compare {
+  display: block;
+}
+
+@media (max-width: 768px) {
+  .scenario-container {
+    height: calc(100vh - 60px);
+  }
+  
+  .scenario-mobile-tabs {
+    display: flex;
+    border-bottom: 1px solid #334155;
+    background: #1e293b;
+  }
+  
+  .scenario-mobile-tabs button {
+    flex: 1;
+    padding: 10px 8px;
+    background: transparent;
+    border: none;
+    color: #94a3b8;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  
+  .scenario-mobile-tabs button.active {
+    background: #334155;
+    color: #fff;
+    border-bottom: 2px solid #3b82f6;
+  }
+  
+  .scenario-grid {
+    display: block;
+    position: relative;
+    flex: 1;
+  }
+  
+  .scenario-sidebar,
+  .scenario-edit-panel,
+  .scenario-compare-panel {
+    display: none;
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: #0f172a;
+    padding: 1rem;
+    overflow: auto;
+  }
+  
+  .scenario-sidebar.mobile-visible {
+    display: block;
+  }
+  
+  .scenario-edit-panel.mobile-visible,
+  .scenario-compare-panel.mobile-visible {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+  }
+  
+  /* Hide desktop compare on mobile */
+  .desktop-compare {
+    display: none;
+  }
+}
+
+/* Console mobile tabs */
+.console-mobile-tabs {
+  display: none;
+}
+
+.header-divider {
+  width: 1px;
+  height: 24px;
+  background: #475569;
+  margin: 0 0.25rem;
+}
+
+/* Desktop: console-runs-panel should not interfere */
+.console-runs-panel {
+  display: contents;
+}
+
+/* Desktop: info panel hidden */
+.console-info-panel {
+  display: none;
+}
+
+@media (max-width: 768px) {
+  .console-mobile-tabs {
+    display: flex;
+    border-bottom: 1px solid #334155;
+    background: #1e293b;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 100;
+  }
+  
+  .console-mobile-tabs button {
+    flex: 1;
+    padding: 12px 8px;
+    background: transparent;
+    border: none;
+    color: #94a3b8;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  
+  .console-mobile-tabs button.active {
+    background: #334155;
+    color: #fff;
+    border-bottom: 2px solid #3b82f6;
+  }
+  
+  .app-shell {
+    padding-top: 44px;
+  }
+  
+  .console-runs-panel {
+    display: none;
+    position: fixed;
+    top: 44px;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 50;
+    background: #0f172a;
+  }
+  
+  .console-runs-panel.mobile-visible {
+    display: flex;
+    flex-direction: column;
+  }
+  
+  .console-view-panel {
+    display: none;
+    position: fixed;
+    top: 44px;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 50;
+    background: #0f172a;
+    padding: 0.75rem;
+  }
+  
+  .console-view-panel.mobile-visible {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  
+  .console-view-panel.mobile-visible .vsplit-container {
+    flex: 1;
+    min-height: 0;
+  }
+  
+  .console-view-panel.mobile-visible .vsplit-pane {
+    flex: 1 !important;
+    flex-basis: 100% !important;
+  }
+  
+  .console-view-panel.mobile-visible .viewer-panel {
+    height: 100% !important;
+    min-height: 0 !important;
+  }
+  
+  .console-info-panel {
+    display: none;
+    position: fixed;
+    top: 44px;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 50;
+    background: #0f172a;
+  }
+  
+  .console-info-panel.mobile-visible {
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+  }
+  
+  .console-runs-panel .sidebar {
+    max-height: none;
+    height: 100%;
+    border: none;
+    flex: 1;
+  }
+  
+  .sidebar-divider {
+    display: none !important;
+  }
+  
+  .desktop-only {
+    display: none !important;
+  }
+  
+  .console-header {
+    flex-direction: column;
+    align-items: flex-start !important;
+    gap: 8px;
+  }
+  
+  .console-header h1 {
+    font-size: 1.1rem;
+  }
+  
+  .header-divider {
+    display: none;
+  }
+}
+
+/* Digital Twin Builder responsive */
+.dt-builder-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+.dt-mobile-tabs {
+  display: none;
+}
+
+.dt-builder-main {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.dt-panel {
+  overflow-y: auto;
+}
+
+.dt-palette-panel {
+  width: 220px;
+  border-right: 1px solid #334155;
+  padding: 12px;
+}
+
+.dt-canvas-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.dt-properties-panel {
+  width: 260px;
+  border-left: 1px solid #334155;
+  padding: 12px;
+}
+
+.dt-toolbar {
+  padding: 8px 12px;
+  border-bottom: 1px solid #334155;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.dt-toolbar-info {
+  font-size: 12px;
+  color: #64748b;
+}
+
+@media (max-width: 768px) {
+  .dt-mobile-tabs {
+    display: flex;
+    border-bottom: 1px solid #334155;
+    background: #1e293b;
+  }
+  
+  .dt-mobile-tabs button {
+    flex: 1;
+    padding: 10px 8px;
+    background: transparent;
+    border: none;
+    color: #94a3b8;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  
+  .dt-mobile-tabs button.active {
+    background: #334155;
+    color: #fff;
+    border-bottom: 2px solid #3b82f6;
+  }
+  
+  .dt-builder-main {
+    position: relative;
+  }
+  
+  .dt-panel {
+    display: none;
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100% !important;
+    border: none !important;
+  }
+  
+  .dt-panel.mobile-visible {
+    display: flex;
+    flex-direction: column;
+  }
+  
+  .dt-palette-panel.mobile-visible {
+    padding: 12px;
+    overflow-y: auto;
+  }
+  
+  .dt-palette-panel .dt-component-list {
+    display: grid !important;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+  }
+  
+  .dt-canvas-panel.mobile-visible {
+    display: flex;
+  }
+  
+  .dt-properties-panel.mobile-visible {
+    padding: 12px;
+    overflow-y: auto;
+  }
+  
+  .dt-toolbar {
+    padding: 6px 8px;
+    gap: 8px;
+  }
+  
+  .dt-toolbar input {
+    max-width: 140px !important;
+  }
 }
 
 .metrics-grid {

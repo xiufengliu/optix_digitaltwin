@@ -61,12 +61,13 @@ export default function App() {
   const [bottomSplit, setBottomSplit] = useState(0.5); // 0..1 left width ratio
   const [draggingSplit, setDraggingSplit] = useState(false);
   const splitRef = useState<HTMLDivElement | null>(null)[0];
-  const [centerSplit, setCenterSplit] = useState(0.58); // 0..1 top height ratio
+  const [centerSplit, setCenterSplit] = useState(0.48); // 0..1 top height ratio
   const [draggingVSplit, setDraggingVSplit] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(320);
   const [draggingSidebar, setDraggingSidebar] = useState(false);
   const [bottomCollapsed, setBottomCollapsed] = useState(false);
   const [reduceMotion, setReduceMotion] = useState(false);
+  const [mobileTab, setMobileTab] = useState<'runs' | 'view' | 'info'>('view');
 
   const appendLog = useCallback((entry: string) => {
     setLogs((prev) => {
@@ -389,10 +390,24 @@ export default function App() {
     <div className="app-shell" style={{ ['--sidebar-width' as any]: `${sidebarWidth}px` }}>
       {tab === 'runs' ? (
         <>
+          {/* Mobile Tab Bar for Console */}
+          <div className="console-mobile-tabs">
+            <button className={mobileTab === 'runs' ? 'active' : ''} onClick={() => setMobileTab('runs')}>
+              📋 Runs
+            </button>
+            <button className={mobileTab === 'view' ? 'active' : ''} onClick={() => setMobileTab('view')}>
+              👁️ View
+            </button>
+            <button className={mobileTab === 'info' ? 'active' : ''} onClick={() => setMobileTab('info')}>
+              ℹ️ Info
+            </button>
+          </div>
+
+          <div className={`console-panel console-runs-panel ${mobileTab === 'runs' ? 'mobile-visible' : ''}`}>
           <RunList
             runs={runs}
             selectedId={selectedRunId}
-            onSelect={handleSelectRun}
+            onSelect={(id) => { handleSelectRun(id); setMobileTab('view'); }}
             onRefresh={loadRuns}
             onDelete={async (runId) => {
               try {
@@ -407,31 +422,43 @@ export default function App() {
             }}
             isLoading={loadingRuns}
           />
+          </div>
           <div className="sidebar-divider" onMouseDown={() => setDraggingSidebar(true)} title="Resize sidebar" />
-          <main className="main-content">
-            <div className="header">
+          <main className={`main-content console-panel console-view-panel ${mobileTab === 'view' ? 'mobile-visible' : ''}`}>
+            <div className="header console-header">
               <div>
                 <h1>Digital Twin Console</h1>
-                <p style={{ color: '#64748b' }}>WebSocket status: {wsStatus}</p>
+                <p style={{ color: '#64748b', margin: 0, fontSize: 12 }}>WS: {wsStatus}</p>
               </div>
               <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
                 {/* Navigation */}
-                <button className="button" onClick={() => setTab('builder')}>🏗️ Digital Twin</button>
+                <button className="button" onClick={() => setTab('builder')}>🏗️ Builder</button>
                 <button className="button button-secondary" onClick={() => setTab('scenarios')}>Scenarios</button>
                 
-                <span style={{ width: 1, height: 24, background: '#475569', margin: '0 0.25rem' }} />
+                <span className="header-divider" />
                 
                 {/* View tabs */}
                 <button className="button" onClick={() => setViewTab('3d')} style={{ background: viewTab==='3d' ? '#2563eb' : '#475569' }}>3D</button>
                 <button className="button" onClick={() => setViewTab('charts')} style={{ background: viewTab==='charts' ? '#2563eb' : '#475569' }}>Charts</button>
                 
-                <span style={{ width: 1, height: 24, background: '#475569', margin: '0 0.25rem' }} />
+                <span className="header-divider" />
                 
-                {/* Simulation status */}
-                {isSimulationComplete && (
-                  <span style={{ padding: '4px 10px', background: '#166534', borderRadius: 4, fontSize: 12, fontWeight: 600 }}>
-                    ✓ Completed
-                  </span>
+                {/* Progress indicator */}
+                {selectedRunId && metrics.total_steps && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <div style={{ width: 100, height: 8, background: '#334155', borderRadius: 4, overflow: 'hidden' }}>
+                      <div style={{ 
+                        height: '100%', 
+                        width: `${Math.min(((metrics.timestep || 0) / metrics.total_steps) * 100, 100)}%`,
+                        background: isSimulationComplete ? '#22c55e' : '#3b82f6',
+                        transition: 'width 0.3s'
+                      }} />
+                    </div>
+                    <span style={{ fontSize: 11, color: '#94a3b8', minWidth: 80 }}>
+                      {metrics.timestep || 0} / {metrics.total_steps}
+                      {isSimulationComplete && ' ✓'}
+                    </span>
+                  </div>
                 )}
                 
                 {/* Simulation controls */}
@@ -475,16 +502,18 @@ export default function App() {
             </section>
 
             {/* Vertical split: top (3D/Charts) and bottom (Scenario/Log) */}
-            <section className="vsplit-container" style={{ height: '100%' }}>
+            <section className="vsplit-container" style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
               <div
                 className="vsplit-pane"
                 style={{
                   flexBasis: bottomCollapsed ? '100%' : `${Math.round(centerSplit * 100)}%`,
-                  flexGrow: 1,
+                  flexGrow: 0,
+                  flexShrink: 0,
                   minHeight: 0,
                   padding: viewTab === '3d' ? 0 : '1rem',
                   display: 'flex',
                   flexDirection: 'column',
+                  overflow: 'hidden',
                 }}
               >
                 {viewTab === '3d' ? (
@@ -514,7 +543,7 @@ export default function App() {
 
               {!bottomCollapsed && (
                 <div
-                  className="vsplit-divider"
+                  className="vsplit-divider desktop-only"
                   onMouseDown={() => setDraggingVSplit(true)}
                   onDoubleClick={() => setCenterSplit(0.58)}
                 />
@@ -522,7 +551,7 @@ export default function App() {
 
               {/* Bottom split: scenario info (left), log (right) */}
               {!bottomCollapsed && (
-              <div className="split-container" style={{ flexBasis: `${Math.round((1 - centerSplit) * 100)}%`, minHeight: 180 }}>
+              <div className="split-container desktop-only" style={{ flexBasis: `${Math.round((1 - centerSplit) * 100)}%`, flexGrow: 0, flexShrink: 0, minHeight: 0, overflow: 'hidden' }}>
                 {/* Scenario info on the left */}
                 <div className="split-pane" style={{ flexBasis: `${Math.round(bottomSplit * 100)}%`, padding: '1rem', minHeight: 220, display: 'flex', flexDirection: 'column', overflow: 'auto' }}>
                   <div className="metric-label">Scenario</div>
@@ -557,8 +586,8 @@ export default function App() {
                 />
 
               {/* Log on the right */}
-              <div className="split-pane" style={{ flexBasis: `${Math.round((1 - bottomSplit) * 100)}%`, padding: 0, minHeight: 220, display: 'flex', flexDirection: 'column' }}>
-                <div className="log-panel" style={{ height: '100%', maxHeight: '100%', flex: 1 }}>
+              <div className="split-pane" style={{ flexBasis: `${Math.round((1 - bottomSplit) * 100)}%`, padding: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+                <div className="log-panel" style={{ flex: 1, overflow: 'auto' }}>
                   {logs.map((entry, idx) => (
                     <div key={idx}>{entry}</div>
                   ))}
@@ -570,9 +599,37 @@ export default function App() {
             </section>
 
           </main>
+
+          {/* Mobile Info Panel */}
+          <div className={`console-panel console-info-panel ${mobileTab === 'info' ? 'mobile-visible' : ''}`}>
+            <div style={{ padding: '1rem', overflowY: 'auto', height: '100%' }}>
+              <div className="metric-card" style={{ marginBottom: '1rem' }}>
+                <div className="metric-label">Scenario</div>
+                {selectedScenario ? (
+                  <div>
+                    <h3 style={{ margin: '0.25rem 0 0.5rem 0' }}>{selectedScenario.name}</h3>
+                    <p style={{ color: '#94a3b8', fontSize: 12 }}>{selectedScenario.description ?? '—'}</p>
+                    {selectedScenario.details && (
+                      <p style={{ fontSize: 12, marginTop: 8 }}>{selectedScenario.details}</p>
+                    )}
+                  </div>
+                ) : (
+                  <div style={{ color: '#64748b' }}>No scenario selected</div>
+                )}
+              </div>
+              <div className="metric-card">
+                <div className="metric-label">Log</div>
+                <div style={{ fontSize: 11, fontFamily: 'monospace', maxHeight: 200, overflowY: 'auto' }}>
+                  {logs.slice(-10).map((entry, idx) => (
+                    <div key={idx} style={{ color: '#94a3b8' }}>{entry}</div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
         </>
-      ) : (
-        <main style={{ gridColumn: '1 / -1', padding: '1.5rem' }}>
+      ) : tab === 'scenarios' ? (
+        <main style={{ gridColumn: '1 / -1', gridRow: '1 / -1', padding: '1.5rem', overflowY: 'auto' }}>
           <div className="header" style={{ marginBottom: '1rem' }}>
             <h1>Scenarios</h1>
             <div style={{ display: 'flex', gap: '0.5rem' }}>
@@ -581,8 +638,7 @@ export default function App() {
           </div>
           <ScenarioList apiBase={apiBase} onRun={(runId) => { setTab('runs'); setSelectedRunId(runId); loadRuns(); }} />
         </main>
-      )}
-      {tab === 'builder' && (
+      ) : tab === 'builder' ? (
         <main className="main-content" style={{ gridColumn: '1 / -1', display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
           <div className="header" style={{ flexShrink: 0 }}>
             <div>
@@ -609,11 +665,23 @@ export default function App() {
                 }}
               />
             ) : (
-              <DigitalTwin3DView config={dtConfig} animate={!reduceMotion} />
+              <DigitalTwin3DView 
+                config={dtConfig} 
+                animate={!reduceMotion} 
+                onComponentMove={(id, x, y) => {
+                  if (!dtConfig) return;
+                  setDtConfig({
+                    ...dtConfig,
+                    components: dtConfig.components.map(c => 
+                      c.id === id ? { ...c, x, y } : c
+                    )
+                  });
+                }}
+              />
             )}
           </div>
         </main>
-      )}
+      ) : null}
     </div>
   );
 }

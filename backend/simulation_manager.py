@@ -213,9 +213,15 @@ class SimulationManager:
         obs_payload = {agent: self._to_serializable(values) for agent, values in observation.items()}
         info_payload = {key: self._to_serializable(value) for key, value in (session.last_info or {}).items()}
 
+        # Get total steps from env
+        total_steps = getattr(env, '_total_steps', None)
+        if total_steps is None:
+            total_steps = len(getattr(env, '_load', [])) or len(getattr(env, 'data', []))
+
         metrics = {
             "timestep": int(getattr(env, "t", session.steps_taken)),
             "steps_taken": session.steps_taken,
+            "total_steps": total_steps,
             "fund_nav": self._safe_float(getattr(env, "equity", None)),
             "budget": self._safe_float(getattr(env, "budget", None)),
             "last_revenue": self._safe_float(getattr(env, "last_revenue", None)),

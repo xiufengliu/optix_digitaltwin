@@ -21,8 +21,8 @@ OUTPUT_PATH = ASSETS_DIR / "building.glb"
 FLOORS = 15
 FLOOR_H = 3.0
 HEIGHT = FLOORS * FLOOR_H
-COLS = 12                       # window bays across the long façade
-BAY_W = 6.0                      # approx width of a window bay
+COLS = 4                        # 4 rooms per floor
+BAY_W = 18.0                     # width of each room bay
 WIDTH = COLS * BAY_W             # tower width
 DEPTH = 16.0
 
@@ -72,9 +72,7 @@ for f in range(FLOORS):
     y = FLOOR_H * (f + 0.5)
     for c in range(COLS):
         x = -WIDTH / 2 + col_spacing * (c + 0.5)
-        # skip a couple of columns to create rhythm like photo
-        if c % 3 == 2:
-            continue
+        # all 4 columns = 4 rooms per floor
         # Front (+Z)
         balcony_f = trimesh.creation.box(extents=(BALCONY_W, BALCONY_H, BALCONY_D))
         balcony_f.apply_translation((x, y, DEPTH / 2 + BALCONY_D / 2))

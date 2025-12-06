@@ -28,6 +28,7 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
   const [runBusyId, setRunBusyId] = useState<string | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
   const [compareRows, setCompareRows] = useState<any[]>([]);
+  const [mobileTab, setMobileTab] = useState<'list' | 'edit' | 'compare'>('list');
 
   const join = (p: string) => {
     const base = apiBase.endsWith('/') ? apiBase : apiBase + '/';
@@ -139,11 +140,25 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
   });
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '360px 1fr', gap: '1rem' }}>
-      <div className="sidebar" style={{ maxHeight: 'calc(100vh - 120px)', overflowY: 'auto' }}>
+    <div className="scenario-container">
+      {/* Mobile Tab Bar */}
+      <div className="scenario-mobile-tabs">
+        <button className={mobileTab === 'list' ? 'active' : ''} onClick={() => setMobileTab('list')}>
+          📋 List
+        </button>
+        <button className={mobileTab === 'edit' ? 'active' : ''} onClick={() => setMobileTab('edit')}>
+          ✏️ Edit
+        </button>
+        <button className={mobileTab === 'compare' ? 'active' : ''} onClick={() => setMobileTab('compare')}>
+          📊 Compare
+        </button>
+      </div>
+
+      <div className="scenario-grid">
+      <div className={`sidebar scenario-sidebar ${mobileTab === 'list' ? 'mobile-visible' : ''}`}>
         <div className="header" style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
           <h2 style={{ flex: 1 }}>Scenarios</h2>
-          <button className="button" onClick={() => { setSelectedId(null); setName('My Scenario'); setDesc(''); setDetails(''); setOverrides({ ...defaultOverrides }); setShowGuide(true); }}>New</button>
+          <button className="button" onClick={() => { setSelectedId(null); setName('My Scenario'); setDesc(''); setDetails(''); setOverrides({ ...defaultOverrides }); setShowGuide(true); setMobileTab('edit'); }}>New</button>
           <button className="button" onClick={load} disabled={loading}>Refresh</button>
         </div>
         <div style={{ marginTop: '1rem' }}>
@@ -160,7 +175,7 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
                 background: isPaper ? 'linear-gradient(135deg, #1e3a5f 0%, #1e293b 100%)' : undefined,
                 borderLeft: isPaper ? '3px solid #3b82f6' : undefined,
               }} 
-              onClick={() => { setSelectedId(s.id); setName(s.name); setDesc(s.description ?? ''); setDetails(s.details ?? ''); setOverrides({ ...defaultOverrides, ...(s.config_overrides || {}) }); }}
+              onClick={() => { setSelectedId(s.id); setName(s.name); setDesc(s.description ?? ''); setDetails(s.details ?? ''); setOverrides({ ...defaultOverrides, ...(s.config_overrides || {}) }); setMobileTab('edit'); }}
             >
               <div style={{ flex: 1 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -194,7 +209,7 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
           })}
         </div>
       </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+      <div className={`scenario-edit-panel ${mobileTab === 'edit' ? 'mobile-visible' : ''}`}>
         <div className="header"><h2>Create / Edit Scenario</h2></div>
         {runError && (
           <div className="metric-card" style={{ color: '#fecaca' }}>{runError}</div>
@@ -296,17 +311,16 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
           )}
         </div>
 
-        {/* Compare runs */}
-        <div className="metric-card">
+        {/* Compare runs - desktop only (inside edit panel) */}
+        <div className="metric-card desktop-compare">
           <div className="header" style={{ justifyContent: 'space-between' }}>
-            <h3 style={{ margin: 0 }}>Compare Runs (latest)</h3>
+            <h3 style={{ margin: 0 }}>Compare Runs</h3>
             <button className="button" onClick={loadCompare}>Refresh</button>
           </div>
-          
           {compareRows.length > 0 ? (
             <>
               {/* Visual comparison charts */}
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1rem', marginBottom: '1rem' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1rem', marginBottom: '1rem', marginTop: '1rem' }}>
                 {/* PED Ratio Chart */}
                 <div style={{ background: '#1e293b', borderRadius: 8, padding: '12px' }}>
                   <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>PED Ratio</div>
@@ -386,44 +400,68 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
                   <thead>
                     <tr style={{ borderBottom: '1px solid #334155' }}>
-                      <th style={{ textAlign: 'left', padding: '8px', color: '#94a3b8', fontWeight: 500 }}>Run Name</th>
-                      <th style={{ textAlign: 'center', padding: '8px', color: '#94a3b8', fontWeight: 500 }}>Status</th>
-                      <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8', fontWeight: 500 }}>PED Ratio</th>
-                      <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8', fontWeight: 500 }}>Gen (MWh)</th>
-                      <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8', fontWeight: 500 }}>Demand (MWh)</th>
-                      <th style={{ textAlign: 'center', padding: '8px', color: '#94a3b8', fontWeight: 500 }}>PED Status</th>
+                      <th style={{ textAlign: 'left', padding: '8px', color: '#94a3b8' }}>Run</th>
+                      <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8' }}>PED</th>
+                      <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8' }}>Gen</th>
+                      <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8' }}>Load</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {compareRows.map((r, i) => {
-                      const isPed = r.ped_ratio !== '-' && parseFloat(r.ped_ratio) >= 1;
-                      return (
-                        <tr key={i} style={{ borderBottom: '1px solid #1e293b' }}>
-                          <td style={{ padding: '8px', fontWeight: 500 }}>{r.name}</td>
-                          <td style={{ padding: '8px', textAlign: 'center' }}>
-                            <span style={{ padding: '2px 8px', borderRadius: 4, fontSize: 10, background: r.status === 'completed' ? '#166534' : r.status === 'running' ? '#1e40af' : '#374151' }}>
-                              {r.status}
-                            </span>
-                          </td>
-                          <td style={{ padding: '8px', textAlign: 'right', fontWeight: 600, color: r.ped_ratio !== '-' && parseFloat(r.ped_ratio) >= 1 ? '#22c55e' : '#ef4444' }}>{r.ped_ratio}</td>
-                          <td style={{ padding: '8px', textAlign: 'right', color: '#22c55e' }}>{r.total_gen_mwh}</td>
-                          <td style={{ padding: '8px', textAlign: 'right', color: '#f97316' }}>{r.total_demand_mwh}</td>
-                          <td style={{ padding: '8px', textAlign: 'center' }}>
-                            {r.ped_ratio === '-' ? '—' : isPed ? <span style={{ color: '#22c55e' }}>✓ PED</span> : <span style={{ color: '#ef4444' }}>✗ Not PED</span>}
-                          </td>
-                        </tr>
-                      );
-                    })}
+                    {compareRows.map((r, i) => (
+                      <tr key={i} style={{ borderBottom: '1px solid #1e293b' }}>
+                        <td style={{ padding: '8px', fontSize: 11 }}>{r.name}</td>
+                        <td style={{ padding: '8px', textAlign: 'right', fontWeight: 600, color: r.ped_ratio !== '-' && parseFloat(r.ped_ratio) >= 1 ? '#22c55e' : '#ef4444' }}>{r.ped_ratio}</td>
+                        <td style={{ padding: '8px', textAlign: 'right', color: '#22c55e' }}>{r.total_gen_mwh}</td>
+                        <td style={{ padding: '8px', textAlign: 'right', color: '#f97316' }}>{r.total_demand_mwh}</td>
+                      </tr>
+                    ))}
                   </tbody>
                 </table>
               </div>
             </>
           ) : (
-            <div style={{ textAlign: 'center', padding: '2rem', color: '#64748b' }}>
-              No runs to compare. Run some scenarios first!
+            <div style={{ textAlign: 'center', padding: '1rem', color: '#64748b' }}>
+              No runs to compare.
             </div>
           )}
         </div>
+      </div>
+      </div>
+
+      {/* Compare Panel - mobile tab only */}
+      <div className={`scenario-compare-panel ${mobileTab === 'compare' ? 'mobile-visible' : ''}`}>
+        <div className="header" style={{ marginBottom: '1rem' }}>
+          <h2>Compare Runs</h2>
+          <button className="button" onClick={loadCompare}>Refresh</button>
+        </div>
+        {compareRows.length > 0 ? (
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+              <thead>
+                <tr style={{ borderBottom: '1px solid #334155' }}>
+                  <th style={{ textAlign: 'left', padding: '8px', color: '#94a3b8' }}>Run</th>
+                  <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8' }}>PED</th>
+                  <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8' }}>Gen</th>
+                  <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8' }}>Load</th>
+                </tr>
+              </thead>
+              <tbody>
+                {compareRows.map((r, i) => (
+                  <tr key={i} style={{ borderBottom: '1px solid #1e293b' }}>
+                    <td style={{ padding: '8px', fontSize: 11 }}>{r.name}</td>
+                    <td style={{ padding: '8px', textAlign: 'right', fontWeight: 600, color: r.ped_ratio !== '-' && parseFloat(r.ped_ratio) >= 1 ? '#22c55e' : '#ef4444' }}>{r.ped_ratio}</td>
+                    <td style={{ padding: '8px', textAlign: 'right', color: '#22c55e' }}>{r.total_gen_mwh}</td>
+                    <td style={{ padding: '8px', textAlign: 'right', color: '#f97316' }}>{r.total_demand_mwh}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div style={{ textAlign: 'center', padding: '2rem', color: '#64748b' }}>
+            No runs to compare. Run some scenarios first!
+          </div>
+        )}
       </div>
     </div>
   );

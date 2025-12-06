@@ -14,6 +14,7 @@ export interface SimulationRun {
 export interface SimulationMetrics {
   timestep?: number | null;
   steps_taken?: number | null;
+  total_steps?: number | null;
   fund_nav?: number | null;
   budget?: number | null;
   last_revenue?: number | null;

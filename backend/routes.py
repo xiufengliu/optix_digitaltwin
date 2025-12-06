@@ -76,6 +76,7 @@ def _run_to_read_dict(run: SimulationRun) -> dict:
         "name": getattr(run, "name", None),
         "session_id": getattr(run, "session_id", None),
         "scenario_id": getattr(run, "scenario_id", None),
+        "digital_twin_id": getattr(run, "digital_twin_id", None),
         "status": getattr(getattr(run, "status", None), "value", None) or str(getattr(run, "status", None) or ""),
         "created_at": getattr(run, "created_at", None),
         "updated_at": getattr(run, "updated_at", None),

@@ -155,7 +155,79 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
   const [running, setRunning] = useState(false);
   const [scenarios, setScenarios] = useState<Array<{ id: string; name: string }>>([]);
   const [linkedScenarioId, setLinkedScenarioId] = useState<string | null>(null);
+  const [mobilePanel, setMobilePanel] = useState<'palette' | 'canvas' | 'properties'>('canvas');
+  const [touchDrag, setTouchDrag] = useState<{ id: string; offsetX: number; offsetY: number } | null>(null);
+  const [zoom, setZoom] = useState(1);
+  const [pinchStart, setPinchStart] = useState<number | null>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
+
+  // Zoom handlers
+  const handleWheel = (e: React.WheelEvent) => {
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+      setZoom(z => Math.max(0.5, Math.min(2, z - e.deltaY * 0.001)));
+    }
+  };
+
+  const handlePinchStart = (e: React.TouchEvent) => {
+    if (e.touches.length === 2) {
+      const dist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      setPinchStart(dist);
+    }
+  };
+
+  const handlePinchMove = (e: React.TouchEvent) => {
+    if (e.touches.length === 2 && pinchStart) {
+      const dist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      const scale = dist / pinchStart;
+      setZoom(z => Math.max(0.5, Math.min(2, z * scale)));
+      setPinchStart(dist);
+    }
+  };
+
+  const handlePinchEnd = () => {
+    setPinchStart(null);
+  };
+
+  // Touch drag handlers for mobile
+  const handleTouchStart = (id: string, e: React.TouchEvent) => {
+    if (e.touches.length > 1) return; // Ignore multi-touch (pinch)
+    const touch = e.touches[0];
+    const comp = components.find(c => c.id === id);
+    if (!comp || !canvasRef.current) return;
+    const rect = canvasRef.current.getBoundingClientRect();
+    setTouchDrag({
+      id,
+      offsetX: (touch.clientX - rect.left) / zoom - comp.x,
+      offsetY: (touch.clientY - rect.top) / zoom - comp.y
+    });
+    setSelectedId(id);
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    if (e.touches.length === 2) {
+      handlePinchMove(e);
+      return;
+    }
+    if (!touchDrag || !canvasRef.current) return;
+    e.preventDefault();
+    const touch = e.touches[0];
+    const rect = canvasRef.current.getBoundingClientRect();
+    const x = Math.max(0, (touch.clientX - rect.left) / zoom - touchDrag.offsetX);
+    const y = Math.max(0, (touch.clientY - rect.top) / zoom - touchDrag.offsetY);
+    updateComponentPosition(touchDrag.id, x, y);
+  };
+
+  const handleTouchEnd = () => {
+    setTouchDrag(null);
+    setPinchStart(null);
+  };
 
   const join = (p: string) => {
     if (!apiBase) return p;
@@ -712,6 +784,83 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
         { id: 'c8', from: 'hp-1', to: 'bld-2', type: 'heat', capacity_kw: 50 },
       ]
     },
+    // Industrial Microgrid
+    industrial_microgrid: {
+      name: 'Industrial Microgrid',
+      components: [
+        { id: 'chp-1', type: 'chp_unit', name: 'CHP Plant', x: 100, y: 100, params: { capacity_kw_e: 500, capacity_kw_th: 600, efficiency_e: 0.38, efficiency_th: 0.45 } },
+        { id: 'pv-1', type: 'solar_pv', name: 'Rooftop PV', x: 300, y: 50, params: { capacity_kwp: 400, tilt_deg: 15, azimuth_deg: 180, efficiency: 0.20 } },
+        { id: 'wind-1', type: 'wind_turbine', name: 'Wind Farm', x: 500, y: 50, params: { capacity_kw: 800, hub_height_m: 80, rotor_diameter_m: 60, cut_in_speed: 3 } },
+        { id: 'bat-1', type: 'battery_storage', name: 'Industrial Battery', x: 300, y: 200, params: { capacity_kwh: 2000, power_kw: 500, efficiency: 0.92, initial_soc: 0.6 } },
+        { id: 'load-1', type: 'load_center', name: 'Factory Load', x: 500, y: 200, params: { base_load_kw: 600, peak_load_kw: 1200, load_profile: 'industrial' } },
+        { id: 'bld-1', type: 'smart_building', name: 'Office Complex', x: 100, y: 300, params: { floors: 6, area_m2: 3000, load_kw: 150, flexible_load_pct: 30 } },
+        { id: 'grid-1', type: 'smart_grid', name: 'Utility Grid', x: 300, y: 350, params: { import_limit_kw: 1000, export_limit_kw: 800, tariff_type: 'tou' } },
+        { id: 'dh-1', type: 'district_heating', name: 'Heat Network', x: 500, y: 350, params: { supply_temp_c: 90, return_temp_c: 50, capacity_kw: 800 } },
+      ],
+      connections: [
+        { id: 'c1', from: 'chp-1', to: 'bat-1', type: 'electricity', capacity_kw: 500 },
+        { id: 'c2', from: 'chp-1', to: 'dh-1', type: 'heat', capacity_kw: 600 },
+        { id: 'c3', from: 'pv-1', to: 'bat-1', type: 'electricity', capacity_kw: 400 },
+        { id: 'c4', from: 'wind-1', to: 'bat-1', type: 'electricity', capacity_kw: 800 },
+        { id: 'c5', from: 'bat-1', to: 'load-1', type: 'electricity', capacity_kw: 500 },
+        { id: 'c6', from: 'bat-1', to: 'bld-1', type: 'electricity', capacity_kw: 200 },
+        { id: 'c7', from: 'grid-1', to: 'bat-1', type: 'electricity', capacity_kw: 1000 },
+        { id: 'c8', from: 'dh-1', to: 'bld-1', type: 'heat', capacity_kw: 200 },
+        { id: 'c9', from: 'dh-1', to: 'load-1', type: 'heat', capacity_kw: 400 },
+      ]
+    },
+    // University Campus
+    university_campus: {
+      name: 'University Campus',
+      components: [
+        { id: 'pv-1', type: 'solar_pv', name: 'Campus Solar', x: 100, y: 50, params: { capacity_kwp: 600, tilt_deg: 25, azimuth_deg: 180, efficiency: 0.21 } },
+        { id: 'pv-2', type: 'solar_pv', name: 'Parking Canopy', x: 300, y: 50, params: { capacity_kwp: 200, tilt_deg: 10, azimuth_deg: 180, efficiency: 0.19 } },
+        { id: 'bat-1', type: 'battery_storage', name: 'Central Storage', x: 200, y: 150, params: { capacity_kwh: 1500, power_kw: 400, efficiency: 0.94, initial_soc: 0.5 } },
+        { id: 'bld-1', type: 'smart_building', name: 'Science Hall', x: 100, y: 250, params: { floors: 5, area_m2: 4000, load_kw: 200, flexible_load_pct: 25 } },
+        { id: 'bld-2', type: 'smart_building', name: 'Library', x: 300, y: 250, params: { floors: 3, area_m2: 2500, load_kw: 120, flexible_load_pct: 35 } },
+        { id: 'bld-3', type: 'smart_building', name: 'Dormitory', x: 500, y: 250, params: { floors: 8, area_m2: 5000, load_kw: 180, flexible_load_pct: 50 } },
+        { id: 'hp-1', type: 'heat_pump', name: 'Geothermal HP', x: 400, y: 150, params: { capacity_kw: 300, cop: 4.2, type: 'ground_source' } },
+        { id: 'ev-1', type: 'ev_charger', name: 'EV Station', x: 500, y: 50, params: { num_ports: 20, power_per_port_kw: 22, smart_charging: true } },
+        { id: 'grid-1', type: 'smart_grid', name: 'Campus Grid', x: 200, y: 350, params: { import_limit_kw: 800, export_limit_kw: 500, tariff_type: 'dynamic' } },
+      ],
+      connections: [
+        { id: 'c1', from: 'pv-1', to: 'bat-1', type: 'electricity', capacity_kw: 600 },
+        { id: 'c2', from: 'pv-2', to: 'bat-1', type: 'electricity', capacity_kw: 200 },
+        { id: 'c3', from: 'bat-1', to: 'bld-1', type: 'electricity', capacity_kw: 200 },
+        { id: 'c4', from: 'bat-1', to: 'bld-2', type: 'electricity', capacity_kw: 150 },
+        { id: 'c5', from: 'bat-1', to: 'bld-3', type: 'electricity', capacity_kw: 200 },
+        { id: 'c6', from: 'hp-1', to: 'bld-1', type: 'heat', capacity_kw: 100 },
+        { id: 'c7', from: 'hp-1', to: 'bld-2', type: 'heat', capacity_kw: 80 },
+        { id: 'c8', from: 'hp-1', to: 'bld-3', type: 'heat', capacity_kw: 120 },
+        { id: 'c9', from: 'pv-2', to: 'ev-1', type: 'electricity', capacity_kw: 200 },
+        { id: 'c10', from: 'grid-1', to: 'bat-1', type: 'electricity', capacity_kw: 800 },
+      ]
+    },
+    // Renewable Island
+    renewable_island: {
+      name: 'Renewable Island Grid',
+      components: [
+        { id: 'wind-1', type: 'wind_turbine', name: 'Offshore Wind', x: 100, y: 50, params: { capacity_kw: 2000, hub_height_m: 100, rotor_diameter_m: 90, cut_in_speed: 3 } },
+        { id: 'pv-1', type: 'solar_pv', name: 'Solar Farm', x: 300, y: 50, params: { capacity_kwp: 1000, tilt_deg: 30, azimuth_deg: 180, efficiency: 0.22 } },
+        { id: 'bat-1', type: 'battery_storage', name: 'Grid Battery A', x: 150, y: 180, params: { capacity_kwh: 5000, power_kw: 1500, efficiency: 0.93, initial_soc: 0.7 } },
+        { id: 'bat-2', type: 'battery_storage', name: 'Grid Battery B', x: 350, y: 180, params: { capacity_kwh: 5000, power_kw: 1500, efficiency: 0.93, initial_soc: 0.7 } },
+        { id: 'chp-1', type: 'chp_unit', name: 'Backup CHP', x: 500, y: 100, params: { capacity_kw_e: 400, capacity_kw_th: 500, efficiency_e: 0.35, efficiency_th: 0.45 } },
+        { id: 'load-1', type: 'load_center', name: 'Town Center', x: 250, y: 300, params: { base_load_kw: 800, peak_load_kw: 1500, load_profile: 'residential' } },
+        { id: 'bld-1', type: 'smart_building', name: 'Resort Hotel', x: 450, y: 300, params: { floors: 10, area_m2: 8000, load_kw: 400, flexible_load_pct: 30 } },
+        { id: 'dh-1', type: 'district_heating', name: 'District Heat', x: 100, y: 300, params: { supply_temp_c: 80, return_temp_c: 45, capacity_kw: 600 } },
+      ],
+      connections: [
+        { id: 'c1', from: 'wind-1', to: 'bat-1', type: 'electricity', capacity_kw: 1500 },
+        { id: 'c2', from: 'pv-1', to: 'bat-2', type: 'electricity', capacity_kw: 1000 },
+        { id: 'c3', from: 'bat-1', to: 'load-1', type: 'electricity', capacity_kw: 1000 },
+        { id: 'c4', from: 'bat-2', to: 'load-1', type: 'electricity', capacity_kw: 1000 },
+        { id: 'c5', from: 'bat-2', to: 'bld-1', type: 'electricity', capacity_kw: 500 },
+        { id: 'c6', from: 'chp-1', to: 'bat-1', type: 'electricity', capacity_kw: 400 },
+        { id: 'c7', from: 'chp-1', to: 'dh-1', type: 'heat', capacity_kw: 500 },
+        { id: 'c8', from: 'dh-1', to: 'load-1', type: 'heat', capacity_kw: 400 },
+        { id: 'c9', from: 'dh-1', to: 'bld-1', type: 'heat', capacity_kw: 200 },
+      ]
+    },
   };
 
   const loadTemplate = (templateId: string) => {
@@ -734,17 +883,48 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     }
   };
 
+  // Mobile tap to add component (since drag doesn't work well on touch)
+  const handleMobileTap = (type: DTComponentType) => {
+    if (!canvasRef.current) return;
+    const def = COMPONENT_DEFS[type];
+    const newComp: DTComponent = {
+      id: `${type}-${Date.now()}`,
+      type,
+      name: def.label,
+      x: 100 + Math.random() * 150,
+      y: 80 + Math.random() * 100,
+      params: { ...def.defaultParams }
+    };
+    setComponents(prev => [...prev, newComp]);
+    setMobilePanel('canvas');
+  };
+
   return (
-    <div style={{ display: 'flex', height: '100%', background: '#0f172a', color: '#e2e8f0' }}>
+    <div className="dt-builder-container">
+      {/* Mobile Tab Bar */}
+      <div className="dt-mobile-tabs">
+        <button className={mobilePanel === 'palette' ? 'active' : ''} onClick={() => setMobilePanel('palette')}>
+          🧩 Add
+        </button>
+        <button className={mobilePanel === 'canvas' ? 'active' : ''} onClick={() => setMobilePanel('canvas')}>
+          🎨 Canvas
+        </button>
+        <button className={mobilePanel === 'properties' ? 'active' : ''} onClick={() => setMobilePanel('properties')}>
+          ⚙️ Props
+        </button>
+      </div>
+
+      <div className="dt-builder-main">
       {/* Left Panel - Component Palette */}
-      <div style={{ width: 220, borderRight: '1px solid #334155', padding: 12, overflowY: 'auto' }}>
+      <div className={`dt-panel dt-palette-panel ${mobilePanel === 'palette' ? 'mobile-visible' : ''}`}>
         <h3 style={{ margin: '0 0 12px', fontSize: 14, color: '#94a3b8' }}>Components</h3>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }} className="dt-component-list">
           {COMPONENT_LIST.map(comp => (
             <div
               key={comp.type}
               draggable
               onDragStart={() => handleDragStart(comp.type)}
+              onClick={() => handleMobileTap(comp.type)}
               style={{
                 padding: '8px 10px',
                 background: '#1e293b',
@@ -889,46 +1069,62 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
         <div style={{ marginTop: 20 }}>
           <h4 style={{ margin: '0 0 8px', fontSize: 12, color: '#94a3b8' }}>Paper Scenarios</h4>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <button onClick={() => loadTemplate('scenario_1_baseline')} style={{ ...btnStyle, background: '#1e40af', fontSize: 10, padding: '6px 8px' }}>
+            <button onClick={() => { loadTemplate('scenario_1_baseline'); setMobilePanel('canvas'); }} style={{ ...btnStyle, background: '#1e40af', fontSize: 10, padding: '6px 8px' }}>
               S1: Baseline
             </button>
-            <button onClick={() => loadTemplate('scenario_2_high_pv')} style={{ ...btnStyle, background: '#1e40af', fontSize: 10, padding: '6px 8px' }}>
+            <button onClick={() => { loadTemplate('scenario_2_high_pv'); setMobilePanel('canvas'); }} style={{ ...btnStyle, background: '#1e40af', fontSize: 10, padding: '6px 8px' }}>
               S2: High PV
             </button>
-            <button onClick={() => loadTemplate('scenario_3_pv_battery')} style={{ ...btnStyle, background: '#1e40af', fontSize: 10, padding: '6px 8px' }}>
+            <button onClick={() => { loadTemplate('scenario_3_pv_battery'); setMobilePanel('canvas'); }} style={{ ...btnStyle, background: '#1e40af', fontSize: 10, padding: '6px 8px' }}>
               S3: PV + Battery
             </button>
-            <button onClick={() => loadTemplate('scenario_4_large_battery')} style={{ ...btnStyle, background: '#1e40af', fontSize: 10, padding: '6px 8px' }}>
+            <button onClick={() => { loadTemplate('scenario_4_large_battery'); setMobilePanel('canvas'); }} style={{ ...btnStyle, background: '#1e40af', fontSize: 10, padding: '6px 8px' }}>
               S4: Large Battery
             </button>
-            <button onClick={() => loadTemplate('scenario_5_dsm')} style={{ ...btnStyle, background: '#1e40af', fontSize: 10, padding: '6px 8px' }}>
+            <button onClick={() => { loadTemplate('scenario_5_dsm'); setMobilePanel('canvas'); }} style={{ ...btnStyle, background: '#1e40af', fontSize: 10, padding: '6px 8px' }}>
               S5: DSM
             </button>
           </div>
           <h4 style={{ margin: '12px 0 8px', fontSize: 12, color: '#94a3b8' }}>Other Templates</h4>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <button onClick={() => loadTemplate('smart_district')} style={{ ...btnStyle, background: '#065f46', fontSize: 10, padding: '6px 8px' }}>
+            <button onClick={() => { loadTemplate('smart_district'); setMobilePanel('canvas'); }} style={{ ...btnStyle, background: '#065f46', fontSize: 10, padding: '6px 8px' }}>
               🏘️ Smart District
+            </button>
+            <button onClick={() => { loadTemplate('industrial_microgrid'); setMobilePanel('canvas'); }} style={{ ...btnStyle, background: '#7c2d12', fontSize: 10, padding: '6px 8px' }}>
+              🏭 Industrial Microgrid
+            </button>
+            <button onClick={() => { loadTemplate('university_campus'); setMobilePanel('canvas'); }} style={{ ...btnStyle, background: '#4c1d95', fontSize: 10, padding: '6px 8px' }}>
+              🎓 University Campus
+            </button>
+            <button onClick={() => { loadTemplate('renewable_island'); setMobilePanel('canvas'); }} style={{ ...btnStyle, background: '#0e7490', fontSize: 10, padding: '6px 8px' }}>
+              🏝️ Renewable Island
             </button>
           </div>
         </div>
       </div>
 
       {/* Center - Canvas */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+      <div className={`dt-panel dt-canvas-panel ${mobilePanel === 'canvas' ? 'mobile-visible' : ''}`}>
         {/* Toolbar */}
-        <div style={{ padding: '8px 12px', borderBottom: '1px solid #334155', display: 'flex', alignItems: 'center', gap: 12 }}>
+        <div className="dt-toolbar">
           <input
             value={configName}
             onChange={e => setConfigName(e.target.value)}
-            style={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 4, padding: '4px 8px', color: '#e2e8f0', fontSize: 14, width: 200 }}
+            style={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 4, padding: '4px 8px', color: '#e2e8f0', fontSize: 14, flex: 1, minWidth: 0, maxWidth: 200 }}
           />
-          <span style={{ fontSize: 12, color: '#64748b' }}>
-            {components.length} components • {connections.length} connections
+          <span className="dt-toolbar-info">
+            {components.length} • {connections.length}
           </span>
+          {/* Zoom controls */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginLeft: 'auto' }}>
+            <button onClick={() => setZoom(z => Math.max(0.5, z - 0.1))} style={{ ...btnStyle, padding: '4px 8px', fontSize: 14 }}>−</button>
+            <span style={{ fontSize: 11, color: '#94a3b8', minWidth: 40, textAlign: 'center' }}>{Math.round(zoom * 100)}%</span>
+            <button onClick={() => setZoom(z => Math.min(2, z + 0.1))} style={{ ...btnStyle, padding: '4px 8px', fontSize: 14 }}>+</button>
+            <button onClick={() => setZoom(1)} style={{ ...btnStyle, padding: '4px 6px', fontSize: 10 }}>Reset</button>
+          </div>
           {connectingFrom && (
-            <span style={{ fontSize: 12, color: '#eab308', marginLeft: 'auto' }}>
-              🔗 Click another component to connect, or click canvas to cancel
+            <span style={{ fontSize: 12, color: '#eab308' }}>
+              🔗 Click to connect
             </span>
           )}
         </div>
@@ -939,14 +1135,21 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
           onDrop={handleDrop}
           onDragOver={e => e.preventDefault()}
           onClick={handleCanvasClick}
+          onWheel={handleWheel}
+          onTouchStart={e => { if (e.touches.length === 2) handlePinchStart(e); }}
+          onTouchMove={handleTouchMove}
+          onTouchEnd={handleTouchEnd}
           style={{
             flex: 1,
             position: 'relative',
             background: 'linear-gradient(#0f172a 1px, transparent 1px), linear-gradient(90deg, #0f172a 1px, transparent 1px), #1e293b',
-            backgroundSize: '20px 20px',
-            overflow: 'hidden'
+            backgroundSize: `${20 * zoom}px ${20 * zoom}px`,
+            overflow: 'hidden',
+            touchAction: touchDrag || pinchStart ? 'none' : 'pan-x pan-y'
           }}
         >
+          {/* Zoomable content wrapper */}
+          <div style={{ transform: `scale(${zoom})`, transformOrigin: '0 0', width: `${100/zoom}%`, height: `${100/zoom}%`, position: 'relative' }}>
           {/* SVG for connections */}
           <svg style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'none' }}>
             <defs>
@@ -998,6 +1201,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
                 draggable
                 onDragEnd={e => handleComponentDrag(comp.id, e)}
                 onClick={e => handleComponentClick(comp.id, e)}
+                onTouchStart={e => handleTouchStart(comp.id, e)}
                 style={{
                   position: 'absolute',
                   left: comp.x,
@@ -1013,7 +1217,8 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
                   justifyContent: 'center',
                   cursor: 'move',
                   boxShadow: isSelected ? '0 0 12px rgba(255,255,255,0.3)' : status === 'isolated' ? '0 0 8px rgba(249,115,22,0.5)' : 'none',
-                  transition: 'box-shadow 0.15s'
+                  transition: touchDrag?.id === comp.id ? 'none' : 'box-shadow 0.15s',
+                  touchAction: 'none'
                 }}
               >
                 {/* Status badge */}
@@ -1048,11 +1253,12 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
               <div>Drag components here to build your digital twin</div>
             </div>
           )}
+          </div>
         </div>
       </div>
 
       {/* Right Panel - Properties */}
-      <div style={{ width: 260, borderLeft: '1px solid #334155', padding: 12, overflowY: 'auto' }}>
+      <div className={`dt-panel dt-properties-panel ${mobilePanel === 'properties' ? 'mobile-visible' : ''}`}>
         <h3 style={{ margin: '0 0 12px', fontSize: 14, color: '#94a3b8' }}>Properties</h3>
         
         {selectedComp ? (
@@ -1151,6 +1357,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
             Select a component or connection to edit its properties
           </div>
         )}
+      </div>
       </div>
     </div>
   );
