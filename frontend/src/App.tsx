@@ -140,7 +140,7 @@ export default function App() {
     return () => controller.abort();
   }, [apiBase, appendLog, selectedRunId]);
 
-  // Load run details and scenario info when selection changes
+  // Load run details, scenario info, and digital twin when selection changes
   useEffect(() => {
     const ac = new AbortController();
     const load = async () => {
@@ -150,9 +150,44 @@ export default function App() {
         if (!r.ok) return;
         const run: SimulationRun = await r.json();
         setSelectedRun(run);
+        
+        // Load linked digital twin if exists
+        if (run.digital_twin_id) {
+          const dt = await fetch(buildHttpUrl(`/digital-twins/${run.digital_twin_id}`, apiBase), { signal: ac.signal });
+          if (dt.ok) {
+            const dtData = await dt.json();
+            setDtConfig({
+              id: dtData.id,
+              name: dtData.name,
+              components: dtData.components || [],
+              connections: dtData.connections || [],
+              created_at: dtData.created_at
+            });
+          }
+        }
+        
         if (run.scenario_id) {
           const s = await fetch(buildHttpUrl(`/scenarios/${run.scenario_id}`, apiBase), { signal: ac.signal });
-          if (s.ok) setSelectedScenario(await s.json()); else setSelectedScenario(null);
+          if (s.ok) {
+            const scenario = await s.json();
+            setSelectedScenario(scenario);
+            // Also check if scenario has linked digital twin
+            if (!run.digital_twin_id && scenario.digital_twin_id) {
+              const dt = await fetch(buildHttpUrl(`/digital-twins/${scenario.digital_twin_id}`, apiBase), { signal: ac.signal });
+              if (dt.ok) {
+                const dtData = await dt.json();
+                setDtConfig({
+                  id: dtData.id,
+                  name: dtData.name,
+                  components: dtData.components || [],
+                  connections: dtData.connections || [],
+                  created_at: dtData.created_at
+                });
+              }
+            }
+          } else {
+            setSelectedScenario(null);
+          }
         } else {
           setSelectedScenario(null);
         }

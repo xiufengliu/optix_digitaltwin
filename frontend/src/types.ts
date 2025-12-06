@@ -4,6 +4,7 @@ export interface SimulationRun {
   status: string;
   session_id?: string | null;
   scenario_id?: string | null;
+  digital_twin_id?: string | null;
   created_at: string;
   updated_at: string;
   notes?: string | null;
