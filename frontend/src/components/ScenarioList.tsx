@@ -302,30 +302,127 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
             <h3 style={{ margin: 0 }}>Compare Runs (latest)</h3>
             <button className="button" onClick={loadCompare}>Refresh</button>
           </div>
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-              <thead>
-                <tr>
-                  <th style={{ textAlign: 'left', padding: '6px 8px' }}>Name</th>
-                  <th style={{ textAlign: 'left', padding: '6px 8px' }}>Status</th>
-                  <th style={{ textAlign: 'right', padding: '6px 8px' }}>PED Ratio</th>
-                  <th style={{ textAlign: 'right', padding: '6px 8px' }}>Gen (MWh)</th>
-                  <th style={{ textAlign: 'right', padding: '6px 8px' }}>Demand (MWh)</th>
-                </tr>
-              </thead>
-              <tbody>
-                {compareRows.map((r, i) => (
-                  <tr key={i}>
-                    <td style={{ padding: '6px 8px' }}>{r.name}</td>
-                    <td style={{ padding: '6px 8px', color: '#94a3b8' }}>{r.status}</td>
-                    <td style={{ padding: '6px 8px', textAlign: 'right' }}>{r.ped_ratio}</td>
-                    <td style={{ padding: '6px 8px', textAlign: 'right' }}>{r.total_gen_mwh}</td>
-                    <td style={{ padding: '6px 8px', textAlign: 'right' }}>{r.total_demand_mwh}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          
+          {compareRows.length > 0 ? (
+            <>
+              {/* Visual comparison charts */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1rem', marginBottom: '1rem' }}>
+                {/* PED Ratio Chart */}
+                <div style={{ background: '#1e293b', borderRadius: 8, padding: '12px' }}>
+                  <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>PED Ratio</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {compareRows.filter(r => r.ped_ratio !== '-').slice(0, 5).map((r, i) => {
+                      const ratio = parseFloat(r.ped_ratio);
+                      const pct = Math.min(ratio * 100, 150);
+                      return (
+                        <div key={i}>
+                          <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.name}</div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <div style={{ flex: 1, height: 16, background: '#0f172a', borderRadius: 4, overflow: 'hidden', position: 'relative' }}>
+                              <div style={{ position: 'absolute', left: '66.7%', top: 0, bottom: 0, width: 2, background: '#fbbf24', zIndex: 1 }} title="PED Target (1.0)" />
+                              <div style={{ height: '100%', width: `${pct / 1.5}%`, background: ratio >= 1 ? 'linear-gradient(90deg, #22c55e, #16a34a)' : 'linear-gradient(90deg, #ef4444, #dc2626)', borderRadius: 4 }} />
+                            </div>
+                            <span style={{ fontSize: 11, fontWeight: 600, color: ratio >= 1 ? '#22c55e' : '#ef4444', minWidth: 40 }}>{ratio.toFixed(2)}</span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Generation Chart */}
+                <div style={{ background: '#1e293b', borderRadius: 8, padding: '12px' }}>
+                  <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>Generation (MWh)</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {(() => {
+                      const validRows = compareRows.filter(r => r.total_gen_mwh !== '-').slice(0, 5);
+                      const maxGen = Math.max(...validRows.map(r => parseFloat(r.total_gen_mwh)), 1);
+                      return validRows.map((r, i) => {
+                        const gen = parseFloat(r.total_gen_mwh);
+                        return (
+                          <div key={i}>
+                            <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.name}</div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                              <div style={{ flex: 1, height: 16, background: '#0f172a', borderRadius: 4, overflow: 'hidden' }}>
+                                <div style={{ height: '100%', width: `${(gen / maxGen) * 100}%`, background: 'linear-gradient(90deg, #22c55e, #4ade80)', borderRadius: 4 }} />
+                              </div>
+                              <span style={{ fontSize: 11, fontWeight: 600, color: '#22c55e', minWidth: 50 }}>{gen.toFixed(0)}</span>
+                            </div>
+                          </div>
+                        );
+                      });
+                    })()}
+                  </div>
+                </div>
+
+                {/* Demand Chart */}
+                <div style={{ background: '#1e293b', borderRadius: 8, padding: '12px' }}>
+                  <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>Demand (MWh)</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {(() => {
+                      const validRows = compareRows.filter(r => r.total_demand_mwh !== '-').slice(0, 5);
+                      const maxDemand = Math.max(...validRows.map(r => parseFloat(r.total_demand_mwh)), 1);
+                      return validRows.map((r, i) => {
+                        const demand = parseFloat(r.total_demand_mwh);
+                        return (
+                          <div key={i}>
+                            <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.name}</div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                              <div style={{ flex: 1, height: 16, background: '#0f172a', borderRadius: 4, overflow: 'hidden' }}>
+                                <div style={{ height: '100%', width: `${(demand / maxDemand) * 100}%`, background: 'linear-gradient(90deg, #f97316, #fb923c)', borderRadius: 4 }} />
+                              </div>
+                              <span style={{ fontSize: 11, fontWeight: 600, color: '#f97316', minWidth: 50 }}>{demand.toFixed(0)}</span>
+                            </div>
+                          </div>
+                        );
+                      });
+                    })()}
+                  </div>
+                </div>
+              </div>
+
+              {/* Data table */}
+              <div style={{ overflowX: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                  <thead>
+                    <tr style={{ borderBottom: '1px solid #334155' }}>
+                      <th style={{ textAlign: 'left', padding: '8px', color: '#94a3b8', fontWeight: 500 }}>Run Name</th>
+                      <th style={{ textAlign: 'center', padding: '8px', color: '#94a3b8', fontWeight: 500 }}>Status</th>
+                      <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8', fontWeight: 500 }}>PED Ratio</th>
+                      <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8', fontWeight: 500 }}>Gen (MWh)</th>
+                      <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8', fontWeight: 500 }}>Demand (MWh)</th>
+                      <th style={{ textAlign: 'center', padding: '8px', color: '#94a3b8', fontWeight: 500 }}>PED Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {compareRows.map((r, i) => {
+                      const isPed = r.ped_ratio !== '-' && parseFloat(r.ped_ratio) >= 1;
+                      return (
+                        <tr key={i} style={{ borderBottom: '1px solid #1e293b' }}>
+                          <td style={{ padding: '8px', fontWeight: 500 }}>{r.name}</td>
+                          <td style={{ padding: '8px', textAlign: 'center' }}>
+                            <span style={{ padding: '2px 8px', borderRadius: 4, fontSize: 10, background: r.status === 'completed' ? '#166534' : r.status === 'running' ? '#1e40af' : '#374151' }}>
+                              {r.status}
+                            </span>
+                          </td>
+                          <td style={{ padding: '8px', textAlign: 'right', fontWeight: 600, color: r.ped_ratio !== '-' && parseFloat(r.ped_ratio) >= 1 ? '#22c55e' : '#ef4444' }}>{r.ped_ratio}</td>
+                          <td style={{ padding: '8px', textAlign: 'right', color: '#22c55e' }}>{r.total_gen_mwh}</td>
+                          <td style={{ padding: '8px', textAlign: 'right', color: '#f97316' }}>{r.total_demand_mwh}</td>
+                          <td style={{ padding: '8px', textAlign: 'center' }}>
+                            {r.ped_ratio === '-' ? '—' : isPed ? <span style={{ color: '#22c55e' }}>✓ PED</span> : <span style={{ color: '#ef4444' }}>✗ Not PED</span>}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          ) : (
+            <div style={{ textAlign: 'center', padding: '2rem', color: '#64748b' }}>
+              No runs to compare. Run some scenarios first!
+            </div>
+          )}
         </div>
       </div>
     </div>
