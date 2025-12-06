@@ -207,14 +207,36 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
             <label>Financial Allocation<input type="number" step="0.01" value={overrides.financial_allocation} onChange={e => onChange('financial_allocation', Number(e.target.value))} /></label>
             <label>Investment Freq (steps)<input type="number" value={overrides.investment_freq} onChange={e => onChange('investment_freq', Number(e.target.value))} /></label>
           </div>
-          <div style={{ marginTop: '0.75rem', display: 'flex', gap: '0.5rem' }}>
-            <button className="button" onClick={saveScenario}>Save Scenario</button>
-            <button className="button" onClick={async () => {
-              if (!selectedId) return;
-              const url = join(`/scenarios/${selectedId}`);
-              const r = await fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, description: desc, details, config_overrides: overrides }) });
-              if (r.ok) { await load(); }
-            }} disabled={!selectedId}>Save Changes</button>
+          <div style={{ marginTop: '0.75rem', display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+            {selectedId && isPaperScenario(scenarios.find(s => s.id === selectedId)?.name || '') ? (
+              <>
+                <button className="button" onClick={async () => {
+                  // Save As: create a new copy with modified name
+                  const copyName = name.includes('(Copy)') ? name : `${name} (Copy)`;
+                  const payload = { name: copyName, description: desc, details, config_overrides: overrides };
+                  const r = await fetch(join('/scenarios'), {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+                  });
+                  if (r.ok) { 
+                    const newScenario = await r.json();
+                    await load(); 
+                    setSelectedId(newScenario.id);
+                    alert('New scenario created from paper scenario!');
+                  }
+                }}>Save As New</button>
+                <span style={{ fontSize: 11, color: '#94a3b8' }}>Paper scenarios are read-only. Changes apply to this session only.</span>
+              </>
+            ) : (
+              <>
+                <button className="button" onClick={saveScenario}>Save Scenario</button>
+                <button className="button" onClick={async () => {
+                  if (!selectedId) return;
+                  const url = join(`/scenarios/${selectedId}`);
+                  const r = await fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, description: desc, details, config_overrides: overrides }) });
+                  if (r.ok) { await load(); }
+                }} disabled={!selectedId}>Save Changes</button>
+              </>
+            )}
           </div>
         </div>
 
