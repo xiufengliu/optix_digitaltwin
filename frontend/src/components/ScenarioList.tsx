@@ -113,6 +113,9 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
 
   useEffect(() => { loadCompare(); }, []);
 
+  // Paper scenarios (S1-S5) cannot be deleted
+  const isPaperScenario = (name: string) => /^Scenario [1-5]:/.test(name);
+
   return (
     <div style={{ display: 'grid', gridTemplateColumns: '360px 1fr', gap: '1rem', height: '100%' }}>
       <div className="sidebar" style={{ height: '100%', overflowY: 'auto' }}>
@@ -122,10 +125,26 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
           <button className="button" onClick={load} disabled={loading}>Refresh</button>
         </div>
         <div style={{ marginTop: '1rem' }}>
-          {scenarios.map((s) => (
-            <div key={s.id} className={`run-item run-item--with-icon ${selectedId === s.id ? 'active' : ''}`} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }} onClick={() => { setSelectedId(s.id); setName(s.name); setDesc(s.description ?? ''); setDetails(s.details ?? ''); setOverrides({ ...defaultOverrides, ...(s.config_overrides || {}) }); }}>
+          {scenarios.map((s) => {
+            const isPaper = isPaperScenario(s.name);
+            return (
+            <div 
+              key={s.id} 
+              className={`run-item run-item--with-icon ${selectedId === s.id ? 'active' : ''}`} 
+              style={{ 
+                display: 'flex', 
+                alignItems: 'center', 
+                justifyContent: 'space-between',
+                background: isPaper ? 'linear-gradient(135deg, #1e3a5f 0%, #1e293b 100%)' : undefined,
+                borderLeft: isPaper ? '3px solid #3b82f6' : undefined,
+              }} 
+              onClick={() => { setSelectedId(s.id); setName(s.name); setDesc(s.description ?? ''); setDetails(s.details ?? ''); setOverrides({ ...defaultOverrides, ...(s.config_overrides || {}) }); }}
+            >
               <div style={{ flex: 1 }}>
-                <strong>{s.name}</strong>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <strong>{s.name}</strong>
+                  {isPaper && <span style={{ fontSize: 9, padding: '2px 5px', background: '#3b82f6', borderRadius: 3, color: '#fff' }}>PAPER</span>}
+                </div>
                 <div style={{ fontSize: '0.85rem', color: '#94a3b8' }}>{s.description ?? ''}</div>
                 {s.details && (
                   <div style={{ fontSize: '0.75rem', color: '#64748b', marginTop: 4 }}>
@@ -138,16 +157,19 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
                   {runBusyId === s.id ? 'Running…' : 'Run'}
                 </button>
               </div>
-              <button
-                className="icon-btn"
-                title="Delete scenario"
-                aria-label="Delete scenario"
-                onClick={(e) => { e.stopPropagation(); deleteScenario(s.id); }}
-              >
-                🗑
-              </button>
+              {!isPaper && (
+                <button
+                  className="icon-btn"
+                  title="Delete scenario"
+                  aria-label="Delete scenario"
+                  onClick={(e) => { e.stopPropagation(); deleteScenario(s.id); }}
+                >
+                  🗑
+                </button>
+              )}
             </div>
-          ))}
+            );
+          })}
         </div>
       </div>
       <div className="main-content">
