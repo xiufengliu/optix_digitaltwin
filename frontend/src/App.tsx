@@ -140,6 +140,46 @@ export default function App() {
     return () => controller.abort();
   }, [apiBase, appendLog, selectedRunId]);
 
+  // Generate a default digital twin config from scenario overrides
+  const generateDTFromScenario = (scenario: any): DigitalTwinConfig => {
+    const cfg = scenario.config_overrides || {};
+    const components: any[] = [];
+    const connections: any[] = [];
+    let x = 150, connId = 1;
+    
+    // Always add a building
+    components.push({ id: 'bld-1', type: 'smart_building', name: 'Building', x: 300, y: 180, params: { floors: 5, area_m2: 2000, load_kw: 150 } });
+    
+    // Add solar if configured
+    if (cfg.owned_solar_capacity_mw > 0) {
+      components.push({ id: 'pv-1', type: 'solar_pv', name: `Solar (${(cfg.owned_solar_capacity_mw * 1000).toFixed(0)} kWp)`, x: 300, y: 60, params: { capacity_kwp: cfg.owned_solar_capacity_mw * 1000 } });
+      connections.push({ id: `c${connId++}`, from: 'pv-1', to: 'bld-1', type: 'electricity' });
+    }
+    
+    // Add battery if configured
+    if (cfg.owned_battery_capacity_mwh > 0) {
+      components.push({ id: 'bat-1', type: 'battery_storage', name: `Battery (${(cfg.owned_battery_capacity_mwh * 1000).toFixed(0)} kWh)`, x: 450, y: 120, params: { capacity_kwh: cfg.owned_battery_capacity_mwh * 1000 } });
+      connections.push({ id: `c${connId++}`, from: 'bat-1', to: 'bld-1', type: 'electricity' });
+      if (cfg.owned_solar_capacity_mw > 0) connections.push({ id: `c${connId++}`, from: 'pv-1', to: 'bat-1', type: 'electricity' });
+    }
+    
+    // Add wind if configured
+    if (cfg.owned_wind_capacity_mw > 0) {
+      components.push({ id: 'wind-1', type: 'wind_turbine', name: `Wind (${(cfg.owned_wind_capacity_mw * 1000).toFixed(0)} kW)`, x: 150, y: 60, params: { capacity_kw: cfg.owned_wind_capacity_mw * 1000 } });
+      connections.push({ id: `c${connId++}`, from: 'wind-1', to: 'bld-1', type: 'electricity' });
+    }
+    
+    // Always add grid connection
+    components.push({ id: 'grid-1', type: 'smart_grid', name: 'Grid', x: 450, y: 260, params: { import_limit_kw: 500, export_limit_kw: 200 } });
+    connections.push({ id: `c${connId++}`, from: 'grid-1', to: 'bld-1', type: 'electricity' });
+    
+    // Add district heating
+    components.push({ id: 'dh-1', type: 'district_heating', name: 'District Heating', x: 150, y: 260, params: { capacity_kw: 200 } });
+    connections.push({ id: `c${connId++}`, from: 'dh-1', to: 'bld-1', type: 'heat' });
+    
+    return { id: `gen-${scenario.id}`, name: scenario.name, components, connections, created_at: scenario.created_at };
+  };
+
   // Load run details, scenario info, and digital twin when selection changes
   useEffect(() => {
     const ac = new AbortController();
@@ -151,18 +191,15 @@ export default function App() {
         const run: SimulationRun = await r.json();
         setSelectedRun(run);
         
+        let dtLoaded = false;
+        
         // Load linked digital twin if exists
         if (run.digital_twin_id) {
           const dt = await fetch(buildHttpUrl(`/digital-twins/${run.digital_twin_id}`, apiBase), { signal: ac.signal });
           if (dt.ok) {
             const dtData = await dt.json();
-            setDtConfig({
-              id: dtData.id,
-              name: dtData.name,
-              components: dtData.components || [],
-              connections: dtData.connections || [],
-              created_at: dtData.created_at
-            });
+            setDtConfig({ id: dtData.id, name: dtData.name, components: dtData.components || [], connections: dtData.connections || [], created_at: dtData.created_at });
+            dtLoaded = true;
           }
         }
         
@@ -171,19 +208,19 @@ export default function App() {
           if (s.ok) {
             const scenario = await s.json();
             setSelectedScenario(scenario);
-            // Also check if scenario has linked digital twin
-            if (!run.digital_twin_id && scenario.digital_twin_id) {
+            
+            if (!dtLoaded && scenario.digital_twin_id) {
               const dt = await fetch(buildHttpUrl(`/digital-twins/${scenario.digital_twin_id}`, apiBase), { signal: ac.signal });
               if (dt.ok) {
                 const dtData = await dt.json();
-                setDtConfig({
-                  id: dtData.id,
-                  name: dtData.name,
-                  components: dtData.components || [],
-                  connections: dtData.connections || [],
-                  created_at: dtData.created_at
-                });
+                setDtConfig({ id: dtData.id, name: dtData.name, components: dtData.components || [], connections: dtData.connections || [], created_at: dtData.created_at });
+                dtLoaded = true;
               }
+            }
+            
+            // Generate default DT from scenario config if no linked DT
+            if (!dtLoaded) {
+              setDtConfig(generateDTFromScenario(scenario));
             }
           } else {
             setSelectedScenario(null);
