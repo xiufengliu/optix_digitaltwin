@@ -484,14 +484,16 @@ export default function App() {
           </main>
         </>
       ) : (
-        <main className="main-content" style={{ gridColumn: '1 / -1' }}>
-          <div className="header">
+        <main className="main-content" style={{ gridColumn: '1 / -1', display: 'flex', flexDirection: 'column', height: 'calc(100vh - 60px)', overflow: 'hidden' }}>
+          <div className="header" style={{ flexShrink: 0 }}>
             <h1>Scenarios</h1>
             <div style={{ display: 'flex', gap: '0.5rem' }}>
               <button className="button" onClick={() => setTab('runs')}>Back to Runs</button>
             </div>
           </div>
-          <ScenarioList apiBase={apiBase} onRun={(runId) => { setTab('runs'); setSelectedRunId(runId); loadRuns(); }} />
+          <div style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
+            <ScenarioList apiBase={apiBase} onRun={(runId) => { setTab('runs'); setSelectedRunId(runId); loadRuns(); }} />
+          </div>
         </main>
       )}
       {tab === 'builder' && (
