@@ -426,7 +426,6 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
           )}
         </div>
       </div>
-      </div>
 
       {/* Compare Panel - mobile tab only */}
       <div className={`scenario-compare-panel ${mobileTab === 'compare' ? 'mobile-visible' : ''}`}>
@@ -435,33 +434,113 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
           <button className="button" onClick={loadCompare}>Refresh</button>
         </div>
         {compareRows.length > 0 ? (
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
-              <thead>
-                <tr style={{ borderBottom: '1px solid #334155' }}>
-                  <th style={{ textAlign: 'left', padding: '8px', color: '#94a3b8' }}>Run</th>
-                  <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8' }}>PED</th>
-                  <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8' }}>Gen</th>
-                  <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8' }}>Load</th>
-                </tr>
-              </thead>
-              <tbody>
-                {compareRows.map((r, i) => (
-                  <tr key={i} style={{ borderBottom: '1px solid #1e293b' }}>
-                    <td style={{ padding: '8px', fontSize: 11 }}>{r.name}</td>
-                    <td style={{ padding: '8px', textAlign: 'right', fontWeight: 600, color: r.ped_ratio !== '-' && parseFloat(r.ped_ratio) >= 1 ? '#22c55e' : '#ef4444' }}>{r.ped_ratio}</td>
-                    <td style={{ padding: '8px', textAlign: 'right', color: '#22c55e' }}>{r.total_gen_mwh}</td>
-                    <td style={{ padding: '8px', textAlign: 'right', color: '#f97316' }}>{r.total_demand_mwh}</td>
+          <>
+            {/* Charts - stacked vertically on mobile */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', marginBottom: '1rem' }}>
+              {/* PED Ratio Chart */}
+              <div style={{ background: '#1e293b', borderRadius: 8, padding: '12px' }}>
+                <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>PED Ratio</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {compareRows.filter(r => r.ped_ratio !== '-').slice(0, 5).map((r, i) => {
+                    const ratio = parseFloat(r.ped_ratio);
+                    const pct = Math.min(ratio * 100, 150);
+                    return (
+                      <div key={i}>
+                        <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2 }}>{r.name}</div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <div style={{ flex: 1, height: 16, background: '#0f172a', borderRadius: 4, overflow: 'hidden', position: 'relative' }}>
+                            <div style={{ position: 'absolute', left: '66.7%', top: 0, bottom: 0, width: 2, background: '#fbbf24', zIndex: 1 }} />
+                            <div style={{ height: '100%', width: `${pct / 1.5}%`, background: ratio >= 1 ? 'linear-gradient(90deg, #22c55e, #16a34a)' : 'linear-gradient(90deg, #ef4444, #dc2626)', borderRadius: 4 }} />
+                          </div>
+                          <span style={{ fontSize: 11, fontWeight: 600, color: ratio >= 1 ? '#22c55e' : '#ef4444', minWidth: 40 }}>{ratio.toFixed(2)}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Generation Chart */}
+              <div style={{ background: '#1e293b', borderRadius: 8, padding: '12px' }}>
+                <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>Generation (MWh)</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {(() => {
+                    const validRows = compareRows.filter(r => r.total_gen_mwh !== '-').slice(0, 5);
+                    const maxGen = Math.max(...validRows.map(r => parseFloat(r.total_gen_mwh)), 1);
+                    return validRows.map((r, i) => {
+                      const gen = parseFloat(r.total_gen_mwh);
+                      return (
+                        <div key={i}>
+                          <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2 }}>{r.name}</div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <div style={{ flex: 1, height: 16, background: '#0f172a', borderRadius: 4, overflow: 'hidden' }}>
+                              <div style={{ height: '100%', width: `${(gen / maxGen) * 100}%`, background: 'linear-gradient(90deg, #22c55e, #4ade80)', borderRadius: 4 }} />
+                            </div>
+                            <span style={{ fontSize: 11, fontWeight: 600, color: '#22c55e', minWidth: 50 }}>{gen.toFixed(0)}</span>
+                          </div>
+                        </div>
+                      );
+                    });
+                  })()}
+                </div>
+              </div>
+
+              {/* Demand Chart */}
+              <div style={{ background: '#1e293b', borderRadius: 8, padding: '12px' }}>
+                <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>Demand (MWh)</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {(() => {
+                    const validRows = compareRows.filter(r => r.total_demand_mwh !== '-').slice(0, 5);
+                    const maxDemand = Math.max(...validRows.map(r => parseFloat(r.total_demand_mwh)), 1);
+                    return validRows.map((r, i) => {
+                      const demand = parseFloat(r.total_demand_mwh);
+                      return (
+                        <div key={i}>
+                          <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2 }}>{r.name}</div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <div style={{ flex: 1, height: 16, background: '#0f172a', borderRadius: 4, overflow: 'hidden' }}>
+                              <div style={{ height: '100%', width: `${(demand / maxDemand) * 100}%`, background: 'linear-gradient(90deg, #f97316, #fb923c)', borderRadius: 4 }} />
+                            </div>
+                            <span style={{ fontSize: 11, fontWeight: 600, color: '#f97316', minWidth: 50 }}>{demand.toFixed(0)}</span>
+                          </div>
+                        </div>
+                      );
+                    });
+                  })()}
+                </div>
+              </div>
+            </div>
+
+            {/* Data table */}
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                <thead>
+                  <tr style={{ borderBottom: '1px solid #334155' }}>
+                    <th style={{ textAlign: 'left', padding: '8px', color: '#94a3b8' }}>Run</th>
+                    <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8' }}>PED</th>
+                    <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8' }}>Gen</th>
+                    <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8' }}>Load</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {compareRows.map((r, i) => (
+                    <tr key={i} style={{ borderBottom: '1px solid #1e293b' }}>
+                      <td style={{ padding: '8px', fontSize: 11 }}>{r.name}</td>
+                      <td style={{ padding: '8px', textAlign: 'right', fontWeight: 600, color: r.ped_ratio !== '-' && parseFloat(r.ped_ratio) >= 1 ? '#22c55e' : '#ef4444' }}>{r.ped_ratio}</td>
+                      <td style={{ padding: '8px', textAlign: 'right', color: '#22c55e' }}>{r.total_gen_mwh}</td>
+                      <td style={{ padding: '8px', textAlign: 'right', color: '#f97316' }}>{r.total_demand_mwh}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
         ) : (
           <div style={{ textAlign: 'center', padding: '2rem', color: '#64748b' }}>
             No runs to compare. Run some scenarios first!
           </div>
         )}
+      </div>
       </div>
     </div>
   );
