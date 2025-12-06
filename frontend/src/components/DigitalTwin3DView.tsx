@@ -495,6 +495,12 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
   const mouseRef = useRef(new THREE.Vector2());
   const draggedRef = useRef<{ id: string; model: THREE.Group; offset: THREE.Vector3 } | null>(null);
   const planeRef = useRef(new THREE.Plane(new THREE.Vector3(0, 1, 0), 0));
+  const animateRef = useRef(animate);
+  
+  // Keep animateRef in sync with prop
+  useEffect(() => {
+    animateRef.current = animate;
+  }, [animate]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -554,7 +560,7 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
       frameRef.current = requestAnimationFrame(animateLoop);
       controls.update();
       
-      if (animate) {
+      if (animateRef.current) {
         flowParticlesRef.current.forEach(fp => fp.update());
         rotatingPartsRef.current.forEach(part => {
           part.rotation.z += 0.02;
@@ -670,7 +676,7 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
       renderer.dispose();
       container.removeChild(renderer.domElement);
     };
-  }, [animate, onComponentMove]);
+  }, [onComponentMove]); // animate handled via ref
 
   useEffect(() => {
     const scene = sceneRef.current;
