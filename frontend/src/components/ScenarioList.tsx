@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import type { Scenario, ScenarioCreate } from '../types';
+import type { CompareRunRow, CompareRunsResponse, Scenario, ScenarioCreate, SimulationRun } from '../types';
 
 interface ScenarioListProps {
   apiBase: string;
@@ -27,7 +27,11 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
   const [showGuide, setShowGuide] = useState(true);
   const [runBusyId, setRunBusyId] = useState<string | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
-  const [compareRows, setCompareRows] = useState<any[]>([]);
+  const [compareRows, setCompareRows] = useState<CompareRunRow[]>([]);
+  const [compareMeta, setCompareMeta] = useState<{ commonSteps: number | null; commonPeriodHours: number | null }>({
+    commonSteps: null,
+    commonPeriodHours: null,
+  });
   const [mobileTab, setMobileTab] = useState<'list' | 'edit' | 'compare'>('list');
 
   const join = (p: string) => {
@@ -89,26 +93,51 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
 
   const onChange = (key: string, value: number) => setOverrides({ ...overrides, [key]: value });
 
+  const fmt = (value: number | null | undefined, digits = 1) =>
+    value == null || !Number.isFinite(value) ? '-' : value.toFixed(digits);
+
   // duplicateScenario removed per request
 
   const loadCompare = async () => {
     try {
       const r = await fetch(join('/runs'));
       if (!r.ok) return;
-      const runs = await r.json();
-      const top = runs.slice(0, 8);
-      const rows: any[] = [];
-      for (const run of top) {
-        try {
-          const pr = await fetch(join(`/runs/${run.id}/ped`));
-          if (!pr.ok) { rows.push({ name: run.name, status: run.status, ped_ratio: '-', total_gen_mwh: '-', total_demand_mwh: '-' }); continue; }
-          const ped = await pr.json();
-          rows.push({ name: run.name, status: run.status, ped_ratio: Number(ped.ped_ratio).toFixed(3), total_gen_mwh: Number(ped.total_gen_mwh).toFixed(1), total_demand_mwh: Number(ped.total_demand_mwh).toFixed(1) });
-        } catch {
-          rows.push({ name: run.name, status: run.status, ped_ratio: '-', total_gen_mwh: '-', total_demand_mwh: '-' });
-        }
+      const runs = (await r.json()) as SimulationRun[];
+
+      const grouped = new Map<string, SimulationRun[]>();
+      for (const run of runs) {
+        const key = run.name || run.id;
+        const bucket = grouped.get(key) ?? [];
+        bucket.push(run);
+        grouped.set(key, bucket);
       }
-      setCompareRows(rows);
+
+      const selectedRuns = Array.from(grouped.values())
+        .map((group) => group.find((run) => run.session_id) ?? group[0])
+        .slice(0, 8);
+
+      if (selectedRuns.length === 0) {
+        setCompareRows([]);
+        setCompareMeta({ commonSteps: null, commonPeriodHours: null });
+        return;
+      }
+
+      const cr = await fetch(join('/runs/compare'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          run_ids: selectedRuns.map((run) => run.id),
+          use_common_horizon: true,
+        }),
+      });
+      if (!cr.ok) return;
+
+      const compare = (await cr.json()) as CompareRunsResponse;
+      setCompareRows(compare.rows ?? []);
+      setCompareMeta({
+        commonSteps: compare.common_steps ?? null,
+        commonPeriodHours: compare.common_period_hours ?? null,
+      });
     } catch {}
   };
 
@@ -319,24 +348,29 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
           </div>
           {compareRows.length > 0 ? (
             <>
+              {compareMeta.commonSteps ? (
+                <div style={{ fontSize: 11, color: '#94a3b8', marginTop: '0.75rem' }}>
+                  Compared over a common horizon of {compareMeta.commonSteps} steps ({fmt(compareMeta.commonPeriodHours, 1)} h).
+                </div>
+              ) : null}
               {/* Visual comparison charts */}
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1rem', marginBottom: '1rem', marginTop: '1rem' }}>
                 {/* PED Ratio Chart */}
                 <div style={{ background: '#1e293b', borderRadius: 8, padding: '12px' }}>
                   <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>PED Ratio</div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                    {compareRows.filter(r => r.ped_ratio !== '-').slice(0, 5).map((r, i) => {
-                      const ratio = parseFloat(r.ped_ratio);
+                    {compareRows.filter(r => r.ped_ratio != null).slice(0, 5).map((r, i) => {
+                      const ratio = r.ped_ratio ?? 0;
                       const pct = Math.min(ratio * 100, 150);
                       return (
                         <div key={i}>
-                          <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.name}</div>
+                          <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.name ?? r.run_id}</div>
                           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                             <div style={{ flex: 1, height: 16, background: '#0f172a', borderRadius: 4, overflow: 'hidden', position: 'relative' }}>
                               <div style={{ position: 'absolute', left: '66.7%', top: 0, bottom: 0, width: 2, background: '#fbbf24', zIndex: 1 }} title="PED Target (1.0)" />
                               <div style={{ height: '100%', width: `${pct / 1.5}%`, background: ratio >= 1 ? 'linear-gradient(90deg, #22c55e, #16a34a)' : 'linear-gradient(90deg, #ef4444, #dc2626)', borderRadius: 4 }} />
                             </div>
-                            <span style={{ fontSize: 11, fontWeight: 600, color: ratio >= 1 ? '#22c55e' : '#ef4444', minWidth: 40 }}>{ratio.toFixed(2)}</span>
+                            <span style={{ fontSize: 11, fontWeight: 600, color: ratio >= 1 ? '#22c55e' : '#ef4444', minWidth: 40 }}>{fmt(ratio, 2)}</span>
                           </div>
                         </div>
                       );
@@ -349,18 +383,18 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
                   <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>Generation (MWh)</div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                     {(() => {
-                      const validRows = compareRows.filter(r => r.total_gen_mwh !== '-').slice(0, 5);
-                      const maxGen = Math.max(...validRows.map(r => parseFloat(r.total_gen_mwh)), 1);
+                      const validRows = compareRows.filter(r => r.total_gen_mwh != null).slice(0, 5);
+                      const maxGen = Math.max(...validRows.map(r => r.total_gen_mwh ?? 0), 1);
                       return validRows.map((r, i) => {
-                        const gen = parseFloat(r.total_gen_mwh);
+                        const gen = r.total_gen_mwh ?? 0;
                         return (
                           <div key={i}>
-                            <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.name}</div>
+                            <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.name ?? r.run_id}</div>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                               <div style={{ flex: 1, height: 16, background: '#0f172a', borderRadius: 4, overflow: 'hidden' }}>
                                 <div style={{ height: '100%', width: `${(gen / maxGen) * 100}%`, background: 'linear-gradient(90deg, #22c55e, #4ade80)', borderRadius: 4 }} />
                               </div>
-                              <span style={{ fontSize: 11, fontWeight: 600, color: '#22c55e', minWidth: 50 }}>{gen.toFixed(0)}</span>
+                              <span style={{ fontSize: 11, fontWeight: 600, color: '#22c55e', minWidth: 50 }}>{fmt(gen, 0)}</span>
                             </div>
                           </div>
                         );
@@ -374,18 +408,18 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
                   <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>Demand (MWh)</div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                     {(() => {
-                      const validRows = compareRows.filter(r => r.total_demand_mwh !== '-').slice(0, 5);
-                      const maxDemand = Math.max(...validRows.map(r => parseFloat(r.total_demand_mwh)), 1);
+                      const validRows = compareRows.filter(r => r.total_demand_mwh != null).slice(0, 5);
+                      const maxDemand = Math.max(...validRows.map(r => r.total_demand_mwh ?? 0), 1);
                       return validRows.map((r, i) => {
-                        const demand = parseFloat(r.total_demand_mwh);
+                        const demand = r.total_demand_mwh ?? 0;
                         return (
                           <div key={i}>
-                            <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.name}</div>
+                            <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.name ?? r.run_id}</div>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                               <div style={{ flex: 1, height: 16, background: '#0f172a', borderRadius: 4, overflow: 'hidden' }}>
                                 <div style={{ height: '100%', width: `${(demand / maxDemand) * 100}%`, background: 'linear-gradient(90deg, #f97316, #fb923c)', borderRadius: 4 }} />
                               </div>
-                              <span style={{ fontSize: 11, fontWeight: 600, color: '#f97316', minWidth: 50 }}>{demand.toFixed(0)}</span>
+                              <span style={{ fontSize: 11, fontWeight: 600, color: '#f97316', minWidth: 50 }}>{fmt(demand, 0)}</span>
                             </div>
                           </div>
                         );
@@ -409,10 +443,10 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
                   <tbody>
                     {compareRows.map((r, i) => (
                       <tr key={i} style={{ borderBottom: '1px solid #1e293b' }}>
-                        <td style={{ padding: '8px', fontSize: 11 }}>{r.name}</td>
-                        <td style={{ padding: '8px', textAlign: 'right', fontWeight: 600, color: r.ped_ratio !== '-' && parseFloat(r.ped_ratio) >= 1 ? '#22c55e' : '#ef4444' }}>{r.ped_ratio}</td>
-                        <td style={{ padding: '8px', textAlign: 'right', color: '#22c55e' }}>{r.total_gen_mwh}</td>
-                        <td style={{ padding: '8px', textAlign: 'right', color: '#f97316' }}>{r.total_demand_mwh}</td>
+                        <td style={{ padding: '8px', fontSize: 11 }}>{r.name ?? r.run_id}</td>
+                        <td style={{ padding: '8px', textAlign: 'right', fontWeight: 600, color: r.ped_ratio != null && r.ped_ratio >= 1 ? '#22c55e' : '#ef4444' }}>{fmt(r.ped_ratio, 3)}</td>
+                        <td style={{ padding: '8px', textAlign: 'right', color: '#22c55e' }}>{fmt(r.total_gen_mwh, 1)}</td>
+                        <td style={{ padding: '8px', textAlign: 'right', color: '#f97316' }}>{fmt(r.total_demand_mwh, 1)}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -435,24 +469,29 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
         </div>
         {compareRows.length > 0 ? (
           <>
+            {compareMeta.commonSteps ? (
+              <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: '1rem' }}>
+                Compared over a common horizon of {compareMeta.commonSteps} steps ({fmt(compareMeta.commonPeriodHours, 1)} h).
+              </div>
+            ) : null}
             {/* Charts - stacked vertically on mobile */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', marginBottom: '1rem' }}>
               {/* PED Ratio Chart */}
               <div style={{ background: '#1e293b', borderRadius: 8, padding: '12px' }}>
                 <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>PED Ratio</div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  {compareRows.filter(r => r.ped_ratio !== '-').slice(0, 5).map((r, i) => {
-                    const ratio = parseFloat(r.ped_ratio);
+                  {compareRows.filter(r => r.ped_ratio != null).slice(0, 5).map((r, i) => {
+                    const ratio = r.ped_ratio ?? 0;
                     const pct = Math.min(ratio * 100, 150);
                     return (
                       <div key={i}>
-                        <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2 }}>{r.name}</div>
+                        <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2 }}>{r.name ?? r.run_id}</div>
                         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                           <div style={{ flex: 1, height: 16, background: '#0f172a', borderRadius: 4, overflow: 'hidden', position: 'relative' }}>
                             <div style={{ position: 'absolute', left: '66.7%', top: 0, bottom: 0, width: 2, background: '#fbbf24', zIndex: 1 }} />
                             <div style={{ height: '100%', width: `${pct / 1.5}%`, background: ratio >= 1 ? 'linear-gradient(90deg, #22c55e, #16a34a)' : 'linear-gradient(90deg, #ef4444, #dc2626)', borderRadius: 4 }} />
                           </div>
-                          <span style={{ fontSize: 11, fontWeight: 600, color: ratio >= 1 ? '#22c55e' : '#ef4444', minWidth: 40 }}>{ratio.toFixed(2)}</span>
+                          <span style={{ fontSize: 11, fontWeight: 600, color: ratio >= 1 ? '#22c55e' : '#ef4444', minWidth: 40 }}>{fmt(ratio, 2)}</span>
                         </div>
                       </div>
                     );
@@ -465,18 +504,18 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
                 <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>Generation (MWh)</div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                   {(() => {
-                    const validRows = compareRows.filter(r => r.total_gen_mwh !== '-').slice(0, 5);
-                    const maxGen = Math.max(...validRows.map(r => parseFloat(r.total_gen_mwh)), 1);
+                    const validRows = compareRows.filter(r => r.total_gen_mwh != null).slice(0, 5);
+                    const maxGen = Math.max(...validRows.map(r => r.total_gen_mwh ?? 0), 1);
                     return validRows.map((r, i) => {
-                      const gen = parseFloat(r.total_gen_mwh);
+                      const gen = r.total_gen_mwh ?? 0;
                       return (
                         <div key={i}>
-                          <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2 }}>{r.name}</div>
+                          <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2 }}>{r.name ?? r.run_id}</div>
                           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                             <div style={{ flex: 1, height: 16, background: '#0f172a', borderRadius: 4, overflow: 'hidden' }}>
                               <div style={{ height: '100%', width: `${(gen / maxGen) * 100}%`, background: 'linear-gradient(90deg, #22c55e, #4ade80)', borderRadius: 4 }} />
                             </div>
-                            <span style={{ fontSize: 11, fontWeight: 600, color: '#22c55e', minWidth: 50 }}>{gen.toFixed(0)}</span>
+                            <span style={{ fontSize: 11, fontWeight: 600, color: '#22c55e', minWidth: 50 }}>{fmt(gen, 0)}</span>
                           </div>
                         </div>
                       );
@@ -490,18 +529,18 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
                 <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>Demand (MWh)</div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                   {(() => {
-                    const validRows = compareRows.filter(r => r.total_demand_mwh !== '-').slice(0, 5);
-                    const maxDemand = Math.max(...validRows.map(r => parseFloat(r.total_demand_mwh)), 1);
+                    const validRows = compareRows.filter(r => r.total_demand_mwh != null).slice(0, 5);
+                    const maxDemand = Math.max(...validRows.map(r => r.total_demand_mwh ?? 0), 1);
                     return validRows.map((r, i) => {
-                      const demand = parseFloat(r.total_demand_mwh);
+                      const demand = r.total_demand_mwh ?? 0;
                       return (
                         <div key={i}>
-                          <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2 }}>{r.name}</div>
+                          <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2 }}>{r.name ?? r.run_id}</div>
                           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                             <div style={{ flex: 1, height: 16, background: '#0f172a', borderRadius: 4, overflow: 'hidden' }}>
                               <div style={{ height: '100%', width: `${(demand / maxDemand) * 100}%`, background: 'linear-gradient(90deg, #f97316, #fb923c)', borderRadius: 4 }} />
                             </div>
-                            <span style={{ fontSize: 11, fontWeight: 600, color: '#f97316', minWidth: 50 }}>{demand.toFixed(0)}</span>
+                            <span style={{ fontSize: 11, fontWeight: 600, color: '#f97316', minWidth: 50 }}>{fmt(demand, 0)}</span>
                           </div>
                         </div>
                       );
@@ -525,10 +564,10 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
                 <tbody>
                   {compareRows.map((r, i) => (
                     <tr key={i} style={{ borderBottom: '1px solid #1e293b' }}>
-                      <td style={{ padding: '8px', fontSize: 11 }}>{r.name}</td>
-                      <td style={{ padding: '8px', textAlign: 'right', fontWeight: 600, color: r.ped_ratio !== '-' && parseFloat(r.ped_ratio) >= 1 ? '#22c55e' : '#ef4444' }}>{r.ped_ratio}</td>
-                      <td style={{ padding: '8px', textAlign: 'right', color: '#22c55e' }}>{r.total_gen_mwh}</td>
-                      <td style={{ padding: '8px', textAlign: 'right', color: '#f97316' }}>{r.total_demand_mwh}</td>
+                      <td style={{ padding: '8px', fontSize: 11 }}>{r.name ?? r.run_id}</td>
+                      <td style={{ padding: '8px', textAlign: 'right', fontWeight: 600, color: r.ped_ratio != null && r.ped_ratio >= 1 ? '#22c55e' : '#ef4444' }}>{fmt(r.ped_ratio, 3)}</td>
+                      <td style={{ padding: '8px', textAlign: 'right', color: '#22c55e' }}>{fmt(r.total_gen_mwh, 1)}</td>
+                      <td style={{ padding: '8px', textAlign: 'right', color: '#f97316' }}>{fmt(r.total_demand_mwh, 1)}</td>
                     </tr>
                   ))}
                 </tbody>

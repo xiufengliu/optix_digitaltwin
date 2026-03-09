@@ -11,6 +11,9 @@ from .db import session_scope
 from .models import SimulationRun, SimulationSnapshot, SimulationStatus, Scenario, DigitalTwin
 from .optimizer import MeritOrderOptimizer, build_config_from_overrides
 from .schemas import (
+    RunCompareRequest,
+    RunCompareResponse,
+    RunCompareRow,
     SimulationRunCreate,
     SimulationRunRead,
     SimulationState,
@@ -82,6 +85,43 @@ def _run_to_read_dict(run: SimulationRun) -> dict:
         "updated_at": getattr(run, "updated_at", None),
         "config": getattr(run, "config", {}) or {},
         "notes": getattr(run, "notes", None),
+    }
+
+
+def _compute_ped_metrics(env, upto_steps: int | None = None) -> dict:
+    """Compute cumulative PED metrics from raw environment arrays."""
+    t = int(getattr(env, "t", 0))
+    wind = getattr(env, "_wind", None)
+    solar = getattr(env, "_solar", None)
+    hydro = getattr(env, "_hydro", None)
+    load = getattr(env, "_load", None)
+    if any(x is None for x in (wind, solar, hydro, load)):
+        raise AttributeError("Missing arrays for PED computation")
+
+    import numpy as np
+
+    available_steps = max(1, min(t, len(load)))
+    if upto_steps is None:
+        upto = available_steps
+    else:
+        upto = max(1, min(int(upto_steps), available_steps))
+
+    gen = np.array(wind[:upto]) + np.array(solar[:upto]) + np.array(hydro[:upto])
+    demand = np.array(load[:upto])
+    # Current env uses 10-minute steps.
+    step_hours = 10.0 / 60.0
+    total_gen_mwh = float(gen.sum() * step_hours)
+    total_demand_mwh = float(demand.sum() * step_hours)
+    ped_abs = total_gen_mwh - total_demand_mwh
+    ped_ratio = float(total_gen_mwh / (total_demand_mwh + 1e-9))
+    return {
+        "available_steps": available_steps,
+        "steps": upto,
+        "period_hours": upto * step_hours,
+        "total_gen_mwh": total_gen_mwh,
+        "total_demand_mwh": total_demand_mwh,
+        "ped_absolute_mwh": ped_abs,
+        "ped_ratio": ped_ratio,
     }
 
 
@@ -236,35 +276,93 @@ async def get_run_ped(run_id: str) -> dict:
 
     env = session.wrapper or session.env
     try:
-        t = int(getattr(env, 't', 0))
-        # access raw arrays; fall back to DataFrame if needed
-        wind = getattr(env, '_wind', None)
-        solar = getattr(env, '_solar', None)
-        hydro = getattr(env, '_hydro', None)
-        load = getattr(env, '_load', None)
-        if any(x is None for x in (wind, solar, hydro, load)):
-            raise AttributeError('Missing arrays for PED computation')
-
-        import numpy as np  # local import
-        upto = max(1, min(t, len(load)))
-        gen = np.array(wind[:upto]) + np.array(solar[:upto]) + np.array(hydro[:upto])
-        demand = np.array(load[:upto])
-        # Assume values are MW at 10-minute intervals → convert to MWh: MW * (10/60) h
-        step_hours = 10.0 / 60.0
-        total_gen_mwh = float(gen.sum() * step_hours)
-        total_demand_mwh = float(demand.sum() * step_hours)
-        ped_abs = total_gen_mwh - total_demand_mwh
-        ped_ratio = float(total_gen_mwh / (total_demand_mwh + 1e-9))
+        metrics = _compute_ped_metrics(env)
         return {
-            'steps': upto,
-            'period_hours': upto * step_hours,
-            'total_gen_mwh': total_gen_mwh,
-            'total_demand_mwh': total_demand_mwh,
-            'ped_absolute_mwh': ped_abs,
-            'ped_ratio': ped_ratio,
+            "steps": metrics["steps"],
+            "period_hours": metrics["period_hours"],
+            "total_gen_mwh": metrics["total_gen_mwh"],
+            "total_demand_mwh": metrics["total_demand_mwh"],
+            "ped_absolute_mwh": metrics["ped_absolute_mwh"],
+            "ped_ratio": metrics["ped_ratio"],
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"PED calculation failed: {exc}")
+
+
+@router.post("/runs/compare", response_model=RunCompareResponse, tags=["runs"])
+async def compare_runs(payload: RunCompareRequest) -> RunCompareResponse:
+    """Compare runs on a common horizon so totals are directly comparable."""
+    if not payload.run_ids:
+        return RunCompareResponse(common_steps=None, common_period_hours=None, rows=[])
+
+    manager = SimulationManager.get_global()
+    run_ids = list(dict.fromkeys(payload.run_ids))
+
+    with session_scope() as db:
+        runs = []
+        for run_id in run_ids:
+            run = db.get(SimulationRun, run_id)
+            if run is None:
+                continue
+            runs.append(_refresh_run_status_if_needed(db, run))
+
+    session_envs: dict[str, tuple[object, int]] = {}
+    common_steps: int | None = None
+
+    for run in runs:
+        if not run.session_id:
+            continue
+        try:
+            session = manager.get_session(run.session_id)
+        except KeyError:
+            continue
+
+        env = session.wrapper or session.env
+        try:
+            available_steps = int(_compute_ped_metrics(env)["available_steps"])
+        except Exception:
+            continue
+
+        session_envs[run.id] = (env, available_steps)
+        if payload.use_common_horizon:
+            common_steps = available_steps if common_steps is None else min(common_steps, available_steps)
+
+    rows: list[RunCompareRow] = []
+    for run in runs:
+        row = RunCompareRow(
+            run_id=run.id,
+            name=run.name,
+            status=getattr(getattr(run, "status", None), "value", None) or str(getattr(run, "status", None) or ""),
+            comparable=False,
+        )
+
+        env_info = session_envs.get(run.id)
+        if env_info is None:
+            rows.append(row)
+            continue
+
+        env, available_steps = env_info
+        compare_steps = common_steps if payload.use_common_horizon and common_steps is not None else available_steps
+        metrics = _compute_ped_metrics(env, upto_steps=compare_steps)
+        row.comparable = True
+        row.available_steps = available_steps
+        row.compared_steps = int(metrics["steps"])
+        row.period_hours = float(metrics["period_hours"])
+        row.total_gen_mwh = float(metrics["total_gen_mwh"])
+        row.total_demand_mwh = float(metrics["total_demand_mwh"])
+        row.ped_absolute_mwh = float(metrics["ped_absolute_mwh"])
+        row.ped_ratio = float(metrics["ped_ratio"])
+        rows.append(row)
+
+    common_period_hours = None
+    if payload.use_common_horizon and common_steps is not None:
+        common_period_hours = common_steps * (10.0 / 60.0)
+
+    return RunCompareResponse(
+        common_steps=common_steps if payload.use_common_horizon else None,
+        common_period_hours=common_period_hours,
+        rows=rows,
+    )
 
 
 @router.get("/runs/{run_id}/energy_series", tags=["runs"])

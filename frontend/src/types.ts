@@ -64,6 +64,26 @@ export interface PedMetrics {
   ped_ratio: number;
 }
 
+export interface CompareRunRow {
+  run_id: string;
+  name?: string | null;
+  status: string;
+  comparable: boolean;
+  available_steps?: number | null;
+  compared_steps?: number | null;
+  period_hours?: number | null;
+  total_gen_mwh?: number | null;
+  total_demand_mwh?: number | null;
+  ped_absolute_mwh?: number | null;
+  ped_ratio?: number | null;
+}
+
+export interface CompareRunsResponse {
+  common_steps?: number | null;
+  common_period_hours?: number | null;
+  rows: CompareRunRow[];
+}
+
 export interface EnergySeries {
   start: number;
   end: number;

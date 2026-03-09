@@ -74,6 +74,40 @@ class SimulationState(BaseModel):
     metrics: Dict[str, Any]
 
 
+class RunCompareRequest(BaseModel):
+    """Request body for comparing multiple runs on a common horizon."""
+
+    run_ids: list[str] = Field(default_factory=list)
+    use_common_horizon: bool = Field(
+        True,
+        description="If true, truncate every run to the minimum available step count.",
+    )
+
+
+class RunCompareRow(BaseModel):
+    """Comparable run summary used by the compare view."""
+
+    run_id: str
+    name: Optional[str] = None
+    status: str
+    comparable: bool
+    available_steps: Optional[int] = None
+    compared_steps: Optional[int] = None
+    period_hours: Optional[float] = None
+    total_gen_mwh: Optional[float] = None
+    total_demand_mwh: Optional[float] = None
+    ped_absolute_mwh: Optional[float] = None
+    ped_ratio: Optional[float] = None
+
+
+class RunCompareResponse(BaseModel):
+    """Response payload for the compare-runs API."""
+
+    common_steps: Optional[int] = None
+    common_period_hours: Optional[float] = None
+    rows: list[RunCompareRow] = Field(default_factory=list)
+
+
 # -------- Scenario Schemas --------
 
 class ScenarioCreate(BaseModel):
