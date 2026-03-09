@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./build_frontend.sh
-#   API_BASE="https://your.domain/api" ./build_frontend.sh
+#   API_BASE="https://your.domain" ./build_frontend.sh
 #
 # Notes:
 # - API_BASE overrides the default; it is passed to Vite as VITE_API_BASE.
@@ -13,7 +13,7 @@ set -euo pipefail
 
 REPO_DIR="/opt/app/optix_digitaltwin"
 FRONTEND_DIR="$REPO_DIR/frontend"
-API_BASE="${API_BASE:-https://dt.scicloud.site/api}"
+API_BASE="${API_BASE:-https://dt.scicloud.site}"
 
 echo "==> Repo dir:     $REPO_DIR"
 echo "==> Frontend dir: $FRONTEND_DIR"
@@ -32,4 +32,3 @@ VITE_API_BASE="$API_BASE" npm run build
 
 echo
 echo "✅ Build finished."
-
