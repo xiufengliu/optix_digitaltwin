@@ -17,6 +17,7 @@ PORT="${PORT:-8000}"
 WORKERS="${WORKERS:-1}"
 LOG_FILE="${LOG_FILE:-$REPO_DIR/uvicorn.log}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-20}"
+STOP_TIMEOUT="${STOP_TIMEOUT:-10}"
 PID_PATTERN="uvicorn ${APP_MODULE}"
 
 pick_db_path() {
@@ -32,12 +33,15 @@ pick_db_path() {
   )
   local best_path="$REPO_DIR/digital_twin.sqlite3"
   local best_score=-1
+  local best_size=-1
   local path
 
   for path in "${candidates[@]}"; do
     [[ -f "$path" ]] || continue
 
     local score=0
+    local size=0
+    size="$(wc -c < "$path" 2>/dev/null || printf '0')"
     if command -v sqlite3 >/dev/null 2>&1; then
       local has_scenarios
       has_scenarios="$(sqlite3 "$path" "select count(*) from sqlite_master where type='table' and name='scenarios';" 2>/dev/null || printf '0')"
@@ -46,8 +50,9 @@ pick_db_path() {
       fi
     fi
 
-    if (( score > best_score )); then
+    if (( score > best_score || (score == best_score && size > best_size) )); then
       best_score=$score
+      best_size=$size
       best_path="$path"
     fi
   done
@@ -74,11 +79,28 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
 fi
 
 echo "==> Stopping existing backend process"
-pkill -f "$PID_PATTERN" || true
-sleep 1
+mapfile -t existing_pids < <(pgrep -f "$PID_PATTERN" || true)
+if (( ${#existing_pids[@]} > 0 )); then
+  kill "${existing_pids[@]}" 2>/dev/null || true
+
+  stopped=false
+  for ((i = 1; i <= STOP_TIMEOUT; i++)); do
+    sleep 1
+    if ! pgrep -f "$PID_PATTERN" >/dev/null 2>&1; then
+      stopped=true
+      break
+    fi
+  done
+
+  if [[ "$stopped" != true ]]; then
+    echo "==> Existing process did not stop after ${STOP_TIMEOUT}s; forcing kill"
+    pkill -9 -f "$PID_PATTERN" || true
+    sleep 1
+  fi
+fi
 
 if pgrep -f "$PID_PATTERN" >/dev/null 2>&1; then
-  echo "ERROR: Existing backend process is still running." >&2
+  echo "ERROR: Existing backend process is still running after forced stop." >&2
   pgrep -af "$PID_PATTERN" || true
   exit 1
 fi
