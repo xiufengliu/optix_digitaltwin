@@ -139,6 +139,7 @@ class SimulationManager:
             env = _MinimalEnv(
                 data=data,
                 investment_freq=settings.investment_freq,
+                config_overrides=config_overrides,
             )
 
         if forecast_generator is not None:
@@ -329,15 +330,22 @@ class _MinimalEnv:
     Exposes arrays and a simple step/reset so charts and PED endpoints work.
     """
 
-    def __init__(self, data, investment_freq: int = 12):
+    def __init__(self, data, investment_freq: int = 12, config_overrides: Optional[Dict[str, Any]] = None):
         self.data = data
         self.investment_freq = int(investment_freq)
+        self.config_overrides = dict(config_overrides or {})
         self.agents = ["manager"]
         n = len(data)
-        self._wind = (data["wind"].to_numpy() if "wind" in data.columns else np.zeros(n))
-        self._solar = (data["solar"].to_numpy() if "solar" in data.columns else np.zeros(n))
-        self._hydro = (data["hydro"].to_numpy() if "hydro" in data.columns else np.zeros(n))
-        self._load = (data["load"].to_numpy() if "load" in data.columns else np.zeros(n))
+        raw_wind = (data["wind"].to_numpy(dtype=float) if "wind" in data.columns else np.zeros(n))
+        raw_solar = (data["solar"].to_numpy(dtype=float) if "solar" in data.columns else np.zeros(n))
+        raw_hydro = (data["hydro"].to_numpy(dtype=float) if "hydro" in data.columns else np.zeros(n))
+        raw_load = (data["load"].to_numpy(dtype=float) if "load" in data.columns else np.zeros(n))
+
+        self._wind = raw_wind
+        self._solar = raw_solar
+        self._hydro = raw_hydro
+        self._load = raw_load
+        self._apply_config_overrides(raw_wind, raw_solar, raw_hydro, raw_load)
         self._price = (data["price"].to_numpy() if "price" in data.columns else np.zeros(n))
         self.t = 0
         self.equity = None
@@ -383,3 +391,33 @@ class _MinimalEnv:
 
     def close(self):
         return None
+
+    def _apply_config_overrides(self, raw_wind, raw_solar, raw_hydro, raw_load) -> None:
+        overrides = self.config_overrides
+        if not overrides:
+            return
+
+        def as_float(key: str) -> Optional[float]:
+            value = overrides.get(key)
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except Exception:
+                return None
+
+        def scale_to_peak(raw: np.ndarray, target_peak_mw: Optional[float]) -> np.ndarray:
+            if target_peak_mw is None:
+                return raw.astype(float, copy=True)
+            peak = float(np.max(raw)) if raw.size else 0.0
+            if peak <= 1e-9 or target_peak_mw <= 0:
+                return np.zeros_like(raw, dtype=float)
+            return (raw.astype(float) / peak) * float(target_peak_mw)
+
+        self._wind = scale_to_peak(raw_wind, as_float("owned_wind_capacity_mw"))
+        self._solar = scale_to_peak(raw_solar, as_float("owned_solar_capacity_mw"))
+        self._hydro = scale_to_peak(raw_hydro, as_float("owned_hydro_capacity_mw"))
+
+        load_peak = as_float("owned_load_peak_mw")
+        if load_peak is not None:
+            self._load = scale_to_peak(raw_load, load_peak)

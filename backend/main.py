@@ -69,6 +69,9 @@ def _seed_predefined_scenarios() -> None:
             "config_overrides": {
                 # Minimal PV placeholder at building scale (MW)
                 "owned_solar_capacity_mw": 0.03,
+                "owned_wind_capacity_mw": 0.0,
+                "owned_hydro_capacity_mw": 0.0,
+                "owned_load_peak_mw": 0.15,
                 "owned_battery_capacity_mwh": 0.0,
                 "investment_freq": 12,
             },
@@ -84,6 +87,9 @@ def _seed_predefined_scenarios() -> None:
             ),
             "config_overrides": {
                 "owned_solar_capacity_mw": 0.171,
+                "owned_wind_capacity_mw": 0.0,
+                "owned_hydro_capacity_mw": 0.0,
+                "owned_load_peak_mw": 0.15,
                 "owned_battery_capacity_mwh": 0.0,
                 "investment_freq": 12,
             },
@@ -99,6 +105,9 @@ def _seed_predefined_scenarios() -> None:
             ),
             "config_overrides": {
                 "owned_solar_capacity_mw": 0.171,
+                "owned_wind_capacity_mw": 0.0,
+                "owned_hydro_capacity_mw": 0.0,
+                "owned_load_peak_mw": 0.15,
                 "owned_battery_capacity_mwh": 0.32,
                 "batt_power_c_rate": 0.25,  # 4h
                 "investment_freq": 12,
@@ -114,6 +123,9 @@ def _seed_predefined_scenarios() -> None:
             ),
             "config_overrides": {
                 "owned_solar_capacity_mw": 0.171,
+                "owned_wind_capacity_mw": 0.0,
+                "owned_hydro_capacity_mw": 0.0,
+                "owned_load_peak_mw": 0.15,
                 "owned_battery_capacity_mwh": 0.64,
                 "batt_power_c_rate": 0.25,
                 "investment_freq": 12,
@@ -130,8 +142,13 @@ def _seed_predefined_scenarios() -> None:
             ),
             "config_overrides": {
                 "owned_solar_capacity_mw": 0.171,
+                "owned_wind_capacity_mw": 0.0,
+                "owned_hydro_capacity_mw": 0.0,
+                "owned_load_peak_mw": 0.15,
                 "owned_battery_capacity_mwh": 0.32,
                 "batt_power_c_rate": 0.25,
+                "flexible_load_share": 0.30,
+                "max_shift_hours": 3.0,
                 # Use tighter investment frequency to emulate DSM reactivity
                 "investment_freq": 6,
             },
@@ -171,4 +188,9 @@ def _seed_predefined_scenarios() -> None:
                 except Exception:
                     pass
                 if updated:
+                    db.add(row)
+                canonical_overrides = p["config_overrides"]
+                current_overrides = row.config_overrides or {}
+                if current_overrides != canonical_overrides:
+                    row.config_overrides = canonical_overrides
                     db.add(row)

@@ -861,6 +861,8 @@ def _dt_to_config_overrides(components: list, connections: list) -> dict:
         overrides['owned_solar_capacity_mw'] = total_pv
     if total_battery > 0:
         overrides['owned_battery_capacity_mwh'] = total_battery
+    if total_load > 0:
+        overrides['owned_load_peak_mw'] = total_load
 
     return overrides
 
