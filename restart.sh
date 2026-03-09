@@ -17,14 +17,54 @@ PORT="${PORT:-8000}"
 WORKERS="${WORKERS:-1}"
 LOG_FILE="${LOG_FILE:-$REPO_DIR/uvicorn.log}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-20}"
-LOCAL_HEALTH_URL="${LOCAL_HEALTH_URL:-http://127.0.0.1:${PORT}/health}"
 PID_PATTERN="uvicorn ${APP_MODULE}"
+
+pick_db_path() {
+  if [[ -n "${DIGITAL_TWIN_DB_PATH:-}" ]]; then
+    printf '%s\n' "$DIGITAL_TWIN_DB_PATH"
+    return 0
+  fi
+
+  local candidates=(
+    "$REPO_DIR/digital_twin.sqlite3"
+    "$HOME/digital_twin.sqlite3"
+    "$(dirname "$REPO_DIR")/digital_twin.sqlite3"
+  )
+  local best_path="$REPO_DIR/digital_twin.sqlite3"
+  local best_score=-1
+  local path
+
+  for path in "${candidates[@]}"; do
+    [[ -f "$path" ]] || continue
+
+    local score=0
+    if command -v sqlite3 >/dev/null 2>&1; then
+      local has_scenarios
+      has_scenarios="$(sqlite3 "$path" "select count(*) from sqlite_master where type='table' and name='scenarios';" 2>/dev/null || printf '0')"
+      if [[ "$has_scenarios" == "1" ]]; then
+        score="$(sqlite3 "$path" "select count(*) from scenarios;" 2>/dev/null || printf '0')"
+      fi
+    fi
+
+    if (( score > best_score )); then
+      best_score=$score
+      best_path="$path"
+    fi
+  done
+
+  printf '%s\n' "$best_path"
+}
+
+DB_PATH="$(pick_db_path)"
+export DIGITAL_TWIN_DB_PATH="$DB_PATH"
+LOCAL_HEALTH_URL="${LOCAL_HEALTH_URL:-http://127.0.0.1:${PORT}/health}"
 
 echo "==> Repo dir:      $REPO_DIR"
 echo "==> Python:        $PYTHON_BIN"
 echo "==> App module:    $APP_MODULE"
 echo "==> Bind:          ${HOST}:${PORT}"
 echo "==> Workers:       $WORKERS"
+echo "==> Database:      $DIGITAL_TWIN_DB_PATH"
 echo "==> Log file:      $LOG_FILE"
 echo
 

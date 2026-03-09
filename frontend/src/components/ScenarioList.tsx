@@ -19,6 +19,7 @@ const defaultOverrides = {
 export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
   const [scenarios, setScenarios] = useState<Scenario[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [name, setName] = useState('My Scenario');
   const [desc, setDesc] = useState('');
   const [details, setDetails] = useState('');
@@ -42,11 +43,19 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
 
   const load = async () => {
     setLoading(true);
+    setLoadError(null);
     try {
       const r = await fetch(join('/scenarios'));
+      if (!r.ok) {
+        const message = await r.text();
+        throw new Error(message || `Failed to load scenarios (${r.status})`);
+      }
       const data = (await r.json()) as Scenario[];
       setScenarios(data);
-    } catch {}
+    } catch (error: any) {
+      setScenarios([]);
+      setLoadError(error?.message ?? 'Failed to load scenarios.');
+    }
     setLoading(false);
   };
 
@@ -190,6 +199,11 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
           <button className="button" onClick={() => { setSelectedId(null); setName('My Scenario'); setDesc(''); setDetails(''); setOverrides({ ...defaultOverrides }); setShowGuide(true); setMobileTab('edit'); }}>New</button>
           <button className="button" onClick={load} disabled={loading}>Refresh</button>
         </div>
+        {loadError && (
+          <div className="metric-card" style={{ marginTop: '1rem', color: '#fecaca' }}>
+            Failed to load scenarios: {loadError}
+          </div>
+        )}
         <div style={{ marginTop: '1rem' }}>
           {sortedScenarios.map((s) => {
             const isPaper = isPaperScenario(s.name);

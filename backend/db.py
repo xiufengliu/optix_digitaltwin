@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -9,8 +10,10 @@ from typing import Iterator
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
-_DB_PATH = Path("digital_twin.sqlite3")
-DATABASE_URL = f"sqlite:///{_DB_PATH}"  # Stored alongside the repository for now
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_DEFAULT_DB_PATH = _REPO_ROOT / "digital_twin.sqlite3"
+_DB_PATH = Path(os.environ.get("DIGITAL_TWIN_DB_PATH", str(_DEFAULT_DB_PATH))).expanduser().resolve()
+DATABASE_URL = f"sqlite:///{_DB_PATH}"
 
 
 class Base(DeclarativeBase):
