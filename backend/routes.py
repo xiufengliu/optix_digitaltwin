@@ -88,8 +88,75 @@ def _run_to_read_dict(run: SimulationRun) -> dict:
     }
 
 
-def _compute_ped_metrics(env, upto_steps: int | None = None) -> dict:
-    """Compute cumulative PED metrics from raw environment arrays."""
+def _resolve_run_overrides(db, run: SimulationRun) -> dict:
+    """Resolve run-specific local asset overrides for scenario-aware metrics."""
+    run_config = getattr(run, "config", None) or {}
+    stored = run_config.get("config_overrides")
+    if isinstance(stored, dict) and stored:
+        return stored
+
+    if run.scenario_id:
+        sc = db.get(Scenario, run.scenario_id)
+        if sc is not None and isinstance(sc.config_overrides, dict):
+            return sc.config_overrides or {}
+
+    if run.digital_twin_id:
+        dt = db.get(DigitalTwin, run.digital_twin_id)
+        if dt is not None:
+            return _dt_to_config_overrides(dt.components or [], dt.connections or [])
+
+    dt_config = run_config.get("digital_twin_config")
+    if isinstance(dt_config, dict):
+        return _dt_to_config_overrides(
+            dt_config.get("components") or [],
+            dt_config.get("connections") or [],
+        )
+
+    return {}
+
+
+def _as_float(overrides: dict | None, key: str) -> float | None:
+    if not overrides:
+        return None
+    value = overrides.get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _scale_series_to_peak(series, target_peak_mw: float | None):
+    import numpy as np
+
+    raw = np.asarray(series, dtype=float)
+    if target_peak_mw is None:
+        return raw.copy()
+    peak = float(np.max(raw)) if raw.size else 0.0
+    if peak <= 1e-9 or target_peak_mw <= 0:
+        return np.zeros_like(raw, dtype=float)
+    return (raw / peak) * float(target_peak_mw)
+
+
+def _infer_step_hours(env, upto_steps: int | None = None) -> float:
+    dt_hours = 1.0 / 6.0
+    try:
+        df = getattr(env, "data", None)
+        if df is not None and "timestamp" in df.columns:
+            upto = int(upto_steps or getattr(env, "t", 0) or len(df))
+            if upto > 1:
+                ts = df["timestamp"].iloc[:upto]
+                delta = (ts.iloc[1] - ts.iloc[0]).total_seconds() / 3600.0
+                if delta > 0:
+                    dt_hours = float(delta)
+    except Exception:
+        pass
+    return dt_hours
+
+
+def _extract_metric_series(env, overrides: dict | None = None, upto_steps: int | None = None) -> dict:
+    """Return scenario-aware generation/load arrays for PED and chart endpoints."""
     t = int(getattr(env, "t", 0))
     wind = getattr(env, "_wind", None)
     solar = getattr(env, "_solar", None)
@@ -98,26 +165,61 @@ def _compute_ped_metrics(env, upto_steps: int | None = None) -> dict:
     if any(x is None for x in (wind, solar, hydro, load)):
         raise AttributeError("Missing arrays for PED computation")
 
-    import numpy as np
-
     available_steps = max(1, min(t, len(load)))
     if upto_steps is None:
         upto = available_steps
     else:
         upto = max(1, min(int(upto_steps), available_steps))
 
-    gen = np.array(wind[:upto]) + np.array(solar[:upto]) + np.array(hydro[:upto])
-    demand = np.array(load[:upto])
-    # Current env uses 10-minute steps.
-    step_hours = 10.0 / 60.0
+    local_mode = bool(overrides) and any(
+        key in overrides
+        for key in (
+            "owned_solar_capacity_mw",
+            "owned_wind_capacity_mw",
+            "owned_hydro_capacity_mw",
+            "owned_load_peak_mw",
+        )
+    )
+
+    if local_mode:
+        wind_series = _scale_series_to_peak(wind, _as_float(overrides, "owned_wind_capacity_mw") or 0.0)
+        solar_series = _scale_series_to_peak(solar, _as_float(overrides, "owned_solar_capacity_mw") or 0.0)
+        hydro_series = _scale_series_to_peak(hydro, _as_float(overrides, "owned_hydro_capacity_mw") or 0.0)
+        load_peak = _as_float(overrides, "owned_load_peak_mw")
+        load_series = _scale_series_to_peak(load, load_peak) if load_peak is not None else _scale_series_to_peak(load, None)
+    else:
+        wind_series = _scale_series_to_peak(wind, None)
+        solar_series = _scale_series_to_peak(solar, None)
+        hydro_series = _scale_series_to_peak(hydro, None)
+        load_series = _scale_series_to_peak(load, None)
+
+    return {
+        "available_steps": available_steps,
+        "steps": upto,
+        "wind_mw": wind_series[:upto],
+        "solar_mw": solar_series[:upto],
+        "hydro_mw": hydro_series[:upto],
+        "load_mw": load_series[:upto],
+        "dt_hours": _infer_step_hours(env, upto),
+    }
+
+
+def _compute_ped_metrics(env, overrides: dict | None = None, upto_steps: int | None = None) -> dict:
+    """Compute cumulative PED metrics from scenario-aware local series."""
+    import numpy as np
+
+    series = _extract_metric_series(env, overrides=overrides, upto_steps=upto_steps)
+    gen = np.array(series["wind_mw"]) + np.array(series["solar_mw"]) + np.array(series["hydro_mw"])
+    demand = np.array(series["load_mw"])
+    step_hours = float(series["dt_hours"])
     total_gen_mwh = float(gen.sum() * step_hours)
     total_demand_mwh = float(demand.sum() * step_hours)
     ped_abs = total_gen_mwh - total_demand_mwh
     ped_ratio = float(total_gen_mwh / (total_demand_mwh + 1e-9))
     return {
-        "available_steps": available_steps,
-        "steps": upto,
-        "period_hours": upto * step_hours,
+        "available_steps": int(series["available_steps"]),
+        "steps": int(series["steps"]),
+        "period_hours": float(series["steps"]) * step_hours,
         "total_gen_mwh": total_gen_mwh,
         "total_demand_mwh": total_demand_mwh,
         "ped_absolute_mwh": ped_abs,
@@ -269,6 +371,7 @@ async def get_run_ped(run_id: str) -> dict:
         if not run.session_id:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run has no active session")
         session_id = run.session_id
+        scenario_overrides = _resolve_run_overrides(db, run)
     try:
         session = manager.get_session(session_id)
     except KeyError:
@@ -276,7 +379,7 @@ async def get_run_ped(run_id: str) -> dict:
 
     env = session.wrapper or session.env
     try:
-        metrics = _compute_ped_metrics(env)
+        metrics = _compute_ped_metrics(env, overrides=scenario_overrides)
         return {
             "steps": metrics["steps"],
             "period_hours": metrics["period_hours"],
@@ -300,13 +403,16 @@ async def compare_runs(payload: RunCompareRequest) -> RunCompareResponse:
 
     with session_scope() as db:
         runs = []
+        overrides_by_run_id: dict[str, dict] = {}
         for run_id in run_ids:
             run = db.get(SimulationRun, run_id)
             if run is None:
                 continue
-            runs.append(_refresh_run_status_if_needed(db, run))
+            run = _refresh_run_status_if_needed(db, run)
+            runs.append(run)
+            overrides_by_run_id[run.id] = _resolve_run_overrides(db, run)
 
-    session_envs: dict[str, tuple[object, int]] = {}
+    session_envs: dict[str, tuple[object, int, dict]] = {}
     common_steps: int | None = None
 
     for run in runs:
@@ -318,12 +424,13 @@ async def compare_runs(payload: RunCompareRequest) -> RunCompareResponse:
             continue
 
         env = session.wrapper or session.env
+        overrides = overrides_by_run_id.get(run.id) or {}
         try:
-            available_steps = int(_compute_ped_metrics(env)["available_steps"])
+            available_steps = int(_compute_ped_metrics(env, overrides=overrides)["available_steps"])
         except Exception:
             continue
 
-        session_envs[run.id] = (env, available_steps)
+        session_envs[run.id] = (env, available_steps, overrides)
         if payload.use_common_horizon:
             common_steps = available_steps if common_steps is None else min(common_steps, available_steps)
 
@@ -341,9 +448,9 @@ async def compare_runs(payload: RunCompareRequest) -> RunCompareResponse:
             rows.append(row)
             continue
 
-        env, available_steps = env_info
+        env, available_steps, overrides = env_info
         compare_steps = common_steps if payload.use_common_horizon and common_steps is not None else available_steps
-        metrics = _compute_ped_metrics(env, upto_steps=compare_steps)
+        metrics = _compute_ped_metrics(env, overrides=overrides, upto_steps=compare_steps)
         row.comparable = True
         row.available_steps = available_steps
         row.compared_steps = int(metrics["steps"])
@@ -377,6 +484,7 @@ async def get_energy_series(run_id: str, limit: int = 2000) -> dict:
         if not run.session_id:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run has no active session")
         session_id = run.session_id
+        scenario_overrides = _resolve_run_overrides(db, run)
 
     try:
         session = manager.get_session(session_id)
@@ -388,10 +496,11 @@ async def get_energy_series(run_id: str, limit: int = 2000) -> dict:
         t = int(getattr(env, 't', 0))
         upto = max(1, t)
         start = max(0, upto - int(max(1, min(limit, 50000))))
-        wind = getattr(env, '_wind')[start:upto]
-        solar = getattr(env, '_solar')[start:upto]
-        hydro = getattr(env, '_hydro')[start:upto]
-        load = getattr(env, '_load')[start:upto]
+        series = _extract_metric_series(env, overrides=scenario_overrides, upto_steps=upto)
+        wind = series['wind_mw'][start:upto]
+        solar = series['solar_mw'][start:upto]
+        hydro = series['hydro_mw'][start:upto]
+        load = series['load_mw'][start:upto]
 
         import numpy as np
         gen = (np.array(wind) + np.array(solar) + np.array(hydro)).tolist()
@@ -442,30 +551,14 @@ async def optimize_run_merit_order(run_id: str) -> dict:
 
     env = session.wrapper or session.env
     try:
-        # get arrays
-        pv = getattr(env, '_solar', None)
-        load = getattr(env, '_load', None)
-        if pv is None or load is None:
-            raise AttributeError('solar or load arrays not found')
-
         import numpy as np
-        pv = np.asarray(pv, dtype=float)
-        load = np.asarray(load, dtype=float)
-        t = int(getattr(env, 't', len(load)))
-        pv = pv[:t]
-        load = load[:t]
+        t = int(getattr(env, 't', 0))
+        series = _extract_metric_series(env, overrides=scenario_overrides, upto_steps=max(1, t))
+        pv = np.asarray(series['solar_mw'], dtype=float)
+        load = np.asarray(series['load_mw'], dtype=float)
 
         # timestep inference: prefer timestamp spacing, else assume 10‑min
-        dt_hours = 1.0 / 6.0
-        try:
-            df = getattr(env, 'data', None)
-            if df is not None and 'timestamp' in df.columns and t > 1:
-                ts = df['timestamp'].iloc[:t]
-                delta = (ts.iloc[1] - ts.iloc[0]).total_seconds() / 3600.0
-                if delta > 0:
-                    dt_hours = float(delta)
-        except Exception:
-            pass
+        dt_hours = float(series['dt_hours'])
 
         cfg = build_config_from_overrides(scenario_overrides, dt_hours)
         opt = MeritOrderOptimizer(cfg)
@@ -591,6 +684,7 @@ async def run_scenario(scenario_id: str) -> SimulationRunRead:
                 'enable_forecasts': manager.settings.enable_forecasts,
                 'model_dir': str(manager.settings.model_dir),
                 'scaler_dir': str(manager.settings.scaler_dir),
+                'config_overrides': sc.config_overrides or {},
             },
             status=SimulationStatus.RUNNING,
             session_id=sim_session.session_id,
@@ -773,6 +867,7 @@ async def run_digital_twin(dt_id: str) -> SimulationRunRead:
                 'enable_forecasts': manager.settings.enable_forecasts,
                 'model_dir': str(manager.settings.model_dir),
                 'scaler_dir': str(manager.settings.scaler_dir),
+                'config_overrides': config_overrides,
                 'digital_twin_config': {'components': dt.components, 'connections': dt.connections},
             },
             status=SimulationStatus.RUNNING,
