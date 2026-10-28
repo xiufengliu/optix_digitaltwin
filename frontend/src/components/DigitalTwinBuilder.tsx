@@ -1,4 +1,4 @@
-import { Fragment, useState, useRef, useCallback, useEffect, useId } from 'react';
+import { Fragment, useState, useRef, useCallback, useEffect, useId, useMemo } from 'react';
 import { formatTwinSummary, twinSummary } from '../lib/twin';
 import { DeviceIcon, NumberField, PALETTE_GROUPS, paramMeta, specLine } from './builder/builderUi';
 
@@ -138,6 +138,195 @@ const COMPONENT_LIST = Object.entries(COMPONENT_DEFS).map(([type, def]) => ({
 const NODE_ANCHOR = 30;
 const CARD_W = 150;
 const CARD_H = 64;
+
+// ---- Orthogonal (elbow) connection routing ----
+type Pt = { x: number; y: number };
+type Side = 'left' | 'right' | 'top' | 'bottom';
+const PORT_GAP = 4;      // distance between card edge and line end
+const CORNER_R = 8;      // rounded elbow radius
+
+/** Sides a link leaves `a` and enters `b` by (card centres). Cards with room
+ * between them horizontally are joined side to side, otherwise top to bottom. */
+function linkSides(a: Pt, b: Pt): [Side, Side] {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const sideBySide = Math.abs(dx) >= CARD_W + 16 || Math.abs(dy) < CARD_H + 16;
+  if (sideBySide) return dx >= 0 ? ['right', 'left'] : ['left', 'right'];
+  return dy >= 0 ? ['bottom', 'top'] : ['top', 'bottom'];
+}
+
+function portPoint(c: Pt, side: Side, offset: number): Pt {
+  switch (side) {
+    case 'left': return { x: c.x - CARD_W / 2 - PORT_GAP, y: c.y + offset };
+    case 'right': return { x: c.x + CARD_W / 2 + PORT_GAP, y: c.y + offset };
+    case 'top': return { x: c.x + offset, y: c.y - CARD_H / 2 - PORT_GAP };
+    default: return { x: c.x + offset, y: c.y + CARD_H / 2 + PORT_GAP };
+  }
+}
+
+/** Three-segment elbow route; the middle segment sits halfway between the ends. */
+function elbowPoints(p1: Pt, p2: Pt, horizontal: boolean): Pt[] {
+  if (horizontal) {
+    const mx = (p1.x + p2.x) / 2;
+    return [p1, { x: mx, y: p1.y }, { x: mx, y: p2.y }, p2];
+  }
+  const my = (p1.y + p2.y) / 2;
+  return [p1, { x: p1.x, y: my }, { x: p2.x, y: my }, p2];
+}
+
+/** SVG path through the points with rounded corners (zero-length segments dropped). */
+function roundedPath(points: Pt[]): string {
+  const pts = points.filter((p, i) => i === 0 || Math.hypot(p.x - points[i - 1].x, p.y - points[i - 1].y) > 0.5);
+  if (pts.length < 2) return '';
+  let d = `M${pts[0].x},${pts[0].y}`;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const prev = pts[i - 1], cur = pts[i], next = pts[i + 1];
+    const l1 = Math.hypot(cur.x - prev.x, cur.y - prev.y), l2 = Math.hypot(next.x - cur.x, next.y - cur.y);
+    const r = Math.min(CORNER_R, l1 / 2, l2 / 2);
+    const a = { x: cur.x - ((cur.x - prev.x) / l1) * r, y: cur.y - ((cur.y - prev.y) / l1) * r };
+    const b = { x: cur.x + ((next.x - cur.x) / l2) * r, y: cur.y + ((next.y - cur.y) / l2) * r };
+    d += ` L${a.x},${a.y} Q${cur.x},${cur.y} ${b.x},${b.y}`;
+  }
+  const last = pts[pts.length - 1];
+  return d + ` L${last.x},${last.y}`;
+}
+
+type Rect = { l: number; r: number; t: number; b: number };
+type Shape = { s1: Side; s2: Side; kind: 'hvh' | 'vhv' | 'hv' | 'vh' };
+const opposite: Record<Side, Side> = { left: 'right', right: 'left', top: 'bottom', bottom: 'top' };
+
+const cardRect = (c: Pt, pad: number): Rect => ({ l: c.x - CARD_W / 2 - pad, r: c.x + CARD_W / 2 + pad, t: c.y - CARD_H / 2 - pad, b: c.y + CARD_H / 2 + pad });
+function segHitsRect(p: Pt, q: Pt, r: Rect): boolean {
+  return Math.min(p.x, q.x) < r.r && Math.max(p.x, q.x) > r.l && Math.min(p.y, q.y) < r.b && Math.max(p.y, q.y) > r.t;
+}
+/** Two axis-aligned segments lying on top of each other (same line, overlapping span). */
+function segsOverlap(p: Pt, q: Pt, u: Pt, v: Pt): boolean {
+  const h1 = Math.abs(p.y - q.y) < 0.5, h2 = Math.abs(u.y - v.y) < 0.5;
+  if (h1 !== h2) return false;
+  if (h1) return Math.abs(p.y - u.y) < 5 && Math.min(Math.max(p.x, q.x), Math.max(u.x, v.x)) - Math.max(Math.min(p.x, q.x), Math.min(u.x, v.x)) > 6;
+  return Math.abs(p.x - u.x) < 5 && Math.min(Math.max(p.y, q.y), Math.max(u.y, v.y)) - Math.max(Math.min(p.y, q.y), Math.min(u.y, v.y)) > 6;
+}
+function segsCross(p: Pt, q: Pt, u: Pt, v: Pt): boolean {
+  const h1 = Math.abs(p.y - q.y) < 0.5, h2 = Math.abs(u.y - v.y) < 0.5;
+  if (h1 === h2) return false;
+  const [hp, hq, vp, vq] = h1 ? [p, q, u, v] : [u, v, p, q];
+  return vp.x > Math.min(hp.x, hq.x) && vp.x < Math.max(hp.x, hq.x) && hp.y > Math.min(vp.y, vq.y) && hp.y < Math.max(vp.y, vq.y);
+}
+
+/** Candidate elbow routes (with alternative positions of the middle segment). */
+function candidateRoutes(a: Pt, b: Pt, sh: Shape, o1: number, o2: number): Pt[][] {
+  const p1 = portPoint(a, sh.s1, o1), p2 = portPoint(b, sh.s2, o2);
+  const STUB = 12;
+  const out: Pt[][] = [];
+  if (sh.kind === 'hv' || sh.kind === 'vh') {
+    const corner = sh.kind === 'hv' ? { x: p2.x, y: p1.y } : { x: p1.x, y: p2.y };
+    // The first leg must leave p1 outwards and the second enter p2 from outside
+    const out1 = sh.kind === 'hv' ? (sh.s1 === 'right' ? corner.x - p1.x : p1.x - corner.x) : (sh.s1 === 'bottom' ? corner.y - p1.y : p1.y - corner.y);
+    const in2 = sh.kind === 'hv' ? (sh.s2 === 'top' ? p2.y - corner.y : corner.y - p2.y) : (sh.s2 === 'left' ? p2.x - corner.x : corner.x - p2.x);
+    if (out1 >= STUB && in2 >= STUB) out.push([p1, corner, p2]);
+    return out;
+  }
+  const horizontal = sh.kind === 'hvh';
+  const lo = horizontal ? Math.min(p1.x, p2.x) : Math.min(p1.y, p2.y);
+  const hi = horizontal ? Math.max(p1.x, p2.x) : Math.max(p1.y, p2.y);
+  const forward = horizontal ? (sh.s1 === 'right' ? p2.x - p1.x : p1.x - p2.x) : (sh.s1 === 'bottom' ? p2.y - p1.y : p1.y - p2.y);
+  if (forward < 2 * STUB) return out;
+  const mids = new Set<number>([Math.round((lo + hi) / 2)]);
+  const n = Math.min(14, Math.floor((hi - lo - 2 * STUB) / 10));
+  for (let i = 0; i <= n; i++) mids.add(Math.round(lo + STUB + ((hi - lo - 2 * STUB) * i) / Math.max(1, n)));
+  for (const m of mids) out.push(horizontal ? [p1, { x: m, y: p1.y }, { x: m, y: p2.y }, p2] : [p1, { x: p1.x, y: m }, { x: p2.x, y: m }, p2]);
+  return out;
+}
+
+function routeCost(pts: Pt[], obstacles: Rect[], placed: [Pt, Pt][]): number {
+  let cost = (pts.length - 2) * 25;
+  for (let i = 1; i < pts.length; i++) {
+    const p = pts[i - 1], q = pts[i];
+    cost += Math.abs(q.x - p.x) + Math.abs(q.y - p.y);
+    for (const r of obstacles) if (segHitsRect(p, q, r)) cost += 2000;
+    for (const [u, v] of placed) {
+      if (segsOverlap(p, q, u, v)) cost += 400;
+      else if (segsCross(p, q, u, v)) cost += 15;
+    }
+  }
+  return cost;
+}
+
+/** Routes for all links. Each link picks the cheapest elbow route (side to side,
+ * top to bottom or one-corner L) that avoids other cards and existing lines;
+ * ends sharing a card side are then spread out so parallel lines do not overlap. */
+function routeConnections(components: DTComponent[], connections: DTConnection[]): Map<string, { d: string; label: Pt }> {
+  const centre = new Map(components.map(c => [c.id, { x: c.x + NODE_ANCHOR, y: c.y + NODE_ANCHOR }]));
+  const links = connections.filter(c => centre.has(c.from) && centre.has(c.to) && c.from !== c.to);
+  const obstaclesFor = (conn: DTConnection) =>
+    components.filter(c => c.id !== conn.from && c.id !== conn.to).map(c => cardRect(centre.get(c.id)!, 8));
+  const shapesFor = (a: Pt, b: Pt): Shape[] => {
+    const h: Side = b.x >= a.x ? 'right' : 'left';
+    const v: Side = b.y >= a.y ? 'bottom' : 'top';
+    return [
+      { s1: h, s2: opposite[h], kind: 'hvh' }, { s1: v, s2: opposite[v], kind: 'vhv' },
+      { s1: h, s2: opposite[v], kind: 'hv' }, { s1: v, s2: opposite[h], kind: 'vh' },
+    ];
+  };
+  const best = (conn: DTConnection, shapes: Shape[], o1: number, o2: number, placed: [Pt, Pt][]) => {
+    const a = centre.get(conn.from)!, b = centre.get(conn.to)!;
+    const obstacles = obstaclesFor(conn);
+    let top: { pts: Pt[]; shape: Shape; cost: number } | null = null;
+    for (const shape of shapes) {
+      for (const pts of candidateRoutes(a, b, shape, o1, o2)) {
+        const cost = routeCost(pts, obstacles, placed);
+        if (!top || cost < top.cost) top = { pts, shape, cost };
+      }
+    }
+    // Overlapping cards: fall back to a straight elbow between facing sides
+    if (!top) {
+      const [s1, s2] = linkSides(a, b);
+      const pts = elbowPoints(portPoint(a, s1, o1), portPoint(b, s2, o2), s1 === 'left' || s1 === 'right');
+      top = { pts, shape: { s1, s2, kind: s1 === 'left' || s1 === 'right' ? 'hvh' : 'vhv' }, cost: 0 };
+    }
+    return top;
+  };
+  const segments = (pts: Pt[]) => pts.slice(1).map((q, i) => [pts[i], q] as [Pt, Pt]);
+
+  // Pass 1: choose a shape per link (centred ports)
+  const shapeOf = new Map<string, Shape>();
+  let placed: [Pt, Pt][] = [];
+  for (const conn of links) {
+    const r = best(conn, shapesFor(centre.get(conn.from)!, centre.get(conn.to)!), 0, 0, placed);
+    shapeOf.set(conn.id, r.shape);
+    placed = placed.concat(segments(r.pts));
+  }
+
+  // Spread ends that share a card side, ordered by where the other end lies
+  type End = { key: string; other: Pt; vertical: boolean };
+  const groups = new Map<string, End[]>();
+  for (const conn of links) {
+    const sh = shapeOf.get(conn.id)!;
+    for (const [which, comp, side, other] of [[0, conn.from, sh.s1, conn.to], [1, conn.to, sh.s2, conn.from]] as const) {
+      const g = `${comp}:${side}`;
+      groups.set(g, [...(groups.get(g) ?? []), { key: `${conn.id}:${which}`, other: centre.get(other)!, vertical: side === 'left' || side === 'right' }]);
+    }
+  }
+  const offset = new Map<string, number>();
+  for (const group of groups.values()) {
+    const vertical = group[0].vertical;
+    group.sort((p, q) => (vertical ? p.other.y - q.other.y : p.other.x - q.other.x));
+    const span = (vertical ? CARD_H : CARD_W) - 20;
+    const step = group.length > 1 ? Math.min(vertical ? 12 : 22, span / (group.length - 1)) : 0;
+    group.forEach((e, i) => offset.set(e.key, (i - (group.length - 1) / 2) * step));
+  }
+
+  // Pass 2: final routes with spread ports, avoiding lines already drawn
+  const out = new Map<string, { d: string; label: Pt }>();
+  placed = [];
+  for (const conn of links) {
+    const r = best(conn, [shapeOf.get(conn.id)!], offset.get(`${conn.id}:0`) ?? 0, offset.get(`${conn.id}:1`) ?? 0, placed);
+    const segs = segments(r.pts);
+    placed = placed.concat(segs);
+    const [lp, lq] = segs.reduce((m, s) => (Math.hypot(s[1].x - s[0].x, s[1].y - s[0].y) > Math.hypot(m[1].x - m[0].x, m[1].y - m[0].y) ? s : m));
+    out.set(conn.id, { d: roundedPath(r.pts), label: { x: (lp.x + lq.x) / 2, y: (lp.y + lq.y) / 2 } });
+  }
+  return out;
+}
 const GRID = 20;
 const snap = (v: number) => Math.round(v / GRID) * GRID;
 const clampZoom = (k: number) => Math.max(0.4, Math.min(2, k));
@@ -1166,20 +1355,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
   };
 
   // Where a connection leaves a card: intersection of the centre line with the card edge
-  const edgePoint = (cx: number, cy: number, tx: number, ty: number) => {
-    const dx = tx - cx, dy = ty - cy;
-    if (!dx && !dy) return { x: cx, y: cy };
-    const s = Math.min((CARD_W / 2 + 4) / Math.abs(dx || 1e-9), (CARD_H / 2 + 4) / Math.abs(dy || 1e-9));
-    return { x: cx + dx * s, y: cy + dy * s };
-  };
-  const connPath = (a: { x: number; y: number }, b: { x: number; y: number }) => {
-    const dx = b.x - a.x, dy = b.y - a.y;
-    const horizontal = Math.abs(dx) >= Math.abs(dy);
-    const c = (horizontal ? Math.abs(dx) : Math.abs(dy)) * 0.45;
-    return horizontal
-      ? `M${a.x},${a.y} C${a.x + Math.sign(dx) * c},${a.y} ${b.x - Math.sign(dx) * c},${b.y} ${b.x},${b.y}`
-      : `M${a.x},${a.y} C${a.x},${a.y + Math.sign(dy) * c} ${b.x},${b.y - Math.sign(dy) * c} ${b.x},${b.y}`;
-  };
+  const routes = useMemo(() => routeConnections(components, connections), [components, connections]);
   const CONN_COLORS: Record<DTConnection['type'], string> = { electricity: '#38bdf8', heat: '#fb7a4a', both: '#c084fc' };
   const canConnectTo = (id: string) => !!connectingFrom && connectingFrom !== id && validateConnection(connectingFrom, id).valid;
 
@@ -1382,11 +1558,9 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
                   const a = components.find(c => c.id === conn.from);
                   const b = components.find(c => c.id === conn.to);
                   if (!a || !b) return null;
-                  const ac = { x: a.x + NODE_ANCHOR, y: a.y + NODE_ANCHOR };
-                  const bc = { x: b.x + NODE_ANCHOR, y: b.y + NODE_ANCHOR };
-                  const p1 = edgePoint(ac.x, ac.y, bc.x, bc.y);
-                  const p2 = edgePoint(bc.x, bc.y, ac.x, ac.y);
-                  const d = connPath(p1, p2);
+                  const route = routes.get(conn.id);
+                  if (!route) return null;
+                  const d = route.d;
                   const color = CONN_COLORS[conn.type] ?? CONN_COLORS.electricity;
                   const active = selectedId === conn.id || hoverConn === conn.id;
                   return (
@@ -1405,7 +1579,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
                         onMouseLeave={() => setHoverConn(h => (h === conn.id ? null : h))}
                       />
                       {active && (
-                        <g transform={`translate(${(p1.x + p2.x) / 2},${(p1.y + p2.y) / 2})`} className="bn-overlay">
+                        <g transform={`translate(${route.label.x},${route.label.y})`} className="bn-overlay">
                           <rect x={-34} y={-11} width={68} height={22} rx={11} fill="#0b1120" stroke={color} strokeOpacity={0.7} />
                           <text textAnchor="middle" dominantBaseline="central" fill="#e6ecf5" fontSize={11} fontWeight={600}>
                             {conn.capacity_kw ? `${conn.capacity_kw} kW` : conn.type}
@@ -1420,7 +1594,10 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
                   const src = components.find(c => c.id === connectingFrom);
                   if (!src) return null;
                   const sc = { x: src.x + NODE_ANCHOR, y: src.y + NODE_ANCHOR };
-                  return <path d={connPath(edgePoint(sc.x, sc.y, pointer.x, pointer.y), pointer)} stroke="#94a3b8" strokeWidth={2} strokeDasharray="5 5" fill="none" />;
+                  const [side] = linkSides(sc, pointer);
+                  const horizontal = side === 'left' || side === 'right';
+                  const d = roundedPath(elbowPoints(portPoint(sc, side, 0), pointer, horizontal));
+                  return <path d={d} stroke="#94a3b8" strokeWidth={2} strokeDasharray="5 5" fill="none" />;
                 })()}
               </svg>
 
