@@ -141,13 +141,24 @@ export default function App() {
           sc = await apiFetch<Scenario>(apiBase, `/scenarios/${run.scenario_id}`, { signal: ac.signal }).catch(() => null);
           setScenario(sc);
         }
+        // Prefer the design copy stored with the run: it is what was simulated,
+        // even if the twin was edited or deleted afterwards
+        const snapshot = run.config?.digital_twin_config as Partial<DigitalTwinConfig> | undefined;
         const twinId = run.digital_twin_id ?? sc?.digital_twin_id;
         let twin: DigitalTwinConfig | null = null;
-        if (twinId) {
+        if (snapshot && Array.isArray(snapshot.components)) {
+          twin = {
+            id: run.digital_twin_id ?? `run-${run.id}`,
+            name: snapshot.name ?? run.name ?? 'Run twin',
+            components: snapshot.components,
+            connections: Array.isArray(snapshot.connections) ? snapshot.connections : [],
+            created_at: run.created_at,
+          };
+        } else if (twinId) {
           twin = await apiFetch<DigitalTwinConfig>(apiBase, `/digital-twins/${twinId}`, { signal: ac.signal }).catch(() => null);
         }
         if (!twin) {
-          const overrides = (sc?.config_overrides ?? (run.config?.config_overrides as Record<string, unknown> | undefined)) || null;
+          const overrides = ((run.config?.config_overrides as Record<string, unknown> | undefined) ?? sc?.config_overrides) || null;
           twin = twinFromOverrides(`gen-${run.id}`, sc?.name ?? run.name ?? 'Run twin', overrides, run.created_at);
         }
         setRunTwin(twin);
@@ -267,6 +278,19 @@ export default function App() {
     loadRuns();
     if (kind === 'run') setStateNonce((n) => n + 1);
   }, [log, loadRuns]);
+
+  // Open a saved twin (e.g. the one linked to a scenario) in the builder
+  const openTwin = async (twinId: string) => {
+    try {
+      const twin = await apiFetch<DigitalTwinConfig>(apiBase, `/digital-twins/${twinId}`);
+      setBuilderConfig(twin);
+      setBuilderKey((k) => k + 1);
+      setBuilderMode('2d');
+      setView('builder');
+    } catch (error) {
+      log(`Could not open twin: ${(error as Error).message}`, 'error');
+    }
+  };
 
   const editTwin = () => {
     setBuilderConfig(runTwin);
@@ -500,7 +524,7 @@ export default function App() {
 
       {view === 'scenarios' && (
         <main className="page">
-          <ScenarioList apiBase={apiBase} onRun={openRun} />
+          <ScenarioList apiBase={apiBase} onRun={openRun} onOpenTwin={openTwin} />
         </main>
       )}
 

@@ -44,3 +44,28 @@ export function twinFromOverrides(id: string, name: string, overrides: Overrides
 
   return { id, name, components, connections, created_at: createdAt };
 }
+
+export interface TwinSummary { pvKwp: number; windKw: number; batteryKwh: number; loadKw: number; components: number }
+
+/** Key sizes of a design, counted the way the simulation counts them. */
+export function twinSummary(config: Pick<DigitalTwinConfig, 'components'> | null | undefined): TwinSummary {
+  const out: TwinSummary = { pvKwp: 0, windKw: 0, batteryKwh: 0, loadKw: 0, components: 0 };
+  for (const c of config?.components ?? []) {
+    const p = (c.params ?? {}) as Record<string, unknown>;
+    const n = (k: string) => (Number.isFinite(Number(p[k])) ? Number(p[k]) : 0);
+    out.components += 1;
+    if (c.type === 'solar_pv') out.pvKwp += n('capacity_kwp');
+    else if (c.type === 'wind_turbine') out.windKw += n('capacity_kw');
+    else if (c.type === 'battery_storage') out.batteryKwh += n('capacity_kwh');
+    else if (c.type === 'smart_building') out.loadKw += n('load_kw');
+    else if (c.type === 'load_center') out.loadKw += n('peak_load_kw') || n('base_load_kw');
+  }
+  return out;
+}
+
+export function formatTwinSummary(s: TwinSummary): string {
+  const parts = [`${Math.round(s.loadKw)} kW load`, `${Math.round(s.pvKwp)} kWp PV`];
+  if (s.windKw > 0) parts.push(`${Math.round(s.windKw)} kW wind`);
+  if (s.batteryKwh > 0) parts.push(`${Math.round(s.batteryKwh)} kWh battery`);
+  return parts.join(' · ');
+}

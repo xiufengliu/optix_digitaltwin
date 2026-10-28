@@ -1,4 +1,5 @@
 import { Fragment, useState, useRef, useCallback, useEffect, useId } from 'react';
+import { formatTwinSummary, twinSummary } from '../lib/twin';
 import { DeviceIcon, NumberField, PALETTE_GROUPS, paramMeta, specLine } from './builder/builderUi';
 
 // Digital Twin component types for PED simulation
@@ -194,8 +195,10 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
   });
   const [saving, setSaving] = useState(false);
   const [running, setRunning] = useState(false);
-  const [scenarios, setScenarios] = useState<Array<{ id: string; name: string }>>([]);
-  const [linkedScenarioId, setLinkedScenarioId] = useState<string | null>(null);
+  const [scenarios, setScenarios] = useState<Array<{ id: string; name: string; digital_twin_id?: string | null }>>([]);
+  // "Open saved twin" dialog; null = not loaded yet
+  const [openDialog, setOpenDialog] = useState(false);
+  const [savedTwins, setSavedTwins] = useState<Array<DigitalTwinConfig & { updated_at?: string }> | null>(null);
   const [mobilePanel, setMobilePanel] = useState<'palette' | 'canvas' | 'properties'>('canvas');
   const [touchDrag, setTouchDrag] = useState<{ id: string; offsetX: number; offsetY: number } | null>(null);
   // Pan (x, y in screen px) and zoom (k) of the canvas content
@@ -313,36 +316,46 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     }
   };
 
-  // Load scenarios for linking
-  useEffect(() => {
+  // Scenarios, to show which ones use the open twin
+  const refreshScenarios = async (signal?: AbortSignal) => {
     if (!apiBase) return;
+    try {
+      const r = await fetch(join('/scenarios'), { signal });
+      const data = r.ok ? await r.json() : [];
+      setScenarios(Array.isArray(data) ? data : []);
+    } catch { /* offline or aborted */ }
+  };
+  useEffect(() => {
     const ctrl = new AbortController();
-    fetch(join('/scenarios'), { signal: ctrl.signal })
-      .then(r => (r.ok ? r.json() : []))
-      .then(data => setScenarios(Array.isArray(data) ? data : []))
-      .catch(() => {});
+    refreshScenarios(ctrl.signal);
     return () => ctrl.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiBase]);
 
   // Adopt externally provided configs (not our own echoed onConfigChange value)
-  useEffect(() => {
-    if (!initialConfig || initialConfig === syncedConfigRef.current) return;
-    syncedConfigRef.current = initialConfig;
-    const { components: comps, connections: conns } = sanitizeConfig(initialConfig);
+  const adoptConfig = (cfg: DigitalTwinConfig) => {
+    const { components: comps, connections: conns } = sanitizeConfig(cfg);
     setComponents(comps);
     setConnections(conns);
-    setConfigName(initialConfig.name || 'My Digital Twin');
-    const id = initialConfig.id != null ? String(initialConfig.id) : null;
+    setConfigName(cfg.name || 'My Digital Twin');
+    const id = cfg.id != null ? String(cfg.id) : null;
     if (isBackendId(id)) {
       setSavedId(id);
     } else {
       setSavedId(null);
       if (id) localIdRef.current = id;
     }
-    if (initialConfig.created_at) createdAtRef.current = initialConfig.created_at;
+    if (cfg.created_at) createdAtRef.current = cfg.created_at;
     setSelectedId(null);
     setConnectingFrom(null);
     setFitNonce(n => n + 1);
+  };
+
+  useEffect(() => {
+    if (!initialConfig || initialConfig === syncedConfigRef.current) return;
+    syncedConfigRef.current = initialConfig;
+    adoptConfig(initialConfig);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialConfig]);
 
   // Save and notify on changes. initialConfig/onConfigChange are deliberately not
@@ -651,7 +664,6 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
       setSelectedId(null);
       setConnectingFrom(null);
       setSavedId(null);
-      setLinkedScenarioId(null);
     }
   };
 
@@ -688,7 +700,8 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     try {
       const res = await persistTwin();
       if (res.ok) {
-        notify('Digital twin saved.');
+        const n = scenarios.filter(sc => sc.digital_twin_id === res.id).length;
+        notify(n ? `Digital twin saved — ${n} linked scenario${n > 1 ? 's' : ''} updated.` : 'Digital twin saved.');
       } else {
         notify('Save failed: ' + res.error, 'error');
       }
@@ -709,7 +722,11 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
       notify('Add components to your digital twin first', 'error');
       return;
     }
-    
+    if (!hasDemand) {
+      notify('Add a building or load centre first — the simulation needs electricity demand', 'error');
+      return;
+    }
+
     setRunning(true);
     try {
       // Always persist first: the run uses the stored twin, so unsaved edits
@@ -736,63 +753,46 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     }
   };
 
-  // Create scenario from digital twin config
+  const hasDemand = components.some(c => c.type === 'smart_building' || c.type === 'load_center');
+
+  // Create a scenario linked to this digital twin. The twin is saved first and the
+  // backend derives the scenario's settings from it (and keeps them in sync when
+  // the twin is saved again).
   const createScenarioFromDT = async () => {
     if (!apiBase) {
       notify('API not configured', 'error');
       return;
     }
-    const overrides = calcConfigOverrides();
-    const payload = {
-      name: `Scenario: ${configName}`,
-      description: `Auto-generated from digital twin "${configName}"`,
-      details: `Components: ${components.map(c => c.name).join(', ')}`,
-      config_overrides: overrides,
-    };
-    
-    const url = join('/scenarios');
-    console.log('Creating scenario at:', url, payload);
-    
+    if (!hasDemand) {
+      notify('Add a building or load centre first — a scenario needs electricity demand', 'error');
+      return;
+    }
     try {
-      const r = await fetch(url, {
+      const saveRes = await persistTwin();
+      if (!saveRes.ok) {
+        notify('Failed to save the twin: ' + saveRes.error, 'error');
+        return;
+      }
+      const r = await fetch(join('/scenarios'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          name: `Scenario: ${configName}`,
+          description: `Linked to digital twin "${configName}"`,
+          details: `Components: ${components.map(c => c.name).join(', ')}`,
+          digital_twin_id: saveRes.id,
+          config_overrides: { investment_freq: 12 },
+        }),
       });
       if (r.ok) {
-        const data = await r.json();
-        setLinkedScenarioId(data.id);
-        // Refresh scenarios list
-        const sr = await fetch(join('/scenarios'));
-        if (sr.ok) {
-          const list = await sr.json();
-          if (Array.isArray(list)) setScenarios(list);
-        }
-        notify('Scenario created — run it from the Scenarios page.');
+        await refreshScenarios();
+        notify('Linked scenario created — run it from the Scenarios page. Saving this twin updates it.');
       } else {
-        const errText = await r.text();
-        notify('Failed to create scenario: ' + errText, 'error');
+        notify('Failed to create scenario: ' + (await r.text()), 'error');
       }
     } catch (e: any) {
-      console.error('Create scenario error:', e);
       notify('Error creating scenario: ' + (e?.message || String(e)), 'error');
     }
-  };
-
-  // Convert DT components to scenario config overrides
-  const calcConfigOverrides = () => {
-    let solar_mw = 0, battery_mwh = 0, wind_mw = 0;
-    components.forEach(c => {
-      if (c.type === 'solar_pv') solar_mw += Number(c.params.capacity_kwp || 0) / 1000;
-      if (c.type === 'battery_storage') battery_mwh += Number(c.params.capacity_kwh || 0) / 1000;
-      if (c.type === 'wind_turbine') wind_mw += Number(c.params.capacity_kw || 0) / 1000;
-    });
-    return {
-      owned_solar_capacity_mw: solar_mw,
-      owned_battery_capacity_mwh: battery_mwh,
-      owned_wind_capacity_mw: wind_mw,
-      investment_freq: 12,
-    };
   };
 
   const exportConfig = () => {
@@ -1039,17 +1039,50 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     setFitNonce(n => n + 1);
     setSelectedId(null);
     setConnectingFrom(null);
-    setLinkedScenarioId(null);
-    
-    // Auto-link to matching backend scenario (S1-S5)
-    const scenarioNum = templateId.match(/scenario_(\d)/)?.[1];
-    if (scenarioNum && scenarios.length > 0) {
-      const match = scenarios.find(s => 
-        s.name.toLowerCase().includes(`scenario ${scenarioNum}`) ||
-        s.name.toLowerCase().includes(`s${scenarioNum}`)
-      );
-      if (match) setLinkedScenarioId(match.id);
+  };
+
+  // ---- Saved twins: open / rename / delete ----
+  const loadSavedTwins = async () => {
+    setSavedTwins(null);
+    try {
+      const r = await fetch(join('/digital-twins'));
+      const list = r.ok ? await r.json() : [];
+      setSavedTwins((Array.isArray(list) ? list : []).sort((a: any, b: any) =>
+        String(b.updated_at || b.created_at).localeCompare(String(a.updated_at || a.created_at))));
+    } catch {
+      setSavedTwins([]);
     }
+  };
+  const showOpenDialog = () => { setOpenDialog(true); loadSavedTwins(); refreshScenarios(); };
+  const usedBy = (twinId: string | null) => (twinId ? scenarios.filter(sc => sc.digital_twin_id === twinId) : []);
+
+  const openSavedTwin = (t: DigitalTwinConfig) => {
+    if (components.length > 0 && t.id !== savedId && !confirm(`Open “${t.name}”? Unsaved changes to the current design are lost.`)) return;
+    adoptConfig(t);
+    setOpenDialog(false);
+    setMobilePanel('canvas');
+  };
+  const renameSavedTwin = async (t: DigitalTwinConfig) => {
+    const name = prompt('New name for this twin', t.name)?.trim();
+    if (!name || name === t.name) return;
+    const r = await fetch(join(`/digital-twins/${encodeURIComponent(t.id)}`), {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }),
+    });
+    if (!r.ok) { notify('Rename failed: ' + (await r.text()), 'error'); return; }
+    if (t.id === savedId) setConfigName(name);
+    loadSavedTwins();
+  };
+  const deleteSavedTwin = async (t: DigitalTwinConfig) => {
+    const users = usedBy(t.id);
+    const msg = users.length
+      ? `Delete “${t.name}”? ${users.length} scenario${users.length > 1 ? 's' : ''} (${users.map(u => u.name).join(', ')}) will keep their current sizes but no longer follow this twin.`
+      : `Delete “${t.name}”? This cannot be undone.`;
+    if (!confirm(msg)) return;
+    const r = await fetch(join(`/digital-twins/${encodeURIComponent(t.id)}`), { method: 'DELETE' });
+    if (!r.ok) { notify('Delete failed: ' + (await r.text()), 'error'); return; }
+    if (t.id === savedId) setSavedId(null); // the design stays on the canvas, unsaved
+    loadSavedTwins();
+    refreshScenarios();
   };
 
   // Mobile tap to add component (since drag doesn't work well on touch)
@@ -1263,17 +1296,25 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
           <div className="dt-toolbar bn-toolbar">
             <input className="bn-title" value={configName} onChange={e => setConfigName(e.target.value)} aria-label="Design name" />
             <span className="dt-toolbar-info bn-chip">{components.length} components · {connections.length} links</span>
-            {apiBase && linkedScenarioId && (
-              <span className="bn-chip bn-chip-accent" title="Linked scenario">
-                {scenarios.find(s => s.id === linkedScenarioId)?.name || 'Linked scenario'}
-                <button className="chip-remove" onClick={() => setLinkedScenarioId(null)} aria-label="Unlink scenario">✕</button>
+            {apiBase && usedBy(savedId).length > 0 && (
+              <span className="bn-chip bn-chip-accent" title={`Saving this twin updates: ${usedBy(savedId).map(sc => sc.name).join(', ')}`}>
+                Used by {usedBy(savedId).length === 1 ? usedBy(savedId)[0].name : `${usedBy(savedId).length} scenarios`}
               </span>
             )}
             <div className="bn-toolbar-right">
               <div className="bn-menu">
-                <button className="btn btn-secondary btn-sm" onClick={() => setTemplatesOpen(o => !o)} aria-expanded={templatesOpen}>Templates ▾</button>
+                <button className="btn btn-secondary btn-sm" onClick={() => setTemplatesOpen(o => !o)} aria-expanded={templatesOpen}>Designs ▾</button>
                 {templatesOpen && (
                   <div className="bn-menu-pop" role="menu">
+                    {apiBase && (
+                      <>
+                        <button role="menuitem" className="bn-menu-item" onClick={() => { setTemplatesOpen(false); showOpenDialog(); }}>
+                          <span>Open saved twin…</span>
+                          <span className="muted small">Continue editing a design you saved</span>
+                        </button>
+                        <div className="bn-menu-sep" />
+                      </>
+                    )}
                     {TEMPLATE_MENU.map(g => (
                       <div key={g.group}>
                         <div className="bn-group-title">{g.group}</div>
@@ -1590,6 +1631,44 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
           )}
         </aside>
       </div>
+
+      {openDialog && (
+        <div className="bn-dialog-backdrop" onClick={() => setOpenDialog(false)}>
+          <div className="bn-dialog" role="dialog" aria-modal="true" aria-label="Open saved twin" onClick={e => e.stopPropagation()}>
+            <div className="row between">
+              <h3>Open saved twin</h3>
+              <button className="btn btn-ghost btn-sm" onClick={() => setOpenDialog(false)} aria-label="Close">✕</button>
+            </div>
+            <p className="muted small">Saving an opened twin updates it in place, and every scenario that uses it.</p>
+            <div className="bn-twin-list">
+              {savedTwins === null ? (
+                <p className="muted small">Loading…</p>
+              ) : savedTwins.length === 0 ? (
+                <p className="muted small">No saved twins yet. Use “Save twin” to keep a design.</p>
+              ) : savedTwins.map(t => {
+                const users = usedBy(t.id);
+                return (
+                  <div key={t.id} className={`bn-twin-row ${t.id === savedId ? 'is-current' : ''}`}>
+                    <div className="bn-twin-main">
+                      <strong>{t.name}{t.id === savedId && <span className="badge badge-accent">Open</span>}</strong>
+                      <span className="muted small">{formatTwinSummary(twinSummary(t))}</span>
+                      <span className="muted small">
+                        Saved {new Date(t.updated_at || t.created_at).toLocaleString(undefined, { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                        {' · '}{users.length ? `Used by ${users.map(u => u.name).join(', ')}` : 'Not used by any scenario'}
+                      </span>
+                    </div>
+                    <div className="bn-twin-actions">
+                      <button className="btn btn-primary btn-sm" onClick={() => openSavedTwin(t)}>Open</button>
+                      <button className="btn btn-ghost btn-sm" onClick={() => renameSavedTwin(t)}>Rename</button>
+                      <button className="btn btn-ghost btn-sm btn-danger" onClick={() => deleteSavedTwin(t)}>Delete</button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

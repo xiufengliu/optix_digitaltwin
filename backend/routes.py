@@ -104,7 +104,7 @@ def _resolve_run_overrides(db, run: SimulationRun) -> dict:
     if run.digital_twin_id:
         dt = db.get(DigitalTwin, run.digital_twin_id)
         if dt is not None:
-            return _dt_to_config_overrides(dt.components or [], dt.connections or [])
+            return _overrides_with_twin(None, dt)
 
     dt_config = run_config.get("digital_twin_config")
     if isinstance(dt_config, dict):
@@ -653,21 +653,21 @@ async def optimize_run_merit_order(run_id: str, limit: int = 0, max_points: int 
 @router.post('/scenarios', response_model=ScenarioRead, tags=['scenarios'])
 async def create_scenario(payload: ScenarioCreate) -> ScenarioRead:
     with session_scope() as db:
-        # If linked to a digital twin, merge its config
+        # A scenario linked to a digital twin takes its asset sizes from the design
         config = payload.config_overrides or {}
         if payload.digital_twin_id:
             dt = db.get(DigitalTwin, payload.digital_twin_id)
-            if dt:
-                dt_config = _dt_to_config_overrides(dt.components or [], dt.connections or [])
-                config = {**dt_config, **config}
-        
+            if dt is None:
+                raise HTTPException(status_code=404, detail='Digital twin not found')
+            config = _overrides_with_twin(config, dt)
+
         scenario = Scenario(
             id=str(uuid4()),
             name=payload.name,
             description=payload.description,
             details=payload.details,
             config_overrides=config,
-            digital_twin_id=payload.digital_twin_id,
+            digital_twin_id=payload.digital_twin_id or None,
         )
         db.add(scenario)
         db.flush(); db.refresh(scenario)
@@ -705,12 +705,14 @@ async def update_scenario(scenario_id: str, payload: ScenarioUpdate) -> Scenario
         if payload.config_overrides is not None:
             sc.config_overrides = payload.config_overrides
         if payload.digital_twin_id is not None:
-            sc.digital_twin_id = payload.digital_twin_id
-            # Optionally merge DT config into overrides
-            dt = db.get(DigitalTwin, payload.digital_twin_id)
-            if dt:
-                dt_config = _dt_to_config_overrides(dt.components or [], dt.connections or [])
-                sc.config_overrides = {**dt_config, **(sc.config_overrides or {})}
+            # "" unlinks; the scenario keeps its current sizes as manual values
+            if payload.digital_twin_id and db.get(DigitalTwin, payload.digital_twin_id) is None:
+                raise HTTPException(status_code=404, detail='Digital twin not found')
+            sc.digital_twin_id = payload.digital_twin_id or None
+        if sc.digital_twin_id:
+            dt = db.get(DigitalTwin, sc.digital_twin_id)
+            if dt is not None:
+                sc.config_overrides = _overrides_with_twin(sc.config_overrides, dt)
         db.add(sc); db.flush(); db.refresh(sc)
         return ScenarioRead.from_orm(sc)
 
@@ -722,6 +724,8 @@ async def run_scenario(scenario_id: str) -> SimulationRunRead:
         sc = db.get(Scenario, scenario_id)
         if sc is None:
             raise HTTPException(status_code=404, detail='Scenario not found')
+        # Keep a copy of the linked design so the run shows what was simulated
+        twin = db.get(DigitalTwin, sc.digital_twin_id) if sc.digital_twin_id else None
         # Build session using scenario overrides
         try:
             sim_session = manager.create_session(config_overrides=sc.config_overrides)
@@ -739,10 +743,12 @@ async def run_scenario(scenario_id: str) -> SimulationRunRead:
                 'model_dir': str(manager.settings.model_dir),
                 'scaler_dir': str(manager.settings.scaler_dir),
                 'config_overrides': sc.config_overrides or {},
+                **({'digital_twin_config': {'name': twin.name, 'components': twin.components, 'connections': twin.connections}} if twin else {}),
             },
             status=SimulationStatus.RUNNING,
             session_id=sim_session.session_id,
             scenario_id=sc.id,
+            digital_twin_id=twin.id if twin else None,
         )
         db.add(run)
         db.flush(); db.refresh(run)
@@ -886,6 +892,10 @@ async def update_digital_twin(dt_id: str, payload: DigitalTwinUpdate) -> Digital
         if payload.connections is not None:
             dt.connections = [c.model_dump(by_alias=True) for c in payload.connections]
         db.add(dt)
+        # Linked scenarios follow the design (existing runs keep the settings they started with)
+        for sc in db.query(Scenario).filter(Scenario.digital_twin_id == dt.id).all():
+            sc.config_overrides = _overrides_with_twin(sc.config_overrides, dt)
+            db.add(sc)
         db.flush()
         db.refresh(dt)
         return DigitalTwinRead.model_validate(_dt_to_read_dict(dt))
@@ -898,8 +908,19 @@ async def delete_digital_twin(dt_id: str) -> dict:
         dt = db.get(DigitalTwin, dt_id)
         if dt is None:
             raise HTTPException(status_code=404, detail='Digital twin not found')
+        # SQLite does not enforce the ON DELETE SET NULL foreign keys: unlink by
+        # hand. Scenarios keep their current sizes as manual values; runs keep the
+        # design copy stored in their config.
+        unlinked = 0
+        for sc in db.query(Scenario).filter(Scenario.digital_twin_id == dt_id).all():
+            sc.digital_twin_id = None
+            db.add(sc)
+            unlinked += 1
+        for run in db.query(SimulationRun).filter(SimulationRun.digital_twin_id == dt_id).all():
+            run.digital_twin_id = None
+            db.add(run)
         db.delete(dt)
-        return {"status": "deleted", "id": dt_id}
+        return {"status": "deleted", "id": dt_id, "unlinked_scenarios": unlinked}
 
 
 @router.post('/digital-twins/{dt_id}/run', response_model=SimulationRunRead, tags=['digital-twins'])
@@ -912,7 +933,7 @@ async def run_digital_twin(dt_id: str) -> SimulationRunRead:
             raise HTTPException(status_code=404, detail='Digital twin not found')
 
         # Convert digital twin components to simulation config overrides
-        config_overrides = _dt_to_config_overrides(dt.components or [], dt.connections or [])
+        config_overrides = _overrides_with_twin(None, dt)
 
         try:
             sim_session = manager.create_session(config_overrides=config_overrides)
@@ -930,7 +951,7 @@ async def run_digital_twin(dt_id: str) -> SimulationRunRead:
                 'model_dir': str(manager.settings.model_dir),
                 'scaler_dir': str(manager.settings.scaler_dir),
                 'config_overrides': config_overrides,
-                'digital_twin_config': {'components': dt.components, 'connections': dt.connections},
+                'digital_twin_config': {'name': dt.name, 'components': dt.components, 'connections': dt.connections},
             },
             status=SimulationStatus.RUNNING,
             session_id=sim_session.session_id,
@@ -1018,6 +1039,25 @@ def _dataset_full_load_hours() -> dict:
     df = manager._load_data(manager.settings.resolve(Path.cwd()).data_path)
     step_h = (df['timestamp'].iloc[1] - df['timestamp'].iloc[0]).total_seconds() / 3600 if len(df) > 1 else 1 / 6
     return full_load_hours(df, step_h)
+
+
+# Settings that a linked digital twin owns; everything else (e.g. investment_freq) is kept
+TWIN_ASSET_KEYS = (
+    'owned_solar_capacity_mw', 'owned_wind_capacity_mw', 'owned_hydro_capacity_mw', 'owned_load_peak_mw',
+    'owned_battery_capacity_mwh', 'batt_power_c_rate', 'batt_eta_charge', 'batt_eta_discharge',
+    'flexible_load_share', 'max_shift_hours',
+)
+
+
+def _overrides_with_twin(overrides: dict | None, dt: DigitalTwin) -> dict:
+    """Replace the asset settings in ``overrides`` with those derived from the twin."""
+    kept = {k: v for k, v in (overrides or {}).items() if k not in TWIN_ASSET_KEYS}
+    twin = _dt_to_config_overrides(dt.components or [], dt.connections or [])
+    # Local-asset mode needs explicit zeros, otherwise a design without PV would fall
+    # back to the regional DK2 series
+    for key in ('owned_solar_capacity_mw', 'owned_wind_capacity_mw', 'owned_hydro_capacity_mw', 'owned_load_peak_mw'):
+        twin.setdefault(key, 0.0)
+    return {**kept, **twin}
 
 
 def _dt_to_config_overrides(components: list, connections: list) -> dict:

@@ -4,11 +4,17 @@ import { formatDuration, formatEnergy } from '../lib/format';
 import { PedGauge } from './AnalyticsPanels';
 import { RunStatusBadge } from './RunList';
 import type { CompareRunsResponse, Scenario, ScenarioCreate, SimulationRun } from '../types';
+import type { DigitalTwinConfig } from './DigitalTwinBuilder';
+import { formatTwinSummary, twinSummary } from '../lib/twin';
 
 interface ScenarioListProps {
   apiBase: string;
   onRun: (runId: string) => void;
+  /** Open a saved digital twin in the Twin Builder */
+  onOpenTwin?: (twinId: string) => void;
 }
+
+type SavedTwin = DigitalTwinConfig & { updated_at?: string };
 
 const PAPER_SCENARIO_NAMES = [
   'Scenario 1: Baseline',
@@ -19,6 +25,9 @@ const PAPER_SCENARIO_NAMES = [
 ];
 
 /** Editable fields, shown in building-friendly units and stored in backend units. */
+// Settings a linked digital twin owns (mirrors TWIN_ASSET_KEYS in backend/routes.py)
+const TWIN_KEYS = new Set(['owned_solar_capacity_mw', 'owned_wind_capacity_mw', 'owned_hydro_capacity_mw', 'owned_load_peak_mw', 'owned_battery_capacity_mwh', 'batt_power_c_rate', 'batt_eta_charge', 'batt_eta_discharge', 'flexible_load_share', 'max_shift_hours']);
+
 type Field = { key: string; label: string; unit: string; scale: number; step: number; min?: number; max?: number; hint: string };
 const ASSET_FIELDS: Field[] = [
   { key: 'owned_solar_capacity_mw', label: 'Solar PV', unit: 'kWp', scale: 1000, step: 1, min: 0, hint: 'Rooftop PV nameplate. ~171 kWp fits the reference roof.' },
@@ -45,14 +54,17 @@ const NEW_SCENARIO_OVERRIDES: Record<string, number> = {
   investment_freq: 12,
 };
 
-type Draft = { name: string; description: string; details: string; overrides: Record<string, unknown> };
-const newDraft = (): Draft => ({ name: 'My scenario', description: '', details: '', overrides: { ...NEW_SCENARIO_OVERRIDES } });
-const draftFrom = (s: Scenario): Draft => ({ name: s.name, description: s.description ?? '', details: s.details ?? '', overrides: { ...(s.config_overrides || {}) } });
+type Draft = { name: string; description: string; details: string; overrides: Record<string, unknown>; twinId: string | null };
+const newDraft = (): Draft => ({ name: 'My scenario', description: '', details: '', overrides: { ...NEW_SCENARIO_OVERRIDES }, twinId: null });
+const draftFrom = (s: Scenario): Draft => ({ name: s.name, description: s.description ?? '', details: s.details ?? '', overrides: { ...(s.config_overrides || {}) }, twinId: s.digital_twin_id ?? null });
+
+const savedDate = (t: SavedTwin) => new Date(t.updated_at || t.created_at).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
 
 type Notice = { tone: 'ok' | 'error'; text: string } | null;
 
-export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
+export function ScenarioList({ apiBase, onRun, onOpenTwin }: ScenarioListProps) {
   const [scenarios, setScenarios] = useState<Scenario[]>([]);
+  const [twins, setTwins] = useState<SavedTwin[]>([]);
   const [loading, setLoading] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [draft, setDraft] = useState<Draft>(newDraft);
@@ -64,7 +76,12 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      setScenarios(await apiFetch<Scenario[]>(apiBase, '/scenarios'));
+      const [sc, tw] = await Promise.all([
+        apiFetch<Scenario[]>(apiBase, '/scenarios'),
+        apiFetch<SavedTwin[]>(apiBase, '/digital-twins').catch(() => [] as SavedTwin[]),
+      ]);
+      setScenarios(sc);
+      setTwins([...tw].sort((a, b) => (b.updated_at || b.created_at).localeCompare(a.updated_at || a.created_at)));
     } catch (e) {
       setNotice({ tone: 'error', text: `Could not load scenarios: ${(e as Error).message}` });
     } finally {
@@ -96,6 +113,27 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
   const custom = scenarios.filter((s) => !paperIds.has(s.id));
   const selected = scenarios.find((s) => s.id === selectedId) ?? null;
   const readOnly = Boolean(selected && paperIds.has(selected.id));
+  // Asset sizes of a scenario linked to a twin come from the design (kept in sync by the backend)
+  const linked = Boolean(draft.twinId);
+  const twinById = useMemo(() => new Map(twins.map((t) => [t.id, t])), [twins]);
+  const draftTwin = draft.twinId ? twinById.get(draft.twinId) ?? null : null;
+
+  // Picking a twin shows its sizes right away; the backend derives the exact
+  // settings (battery power, efficiency, flexibility) when the scenario is saved
+  const chooseTwin = (id: string) => {
+    if (!id) { update({ twinId: null }); return; }
+    const t = twinById.get(id);
+    const sum = twinSummary(t);
+    const next: Record<string, unknown> = Object.fromEntries(Object.entries(draft.overrides).filter(([k]) => !TWIN_KEYS.has(k)));
+    Object.assign(next, {
+      owned_solar_capacity_mw: sum.pvKwp / 1000,
+      owned_wind_capacity_mw: sum.windKw / 1000,
+      owned_hydro_capacity_mw: 0,
+      owned_load_peak_mw: sum.loadKw / 1000,
+      ...(sum.batteryKwh > 0 ? { owned_battery_capacity_mwh: sum.batteryKwh / 1000 } : {}),
+    });
+    update({ twinId: id, overrides: next });
+  };
 
   const select = (s: Scenario | null) => {
     if (dirty && !confirm('Discard unsaved changes?')) return;
@@ -117,6 +155,8 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
     description: draft.description,
     details: draft.details,
     config_overrides: draft.overrides,
+    // "" unlinks on update; on create it means no twin
+    digital_twin_id: draft.twinId ?? '',
   });
 
   const saveNew = async () => {
@@ -190,6 +230,7 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
         <div className="scenario-card-top">
           <strong>{s.name}</strong>
           {isPaper && <span className="badge badge-accent">Paper</span>}
+          {s.digital_twin_id && <span className="badge badge-accent" title={`Linked to twin “${twinById.get(s.digital_twin_id)?.name ?? 'unknown'}”`}>Twin</span>}
         </div>
         {s.description && <p className="muted small clamp-2">{s.description}</p>}
         <div className="spec-chips">
@@ -226,7 +267,8 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
             min={f.min}
             max={f.max}
             value={value}
-            disabled={readOnly}
+            disabled={readOnly || (linked && TWIN_KEYS.has(f.key))}
+            title={linked && TWIN_KEYS.has(f.key) ? 'Set by the linked twin — change it in Twin Builder' : undefined}
             placeholder="not set"
             onChange={(e) => {
               const v = e.target.value;
@@ -279,6 +321,7 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
             <div>
               <h2>{selected ? (readOnly ? 'Reference scenario' : 'Edit scenario') : 'New scenario'}</h2>
               {readOnly && <p className="muted small">Read-only. Duplicate it to experiment with your own values.</p>}
+
             </div>
             <div className="row gap-xs wrap">
               {selected && (
@@ -291,6 +334,35 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
                 {readOnly ? 'Duplicate' : selected ? 'Save as new' : 'Create scenario'}
               </button>
             </div>
+          </div>
+
+          <div className="twin-link">
+            <label className="field">
+              <span className="field-label">Digital twin</span>
+              <select value={draft.twinId ?? ''} disabled={readOnly} onChange={(e) => chooseTwin(e.target.value)}>
+                <option value="">None — enter sizes below</option>
+                {draft.twinId && !draftTwin && <option value={draft.twinId}>Missing twin ({draft.twinId.slice(0, 8)})</option>}
+                {twins.map((t) => (
+                  <option key={t.id} value={t.id}>{t.name} — {formatTwinSummary(twinSummary(t))} · saved {savedDate(t)}</option>
+                ))}
+              </select>
+            </label>
+            {linked ? (
+              <div className="twin-link-info">
+                <p className="muted small">
+                  Sizes come from {draftTwin ? <b>{draftTwin.name}</b> : 'the linked twin'} and update whenever that twin is saved in Twin Builder.
+                  {dirty && ' Save the scenario to apply the link.'}
+                </p>
+                {draftTwin && onOpenTwin && (
+                  <button className="btn btn-secondary btn-sm" onClick={() => {
+                    if (dirty && !confirm('Leave without saving this scenario?')) return;
+                    onOpenTwin(draftTwin.id);
+                  }}>Open in Twin Builder</button>
+                )}
+              </div>
+            ) : (
+              <p className="muted small twin-link-info">Link a design from Twin Builder to take its sizes from there, or enter them by hand below.</p>
+            )}
           </div>
 
           <div className="form-grid">
@@ -320,7 +392,7 @@ export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
                 {unknownKeys.map((k) => (
                   <span key={k} className="spec-chip">
                     <code>{k}</code> = {String(draft.overrides[k])}
-                    {!readOnly && <button className="chip-remove" onClick={() => setOverride(k, null)} aria-label={`Remove ${k}`}>✕</button>}
+                    {!readOnly && !(linked && TWIN_KEYS.has(k)) && <button className="chip-remove" onClick={() => setOverride(k, null)} aria-label={`Remove ${k}`}>✕</button>}
                   </span>
                 ))}
               </div>

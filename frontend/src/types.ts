@@ -65,6 +65,8 @@ export interface ScenarioCreate {
   description?: string;
   details?: string;
   config_overrides: Record<string, unknown>;
+  /** Linked digital twin; "" means none (and unlinks on update) */
+  digital_twin_id?: string;
 }
 
 // PED

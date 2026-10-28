@@ -933,3 +933,25 @@ kbd { font-family: inherit; font-size: 0.72rem; background: var(--surface-2); bo
 
 .mobile-hint { display: none; }
 @media (max-width: 768px) { .mobile-hint { display: inline; } }
+
+/* Scenario ↔ digital twin link */
+.twin-link { display: grid; gap: 6px; padding: 12px; margin-bottom: 14px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); }
+.twin-link select { width: 100%; }
+.twin-link-info { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin: 0; }
+.twin-link-info p { margin: 0; flex: 1; min-width: 200px; }
+
+/* Builder: open saved twin dialog */
+.bn-dialog-backdrop { position: fixed; inset: 0; z-index: 70; background: rgba(3, 7, 18, 0.6); display: grid; place-items: center; padding: 16px; }
+.bn-dialog { width: min(640px, 100%); max-height: min(80vh, 720px); display: flex; flex-direction: column; gap: 8px; padding: 16px; background: var(--bg-elev); border: 1px solid var(--border-strong); border-radius: var(--radius); box-shadow: var(--shadow); }
+.bn-dialog h3 { margin: 0; font-size: 1rem; }
+.bn-dialog p { margin: 0; }
+.bn-twin-list { overflow-y: auto; display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.bn-twin-row { display: flex; gap: 10px; align-items: center; justify-content: space-between; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); }
+.bn-twin-row.is-current { border-color: var(--accent); }
+.bn-twin-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.bn-twin-main strong { display: flex; gap: 8px; align-items: center; }
+.bn-twin-actions { display: flex; gap: 4px; flex-shrink: 0; }
+@media (max-width: 600px) {
+  .bn-twin-row { flex-direction: column; align-items: stretch; }
+  .bn-twin-actions { justify-content: flex-end; }
+}
