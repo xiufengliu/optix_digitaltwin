@@ -41,7 +41,7 @@ export interface DigitalTwinConfig {
 }
 
 // Component definitions with default parameters
-const COMPONENT_DEFS: Record<DTComponentType, { 
+export const COMPONENT_DEFS: Record<DTComponentType, { 
   label: string; 
   icon: string; 
   color: string;
@@ -575,18 +575,19 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
       if (c.type === 'wind_turbine') { windKw += Number(c.params.capacity_kw || 0); genKw += Number(c.params.capacity_kw || 0); }
       if (c.type === 'chp_unit') { chpKw += Number(c.params.electrical_kw || 0); genKw += Number(c.params.electrical_kw || 0); }
       if (c.type === 'smart_building') loadKw += Number(c.params.load_kw || 0);
-      if (c.type === 'load_center') loadKw += Number(c.params.base_load_kw || 0);
+      if (c.type === 'load_center') loadKw += Number(c.params.peak_load_kw || c.params.base_load_kw || 0);
       if (c.type === 'ev_charger') evChargerKw += Number(c.params.num_ports || 0) * Number(c.params.power_per_port_kw || 0);
       if (c.type === 'heat_pump') heatPumpKw += Number(c.params.capacity_kw || 0);
       if (c.type === 'battery_storage') { batteryKwh += Number(c.params.capacity_kwh || 0); storageKwh += Number(c.params.capacity_kwh || 0); }
       if (c.type === 'thermal_storage') thermalStorageKwh += Number(c.params.capacity_kwh || 0);
     });
 
-    // Annual estimates (Denmark typical values)
-    const solarCF = 0.11; // ~1000 kWh/kWp/year in Denmark
-    const windCF = 0.25;  // ~2200 kWh/kW/year
-    const chpCF = 0.6;    // 60% capacity factor
-    const loadFactor = 0.35; // Office building load factor
+    // Annual estimates from the simulation dataset (Energinet DK2, 2015-2024 averages),
+    // so this quick estimate matches what a simulation run reports
+    const solarCF = 0.1163; // 1019 kWh/kWp/year
+    const windCF = 0.255;   // onshore wind, 2235 kWh/kW/year
+    const chpCF = 0.6;      // not simulated; rough 60% capacity factor
+    const loadFactor = 0.60; // DK2 demand profile: mean / peak
     
     const annualGenMwh = (solarKwp * solarCF + windKw * windCF + chpKw * chpCF) * 8.76; // 8760h/1000
     const annualLoadMwh = loadKw * loadFactor * 8.76;
@@ -1061,6 +1062,11 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
       name: def.label,
       ...(() => {
         const rect = canvasRef.current!.getBoundingClientRect();
+        // The canvas is hidden (0x0) while the Components tab is open, so place next to the last node instead
+        if (!rect.width || !rect.height) {
+          const last = components[components.length - 1];
+          return last ? { x: snap(last.x + 40), y: snap(last.y + CARD_H + 40) } : { x: 200, y: 200 };
+        }
         const c = toCanvasCoords(rect.left + rect.width / 2, rect.top + rect.height / 2);
         return { x: snap(c.x - NODE_ANCHOR + (Math.random() - 0.5) * 120), y: snap(c.y - NODE_ANCHOR + (Math.random() - 0.5) * 80) };
       })(),
@@ -1068,6 +1074,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     };
     setComponents(prev => [...prev, newComp]);
     setMobilePanel('canvas');
+    setFitNonce(n => n + 1);
   };
 
   const duplicateComponent = (id: string) => {
@@ -1426,7 +1433,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
                   <DeviceIcon type="battery_storage" size={30} color="#2fc59b" />
                 </div>
                 <h3>Design your energy district</h3>
-                <p className="muted small">Drag components from the left onto the canvas, then link them with the <b>+</b> port.</p>
+                <p className="muted small">Drag components from the left onto the canvas, then link them with the <b>+</b> port.<span className="mobile-hint"> On a phone, open the <b>Components</b> tab and tap one to add it.</span></p>
                 <button className="btn btn-primary btn-sm" onClick={() => setTemplatesOpen(true)}>Start from a template</button>
               </div>
             )}

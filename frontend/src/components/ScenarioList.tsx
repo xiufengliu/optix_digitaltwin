@@ -22,12 +22,12 @@ const PAPER_SCENARIO_NAMES = [
 type Field = { key: string; label: string; unit: string; scale: number; step: number; min?: number; max?: number; hint: string };
 const ASSET_FIELDS: Field[] = [
   { key: 'owned_solar_capacity_mw', label: 'Solar PV', unit: 'kWp', scale: 1000, step: 1, min: 0, hint: 'Rooftop PV nameplate. ~171 kWp fits the reference roof.' },
-  { key: 'owned_wind_capacity_mw', label: 'Wind', unit: 'kW', scale: 1000, step: 1, min: 0, hint: 'On-site wind capacity.' },
-  { key: 'owned_hydro_capacity_mw', label: 'Hydro', unit: 'kW', scale: 1000, step: 1, min: 0, hint: 'On-site hydro capacity.' },
-  { key: 'owned_load_peak_mw', label: 'Peak electric load', unit: 'kW', scale: 1000, step: 1, min: 0, hint: 'The demand profile is scaled to this peak.' },
+  { key: 'owned_wind_capacity_mw', label: 'Wind', unit: 'kW', scale: 1000, step: 1, min: 0, hint: 'On-site wind; uses the DK2 onshore wind profile (≈ 2,200 kWh per kW per year).' },
+  { key: 'owned_hydro_capacity_mw', label: 'Hydro', unit: 'kW', scale: 1000, step: 1, min: 0, hint: 'DK2 has no hydro production data, so this adds no energy.' },
+  { key: 'owned_load_peak_mw', label: 'Peak electric load', unit: 'kW', scale: 1000, step: 1, min: 0, hint: 'The DK2 demand profile is scaled to this peak.' },
 ];
 const STORAGE_FIELDS: Field[] = [
-  { key: 'owned_battery_capacity_mwh', label: 'Battery energy', unit: 'kWh', scale: 1000, step: 1, min: 0, hint: 'Usable storage capacity.' },
+  { key: 'owned_battery_capacity_mwh', label: 'Battery energy', unit: 'kWh', scale: 1000, step: 1, min: 0, hint: 'Nominal capacity; 15–85 % is usable, 90 % round trip (as in the paper).' },
   { key: 'batt_power_c_rate', label: 'Battery C-rate', unit: '1/h', scale: 1, step: 0.05, min: 0.05, max: 4, hint: '0.25 = 4-hour battery (power = energy × C-rate).' },
   { key: 'flexible_load_share', label: 'Flexible load share', unit: '%', scale: 100, step: 1, min: 0, max: 100, hint: 'Share of demand that DSM may shift.' },
   { key: 'max_shift_hours', label: 'Max shift window', unit: 'h', scale: 1, step: 0.5, min: 0, hint: 'How far DSM may move demand in time.' },

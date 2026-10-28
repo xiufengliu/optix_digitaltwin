@@ -281,6 +281,10 @@ export default function App() {
   const genNow = (obs.solar ?? 0) + (obs.wind ?? 0) + (obs.hydro ?? 0);
   const netNow = genNow - (obs.load ?? 0);
   const controlsDisabled = !live || done || stepping || playing;
+  const twinLive = useMemo(
+    () => (live && state ? { timestamp: obs.timestamp, solarMw: obs.solar, windMw: obs.wind, hydroMw: obs.hydro, loadMw: obs.load } : null),
+    [live, state, obs.timestamp, obs.solar, obs.wind, obs.hydro, obs.load],
+  );
 
   return (
     <div className="app">
@@ -369,6 +373,8 @@ export default function App() {
                         {busyRunId === selectedRun.id ? 'Starting…' : 'Restart run'}
                       </button>
                     </div>
+                  ) : !state ? (
+                    <div className="row gap-sm muted small"><span className="spinner" aria-hidden /> Connecting to the simulation…</div>
                   ) : (
                     <>
                       <div className="progress" role="progressbar" aria-valuemin={0} aria-valuemax={totalSteps} aria-valuenow={timestep}>
@@ -400,15 +406,16 @@ export default function App() {
                 </section>
 
                 <section className="kpis">
-                  <Kpi label="Generation now" value={live ? formatPower(genNow) : '—'} color="var(--c-gen)" />
-                  <Kpi label="Load now" value={live ? formatPower(obs.load) : '—'} color="var(--c-load)" />
-                  <Kpi label={netNow >= 0 ? 'Exporting' : 'Importing'} value={live ? formatPower(Math.abs(netNow)) : '—'} color={netNow >= 0 ? 'var(--c-export)' : 'var(--c-grid)'} />
-                  <Kpi label="Spot price" value={live && obs.price != null ? `${obs.price.toFixed(0)} DKK/MWh` : '—'} color="var(--c-price)" />
+                  <Kpi label="Generation now" value={live ? formatPower(genNow) : '—'} color="var(--c-gen)" hint="solar + wind on site" />
+                  <Kpi label="Load now" value={live ? formatPower(obs.load) : '—'} color="var(--c-load)" hint="district consumption" />
+                  <Kpi label={netNow >= 0 ? 'Exporting' : 'Importing'} value={live ? formatPower(Math.abs(netNow)) : '—'} color={netNow >= 0 ? 'var(--c-export)' : 'var(--c-grid)'} hint={netNow >= 0 ? 'surplus sold to the grid' : 'shortfall bought from the grid'} />
+                  <Kpi label="Spot price" value={live && obs.price != null ? `${obs.price.toFixed(0)} DKK/MWh` : '—'} color="var(--c-price)" hint="electricity market price" />
                   <Kpi
                     label="PED ratio (so far)"
                     value={analytics.ped ? analytics.ped.ped_ratio.toFixed(2) : '—'}
                     tone={analytics.ped ? (analytics.ped.ped_ratio >= 1 ? 'good' : 'bad') : undefined}
                     color="var(--accent)"
+                    hint="generation ÷ use · 1.0+ = positive district"
                   />
                   <Kpi
                     label="Net grid value"
@@ -447,7 +454,7 @@ export default function App() {
                   <div className="workspace-body">
                     {workspace === 'twin' && (
                       <div className="viewer">
-                        <DigitalTwin3DView config={runTwin} animate={!reduceMotion} />
+                        <DigitalTwin3DView config={runTwin} animate={!reduceMotion} live={twinLive} />
                         {!runTwin && <div className="viewer-empty muted">Loading twin…</div>}
                       </div>
                     )}

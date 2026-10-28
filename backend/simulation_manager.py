@@ -366,16 +366,13 @@ class _MinimalEnv:
         self.config_overrides = dict(config_overrides or {})
         self.agents = ["manager"]
         n = len(data)
-        raw_wind = (data["wind"].to_numpy(dtype=float) if "wind" in data.columns else np.zeros(n))
-        raw_solar = (data["solar"].to_numpy(dtype=float) if "solar" in data.columns else np.zeros(n))
-        raw_hydro = (data["hydro"].to_numpy(dtype=float) if "hydro" in data.columns else np.zeros(n))
-        raw_load = (data["load"].to_numpy(dtype=float) if "load" in data.columns else np.zeros(n))
+        from .profiles import scale_profiles
 
-        self._wind = raw_wind
-        self._solar = raw_solar
-        self._hydro = raw_hydro
-        self._load = raw_load
-        self._apply_config_overrides(raw_wind, raw_solar, raw_hydro, raw_load)
+        profiles = scale_profiles(data, self.config_overrides)
+        self._wind = profiles["wind"]
+        self._solar = profiles["solar"]
+        self._hydro = profiles["hydro"]
+        self._load = profiles["load"]
         self._price = (data["price"].to_numpy() if "price" in data.columns else np.zeros(n))
         # Shared (uncopied) column; formatted lazily per observation
         self._timestamps = data["timestamp"] if "timestamp" in data.columns else None
@@ -387,6 +384,19 @@ class _MinimalEnv:
                     self.dt_hours = float(delta)
         except Exception:
             pass
+        # Grid exchange per step from the same merit-order dispatch the
+        # /optimize endpoint reports, so the live grid value includes battery
+        # and DSM. Dispatch is causal (DSM looks ahead only within its shift
+        # window), so precomputing the whole horizon equals stepping it.
+        from .optimizer import MeritOrderOptimizer, build_config_from_overrides
+
+        dispatch = MeritOrderOptimizer(build_config_from_overrides(self.config_overrides, self.dt_hours)).run(
+            pv_mw=np.asarray(self._solar + self._wind + self._hydro, dtype=float),
+            load_mw=np.asarray(self._load, dtype=float),
+        )
+        # Grid-side energy: what is actually sold and bought (after transformer/export losses)
+        self._grid_net_mwh = dispatch["series_mwh"]["export_delivered_mwh"] - dispatch["series_mwh"]["grid_purchase_mwh"]
+
         self.t = 0
         self.equity = None
         self.budget = None
@@ -406,12 +416,10 @@ class _MinimalEnv:
 
     def step(self, actions):
         idx = self.t
-        pv = float(self._solar[idx] + self._wind[idx] + self._hydro[idx]) if idx < len(self._load) else 0.0
-        load = float(self._load[idx]) if idx < len(self._load) else 0.0
+        net_mwh = float(self._grid_net_mwh[idx]) if idx < len(self._grid_net_mwh) else 0.0
         price = float(self._price[idx]) if idx < len(self._price) else 0.0
-        net = pv - load
-        # MW × DKK/MWh × h → DKK for this step (positive = export value, negative = import cost)
-        self.last_revenue = net * price * self.dt_hours
+        # MWh × DKK/MWh → DKK for this step (positive = export value, negative = import cost)
+        self.last_revenue = net_mwh * price
         self.cumulative_revenue += self.last_revenue
 
         self.t = min(idx + 1, len(self._load))
@@ -437,39 +445,3 @@ class _MinimalEnv:
 
     def close(self):
         return None
-
-    def _apply_config_overrides(self, raw_wind, raw_solar, raw_hydro, raw_load) -> None:
-        overrides = self.config_overrides
-        if not overrides:
-            return
-
-        def as_float(key: str) -> Optional[float]:
-            value = overrides.get(key)
-            if value is None:
-                return None
-            try:
-                return float(value)
-            except Exception:
-                return None
-
-        def scale_to_peak(raw: np.ndarray, target_peak_mw: Optional[float]) -> np.ndarray:
-            if target_peak_mw is None:
-                return raw.astype(float, copy=True)
-            peak = float(np.max(raw)) if raw.size else 0.0
-            if peak <= 1e-9 or target_peak_mw <= 0:
-                return np.zeros_like(raw, dtype=float)
-            return (raw.astype(float) / peak) * float(target_peak_mw)
-
-        local_keys = ("owned_solar_capacity_mw", "owned_wind_capacity_mw", "owned_hydro_capacity_mw", "owned_load_peak_mw")
-        if not any(key in overrides for key in local_keys):
-            return
-
-        # Local-asset mode: unspecified generators are absent (0 MW), matching
-        # routes._extract_metric_series so live values and PED metrics agree.
-        self._wind = scale_to_peak(raw_wind, as_float("owned_wind_capacity_mw") or 0.0)
-        self._solar = scale_to_peak(raw_solar, as_float("owned_solar_capacity_mw") or 0.0)
-        self._hydro = scale_to_peak(raw_hydro, as_float("owned_hydro_capacity_mw") or 0.0)
-
-        load_peak = as_float("owned_load_peak_mw")
-        if load_peak is not None:
-            self._load = scale_to_peak(raw_load, load_peak)

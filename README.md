@@ -70,6 +70,15 @@ Place a CSV named `trainingdata.csv` in the repo root (or provide an absolute pa
 
 If the values look like capacity factors (0..1), the loader converts them to MW using default capacities; otherwise it assumes they are already in MW.
 
+The bundled `trainingdata.csv` is real Energinet data for price area DK2 (eastern Denmark), 2015–2024, with hourly values held over 10-minute steps and timestamps in Danish standard time (CET, no daylight saving). Besides the regional MW columns it has `solar_cf` / `wind_cf` / `hydro_cf` (output per MW installed, from the DK2 capacity register; wind is onshore), which `backend/profiles.py` multiplies by a design's PV kWp and wind kW. Rebuild it with:
+
+```
+python scripts/fetch_dk2_data.py RAW_DIR
+python scripts/build_dk2_dataset.py RAW_DIR trainingdata.csv
+```
+
+The earlier synthetic dataset is kept as `trainingdata_synthetic_backup.csv` (not used).
+
 4) Create a run
 
 - From the UI: Go to the Scenarios tab, create or pick a scenario, then click “Run”.

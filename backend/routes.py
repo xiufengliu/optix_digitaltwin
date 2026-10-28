@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import List
 from uuid import uuid4
 
@@ -115,30 +116,6 @@ def _resolve_run_overrides(db, run: SimulationRun) -> dict:
     return {}
 
 
-def _as_float(overrides: dict | None, key: str) -> float | None:
-    if not overrides:
-        return None
-    value = overrides.get(key)
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except Exception:
-        return None
-
-
-def _scale_series_to_peak(series, target_peak_mw: float | None):
-    import numpy as np
-
-    raw = np.asarray(series, dtype=float)
-    if target_peak_mw is None:
-        return raw.copy()
-    peak = float(np.max(raw)) if raw.size else 0.0
-    if peak <= 1e-9 or target_peak_mw <= 0:
-        return np.zeros_like(raw, dtype=float)
-    return (raw / peak) * float(target_peak_mw)
-
-
 def _infer_step_hours(env, upto_steps: int | None = None) -> float:
     dt_hours = 1.0 / 6.0
     try:
@@ -171,27 +148,11 @@ def _extract_metric_series(env, overrides: dict | None = None, upto_steps: int |
     else:
         upto = max(1, min(int(upto_steps), available_steps))
 
-    local_mode = bool(overrides) and any(
-        key in overrides
-        for key in (
-            "owned_solar_capacity_mw",
-            "owned_wind_capacity_mw",
-            "owned_hydro_capacity_mw",
-            "owned_load_peak_mw",
-        )
-    )
+    # The env scaled the dataset to the run's design when the session was
+    # created (backend.profiles), so its arrays are the run's MW profiles.
+    import numpy as np
 
-    if local_mode:
-        wind_series = _scale_series_to_peak(wind, _as_float(overrides, "owned_wind_capacity_mw") or 0.0)
-        solar_series = _scale_series_to_peak(solar, _as_float(overrides, "owned_solar_capacity_mw") or 0.0)
-        hydro_series = _scale_series_to_peak(hydro, _as_float(overrides, "owned_hydro_capacity_mw") or 0.0)
-        load_peak = _as_float(overrides, "owned_load_peak_mw")
-        load_series = _scale_series_to_peak(load, load_peak) if load_peak is not None else _scale_series_to_peak(load, None)
-    else:
-        wind_series = _scale_series_to_peak(wind, None)
-        solar_series = _scale_series_to_peak(solar, None)
-        hydro_series = _scale_series_to_peak(hydro, None)
-        load_series = _scale_series_to_peak(load, None)
+    wind_series, solar_series, hydro_series, load_series = (np.asarray(x, dtype=float) for x in (wind, solar, hydro, load))
 
     return {
         "available_steps": available_steps,
@@ -1019,42 +980,88 @@ async def analyze_digital_twin_ped(dt_id: str) -> dict:
             elif ctype == 'district_heating':
                 heat_kw += float(params.get('capacity_kw', 0))
 
-        ratio = gen_kw / load_kw if load_kw > 0 else 0
-        is_ped = ratio >= 1.0
+        # PED is an annual *energy* balance. Convert capacities with the dataset's
+        # full-load hours (the same peak scaling simulation runs use).
+        flh = _dataset_full_load_hours()
+        sim_gen_kw = sum(
+            float((c.get('params') or {}).get(key, 0) or 0)
+            for c in components
+            for t, key in (('solar_pv', 'capacity_kwp'), ('wind_turbine', 'capacity_kw'))
+            if c.get('type') == t
+        )
+        pv_kw = sum(float((c.get('params') or {}).get('capacity_kwp', 0) or 0) for c in components if c.get('type') == 'solar_pv')
+        wind_kw = sim_gen_kw - pv_kw
+        peak_load_kw = _dt_to_config_overrides(components, []).get('owned_load_peak_mw', 0.0) * 1000
+        gen_mwh = (pv_kw * flh['solar'] + wind_kw * flh['wind']) / 1000
+        load_mwh = peak_load_kw * flh['load'] / 1000
+        ratio = gen_mwh / load_mwh if load_mwh > 0 else 0
+        is_ped = load_mwh > 0 and ratio >= 1.0
 
         return {
             'generation_kw': gen_kw,
             'load_kw': load_kw,
             'storage_kwh': storage_kwh,
             'heat_capacity_kw': heat_kw,
+            'annual_generation_mwh': gen_mwh,
+            'annual_demand_mwh': load_mwh,
             'ped_ratio': ratio,
             'is_ped_achievable': is_ped,
-            'recommendations': _get_ped_recommendations(gen_kw, load_kw, storage_kwh, ratio),
+            'recommendations': _get_ped_recommendations(gen_mwh, load_mwh, storage_kwh, peak_load_kw, flh['solar']),
         }
 
 
+def _dataset_full_load_hours() -> dict:
+    """Average annual full-load hours of 1 MW solar / wind / peak load in the dataset."""
+    from .profiles import full_load_hours
+
+    manager = SimulationManager.get_global()
+    df = manager._load_data(manager.settings.resolve(Path.cwd()).data_path)
+    step_h = (df['timestamp'].iloc[1] - df['timestamp'].iloc[0]).total_seconds() / 3600 if len(df) > 1 else 1 / 6
+    return full_load_hours(df, step_h)
+
+
 def _dt_to_config_overrides(components: list, connections: list) -> dict:
-    """Convert digital twin components to simulation config overrides."""
+    """Convert digital twin components to simulation config overrides.
+
+    The simulation scales one demand profile to ``owned_load_peak_mw``, so loads
+    contribute their *peak* demand. EV chargers, heat pumps and CHP have no
+    profile in the dataset and are not simulated.
+    """
+    def num(params: dict, key: str, default: float = 0.0) -> float:
+        try:
+            v = float(params.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return v if v == v else default  # NaN guard
+
     overrides = {}
     total_pv = 0.0
     total_wind = 0.0
     total_battery = 0.0
+    total_battery_power = 0.0
+    battery_eta_weighted = 0.0
     total_load = 0.0
+    flexible_load = 0.0
 
     for c in components:
         ctype = c.get('type', '')
-        params = c.get('params', {})
+        params = c.get('params', {}) or {}
 
         if ctype == 'solar_pv':
-            total_pv += float(params.get('capacity_kwp', 0)) / 1000  # kW to MW
+            total_pv += num(params, 'capacity_kwp') / 1000  # kW to MW
         elif ctype == 'wind_turbine':
-            total_wind += float(params.get('capacity_kw', 0)) / 1000
+            total_wind += num(params, 'capacity_kw') / 1000
         elif ctype == 'battery_storage':
-            total_battery += float(params.get('capacity_kwh', 0)) / 1000  # kWh to MWh
+            kwh = num(params, 'capacity_kwh')
+            total_battery += kwh / 1000  # kWh to MWh
+            total_battery_power += num(params, 'power_kw', kwh * 0.25) / 1000
+            battery_eta_weighted += kwh * min(1.0, max(0.5, num(params, 'efficiency', 0.9)))
         elif ctype == 'smart_building':
-            total_load += float(params.get('load_kw', 0)) / 1000
+            kw = num(params, 'load_kw') / 1000
+            total_load += kw
+            flexible_load += kw * min(100.0, max(0.0, num(params, 'flexible_load_pct'))) / 100
         elif ctype == 'load_center':
-            total_load += float(params.get('base_load_kw', 0)) / 1000
+            total_load += num(params, 'peak_load_kw', num(params, 'base_load_kw')) / 1000
 
     if total_pv > 0:
         overrides['owned_solar_capacity_mw'] = total_pv
@@ -1062,22 +1069,32 @@ def _dt_to_config_overrides(components: list, connections: list) -> dict:
         overrides['owned_wind_capacity_mw'] = total_wind
     if total_battery > 0:
         overrides['owned_battery_capacity_mwh'] = total_battery
+        if total_battery_power > 0:
+            overrides['batt_power_c_rate'] = total_battery_power / total_battery
+        # Component efficiency is round-trip; split evenly between charge and discharge
+        eta_rt = battery_eta_weighted / (total_battery * 1000)
+        overrides['batt_eta_charge'] = overrides['batt_eta_discharge'] = eta_rt ** 0.5
     if total_load > 0:
         overrides['owned_load_peak_mw'] = total_load
+        if flexible_load > 0:
+            overrides['flexible_load_share'] = flexible_load / total_load
+            overrides['max_shift_hours'] = 3.0
 
     return overrides
 
 
-def _get_ped_recommendations(gen_kw: float, load_kw: float, storage_kwh: float, ratio: float) -> list:
-    """Generate recommendations to achieve PED status."""
+def _get_ped_recommendations(gen_mwh: float, load_mwh: float, storage_kwh: float, peak_load_kw: float, pv_flh: float) -> list:
+    """Generate recommendations to achieve PED status (annual energy balance)."""
     recs = []
-    if ratio < 1.0:
-        deficit = load_kw - gen_kw
-        recs.append(f"Add {deficit:.0f} kW of generation capacity to achieve PED")
-        if storage_kwh < load_kw * 4:
-            recs.append(f"Consider adding {(load_kw * 4 - storage_kwh):.0f} kWh storage for 4h autonomy")
+    if load_mwh <= 0:
+        return ["Add a building or load centre to evaluate the energy balance"]
+    if gen_mwh < load_mwh:
+        deficit_mwh = load_mwh - gen_mwh
+        recs.append(f"Add about {deficit_mwh * 1000 / max(pv_flh, 1e-9):.0f} kWp of PV ({deficit_mwh:.0f} MWh/year) to reach a positive annual balance")
+        if storage_kwh < peak_load_kw * 4:
+            recs.append(f"Consider adding {(peak_load_kw * 4 - storage_kwh):.0f} kWh storage for 4h autonomy at peak load")
     else:
         recs.append("PED target achievable with current configuration")
-        if storage_kwh < gen_kw * 2:
+        if storage_kwh < peak_load_kw * 2:
             recs.append("Consider more storage to maximize self-consumption")
     return recs

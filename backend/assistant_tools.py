@@ -19,6 +19,7 @@ from . import routes
 from .db import session_scope
 from .models import Scenario, SimulationRun
 from .optimizer import MeritOrderConfig, MeritOrderOptimizer, build_config_from_overrides
+from .profiles import scale_profiles
 from .schemas import RunCompareRequest, ScenarioCreate, SimulationStepRequest
 from .simulation_manager import SimulationManager
 
@@ -107,7 +108,7 @@ def _dataset_info(df: pd.DataFrame) -> dict:
         "end": str(ts.iloc[-1]),
         "step_minutes": step_min,
         "rows": int(len(df)),
-        "source": "Danish (DK2) wind/solar/hydro/load profiles with spot prices in DKK/MWh",
+        "source": "Energinet DK2 (eastern Denmark) 2015-2024: solar and onshore-wind capacity factors, gross demand and day-ahead spot prices in DKK/MWh; hourly values held over 10-minute steps; times in CET (no DST)",
     }
 
 
@@ -118,7 +119,7 @@ def _dataset_info(df: pd.DataFrame) -> dict:
 class DesignInput(_Input):
     pv_kwp: float = Field(171.0, ge=0, le=100000, description="Rooftop/on-site PV nameplate in kWp")
     wind_kw: float = Field(0.0, ge=0, le=100000, description="On-site wind capacity in kW")
-    battery_kwh: float = Field(0.0, ge=0, le=500000, description="Usable battery energy in kWh")
+    battery_kwh: float = Field(0.0, ge=0, le=500000, description="Nominal battery energy in kWh (15-85 % state-of-charge window is usable, as in the paper)")
     battery_c_rate: float = Field(0.25, gt=0, le=4, description="Battery power = energy x C-rate (0.25 = 4-hour battery)")
     load_peak_kw: float = Field(150.0, gt=0, le=100000, description="Peak electric demand in kW; the demand profile is scaled to it")
     flexible_load_share: float = Field(0.0, ge=0, le=1, description="Share of demand that demand-side management may shift (0-1)")
@@ -136,14 +137,14 @@ def _evaluate(design: DesignInput, df: pd.DataFrame, monthly: bool) -> dict:
         raise ValueError(f"No data between {start.date()} and {end.date()}; dataset covers {ts.iloc[0].date()} to {ts.iloc[-1].date()}")
     dt_h = (ts.iloc[1] - ts.iloc[0]).total_seconds() / 3600.0
 
-    # Scale by the full-dataset peak, exactly like simulation runs do
-    def profile(col: str, target_mw: float) -> np.ndarray:
-        raw = df[col].to_numpy(dtype=float)
-        peak = float(raw.max()) or 1.0
-        return raw[i0:i1] / peak * target_mw
-
-    gen_mw = profile("solar", design.pv_kwp / 1000) + profile("wind", design.wind_kw / 1000)
-    load_mw = profile("load", design.load_peak_kw / 1000)
+    # Same scaling as simulation runs (backend.profiles), then the window
+    prof = scale_profiles(df, {
+        "owned_solar_capacity_mw": design.pv_kwp / 1000,
+        "owned_wind_capacity_mw": design.wind_kw / 1000,
+        "owned_load_peak_mw": design.load_peak_kw / 1000,
+    })
+    gen_mw = prof["solar"][i0:i1] + prof["wind"][i0:i1]
+    load_mw = prof["load"][i0:i1]
     price = df["price"].to_numpy(dtype=float)[i0:i1]
 
     cfg = MeritOrderConfig(
@@ -156,9 +157,10 @@ def _evaluate(design: DesignInput, df: pd.DataFrame, monthly: bool) -> dict:
     out = MeritOrderOptimizer(cfg).run(pv_mw=gen_mw, load_mw=load_mw)
     k, s = out["kpis"], out["series_mwh"]
 
-    import_cost = float(np.sum(s["grid_import_mwh"] * price))
-    export_value = float(np.sum(s["pv_export_mwh"] * price))
-    no_asset_cost = float(np.sum(load_mw * dt_h * price))
+    # Grid-side energy (after transformer/export losses) is what is bought and sold
+    import_cost = float(np.sum(s["grid_purchase_mwh"] * price))
+    export_value = float(np.sum(s["export_delivered_mwh"] * price))
+    no_asset_cost = float(np.sum(load_mw * dt_h / cfg.eta_transformer * price))
     result = {
         "period": {"start": str(ts.iloc[i0]), "end": str(ts.iloc[i1 - 1]), "days": _r((i1 - i0) * dt_h / 24, 1)},
         "design": design.model_dump(exclude={"start_date", "days"}),
@@ -168,13 +170,15 @@ def _evaluate(design: DesignInput, df: pd.DataFrame, monthly: bool) -> dict:
             "balance": _r(k["ped_absolute_mwh"]),
             "grid_import": _r(k["grid_import_mwh"]),
             "export": _r(k["export_mwh"]),
+            "grid_losses": _r(k["grid_losses_mwh"]),
+            "battery_losses": _r(k["battery_losses_mwh"]),
             "battery_throughput": _r(k["battery_throughput_mwh"]),
         },
         "ped_ratio": _r(k["ped_ratio"], 3),
         "is_ped": bool(k["ped_ratio"] >= 1.0),
         "self_sufficiency": _r(k.get("self_sufficiency_ratio"), 3),
         "self_consumption": _r(k.get("self_consumption_ratio"), 3),
-        "peak_grid_import_kw": _r(float(np.max(s["grid_import_mwh"])) / dt_h * 1000, 1),
+        "peak_grid_import_kw": _r(float(np.max(s["grid_purchase_mwh"])) / dt_h * 1000, 1),
         "cost_dkk": {
             "grid_import_cost": _r(import_cost, 0),
             "export_value": _r(export_value, 0),
@@ -318,6 +322,8 @@ async def get_run_details(inp: RunInput) -> dict:
                 "balance": _r(ped["ped_absolute_mwh"]),
                 "grid_import": _r(k["grid_import_mwh"]),
                 "export": _r(k["export_mwh"]),
+            "grid_losses": _r(k["grid_losses_mwh"]),
+            "battery_losses": _r(k["battery_losses_mwh"]),
             },
             "ped_ratio": _r(ped["ped_ratio"], 3),
             "self_sufficiency": _r(k.get("self_sufficiency_ratio"), 3),
