@@ -204,6 +204,31 @@ def _extract_metric_series(env, overrides: dict | None = None, upto_steps: int |
     }
 
 
+def _window_bounds(t: int, limit: int) -> tuple[int, int]:
+    upto = max(1, int(t))
+    start = max(0, upto - int(max(1, min(limit, 600000))))
+    return start, upto
+
+
+def _downsample(values, start: int, end: int, max_points: int | None):
+    """Slice [start:end] and average into at most ``max_points`` buckets.
+
+    Returns (bucket_start_indices, values). Bucketing is anchored at ``start``
+    so every series windowed with the same bounds stays aligned.
+    """
+    import numpy as np
+
+    arr = np.asarray(values, dtype=float)[start:end]
+    n = len(arr)
+    if not max_points or max_points <= 0 or n <= max_points:
+        return list(range(start, end)), arr.tolist()
+    bucket = int(np.ceil(n / max_points))
+    pad = (-n) % bucket
+    padded = np.concatenate([arr, np.full(pad, np.nan)]) if pad else arr
+    means = np.nanmean(padded.reshape(-1, bucket), axis=1)
+    return list(range(start, end, bucket)), means.tolist()
+
+
 def _compute_ped_metrics(env, overrides: dict | None = None, upto_steps: int | None = None) -> dict:
     """Compute cumulative PED metrics from scenario-aware local series."""
     import numpy as np
@@ -297,6 +322,48 @@ async def delete_run(run_id: str) -> dict:
         except Exception:
             pass
     return {"status": "deleted", "id": run_id}
+
+
+@router.post("/runs/{run_id}/restart", response_model=SimulationRunRead, tags=["runs"])
+async def restart_run(run_id: str) -> SimulationRunRead:
+    """Start a fresh session (t=0) for a run, reusing its stored configuration.
+
+    Sessions live in memory, so every backend restart leaves existing runs
+    without one; this makes them usable again instead of dead entries.
+    """
+    manager = SimulationManager.get_global()
+    with session_scope() as db:
+        run = _get_run_or_404(db, run_id)
+        overrides = _resolve_run_overrides(db, run)
+        old_session_id = run.session_id
+        stored = run.config or {}
+
+    if old_session_id:
+        manager.close_session(old_session_id)
+
+    from pathlib import Path
+    from .simulation_manager import SimulationSettings
+
+    defaults = manager.settings
+    settings = SimulationSettings(
+        data_path=Path(stored.get("data_path") or defaults.data_path),
+        investment_freq=int(stored.get("investment_freq") or defaults.investment_freq),
+        enable_forecasts=bool(stored.get("enable_forecasts", False)),
+        model_dir=Path(stored.get("model_dir") or defaults.model_dir),
+        scaler_dir=Path(stored.get("scaler_dir") or defaults.scaler_dir),
+    )
+    try:
+        sim_session = manager.create_session(settings, config_overrides=overrides or None)
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    with session_scope() as db:
+        run = _get_run_or_404(db, run_id)
+        run.session_id = sim_session.session_id
+        run.status = SimulationStatus.RUNNING
+        db.add(run)
+        db.flush(); db.refresh(run)
+        return SimulationRunRead.model_validate(_run_to_read_dict(run))
 
 
 @router.get("/runs/{run_id}/state", response_model=SimulationState, tags=["runs"])
@@ -463,7 +530,9 @@ async def compare_runs(payload: RunCompareRequest) -> RunCompareResponse:
 
     common_period_hours = None
     if payload.use_common_horizon and common_steps is not None:
-        common_period_hours = common_steps * (10.0 / 60.0)
+        any_env = next(iter(session_envs.values()), None)
+        step_hours = _infer_step_hours(any_env[0], common_steps) if any_env else 1.0 / 6.0
+        common_period_hours = common_steps * step_hours
 
     return RunCompareResponse(
         common_steps=common_steps if payload.use_common_horizon else None,
@@ -473,10 +542,12 @@ async def compare_runs(payload: RunCompareRequest) -> RunCompareResponse:
 
 
 @router.get("/runs/{run_id}/energy_series", tags=["runs"])
-async def get_energy_series(run_id: str, limit: int = 2000) -> dict:
-    """Return generation and load series up to the current step.
+async def get_energy_series(run_id: str, limit: int = 2000, max_points: int = 0) -> dict:
+    """Return generation and load series for the last ``limit`` steps.
 
     Values are in MW per step; include optional timestamps if present in env.data.
+    With ``max_points`` > 0 the window is bucket-averaged to at most that many
+    points (``/optimize`` accepts the same parameters and stays aligned).
     """
     manager = SimulationManager.get_global()
     with session_scope() as db:
@@ -493,56 +564,61 @@ async def get_energy_series(run_id: str, limit: int = 2000) -> dict:
 
     env = session.wrapper or session.env
     try:
-        t = int(getattr(env, 't', 0))
-        upto = max(1, t)
-        start = max(0, upto - int(max(1, min(limit, 50000))))
-        series = _extract_metric_series(env, overrides=scenario_overrides, upto_steps=upto)
-        wind = series['wind_mw'][start:upto]
-        solar = series['solar_mw'][start:upto]
-        hydro = series['hydro_mw'][start:upto]
-        load = series['load_mw'][start:upto]
-
         import numpy as np
-        gen = (np.array(wind) + np.array(solar) + np.array(hydro)).tolist()
-        demand = np.array(load).tolist()
+
+        series = _extract_metric_series(env, overrides=scenario_overrides)
+        start, upto = _window_bounds(series['steps'], limit)
+        upto = min(upto, series['steps'])
+        start = min(start, upto)
+        gen_full = np.asarray(series['wind_mw']) + np.asarray(series['solar_mw']) + np.asarray(series['hydro_mw'])
+
+        steps, gen = _downsample(gen_full, start, upto, max_points)
+        _, demand = _downsample(series['load_mw'], start, upto, max_points)
+        _, solar = _downsample(series['solar_mw'], start, upto, max_points)
+        _, wind = _downsample(series['wind_mw'], start, upto, max_points)
+        _, hydro = _downsample(series['hydro_mw'], start, upto, max_points)
 
         timestamps = None
         try:
             df = getattr(env, 'data', None)
             if df is not None and 'timestamp' in df.columns:
-                timestamps = [str(x) for x in df['timestamp'].iloc[start:upto].tolist()]
+                ts = df['timestamp']
+                timestamps = [str(ts.iloc[i]) for i in steps]
         except Exception:
             timestamps = None
 
         return {
             'start': start,
             'end': upto,
-            'steps': list(range(start, upto)),
+            'steps': steps,
             'timestamps': timestamps,
+            'dt_hours': float(series['dt_hours']),
             'gen_mw': gen,
             'load_mw': demand,
+            'solar_mw': solar,
+            'wind_mw': wind,
+            'hydro_mw': hydro,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Series calculation failed: {exc}")
 
 
 @router.get("/runs/{run_id}/optimize", tags=["runs"])
-async def optimize_run_merit_order(run_id: str) -> dict:
+async def optimize_run_merit_order(run_id: str, limit: int = 0, max_points: int = 0, persist: bool = False) -> dict:
     """Run a deterministic merit‑order dispatcher consistent with paper.txt.
 
-    Returns series (MWh per step) and KPIs including PED.
+    Dispatch is always simulated from step 0 (battery state carries over), and
+    KPIs cover the whole horizon. With ``limit`` > 0 the returned series are
+    restricted to the same window/buckets as ``/energy_series``.
     """
     manager = SimulationManager.get_global()
     with session_scope() as db:
         run = _get_run_or_404(db, run_id)
         run = _refresh_run_status_if_needed(db, run)
-        scenario_overrides = None
-        if run.scenario_id:
-            sc = db.get(Scenario, run.scenario_id)
-            if sc is not None:
-                scenario_overrides = sc.config_overrides
+        session_id = run.session_id
+        scenario_overrides = _resolve_run_overrides(db, run)
     try:
-        session = manager.get_session(run.session_id) if run.session_id else None
+        session = manager.get_session(session_id) if session_id else None
     except KeyError:
         session = None
 
@@ -552,9 +628,9 @@ async def optimize_run_merit_order(run_id: str) -> dict:
     env = session.wrapper or session.env
     try:
         import numpy as np
-        t = int(getattr(env, 't', 0))
-        series = _extract_metric_series(env, overrides=scenario_overrides, upto_steps=max(1, t))
-        pv = np.asarray(series['solar_mw'], dtype=float)
+        series = _extract_metric_series(env, overrides=scenario_overrides)
+        # Wind/hydro are on-site generation too; the dispatcher treats all of it as "PV bus"
+        pv = np.asarray(series['solar_mw'], dtype=float) + np.asarray(series['wind_mw'], dtype=float) + np.asarray(series['hydro_mw'], dtype=float)
         load = np.asarray(series['load_mw'], dtype=float)
 
         # timestep inference: prefer timestamp spacing, else assume 10‑min
@@ -564,30 +640,47 @@ async def optimize_run_merit_order(run_id: str) -> dict:
         opt = MeritOrderOptimizer(cfg)
         out = opt.run(pv_mw=pv, load_mw=load)
 
-        # Persist a snapshot for charting convenience
-        try:
-            with session_scope() as db:
-                row = SimulationSnapshot(
-                    run_id=run_id,
-                    timestep=int(getattr(env, 't', 0)),
-                    payload={
-                        'type': 'optimizer_merit_order',
-                        'config': cfg.__dict__,
-                        'kpis': out['kpis'],
-                    },
-                )
-                db.add(row)
-        except Exception:
-            pass
+        # Persist a snapshot only on explicit request; the UI polls this endpoint
+        if persist:
+            try:
+                with session_scope() as db:
+                    row = SimulationSnapshot(
+                        run_id=run_id,
+                        timestep=int(getattr(env, 't', 0)),
+                        payload={
+                            'type': 'optimizer_merit_order',
+                            'config': cfg.__dict__,
+                            'kpis': out['kpis'],
+                        },
+                    )
+                    db.add(row)
+            except Exception:
+                pass
 
-        series_mwh = {k: v.tolist() for k, v in out['series_mwh'].items()}
         dt_h = float(out.get('dt_hours', dt_hours))
-        series_mw = {k.replace('_mwh', '_mw'): (np.array(v) / max(dt_h, 1e-9)).tolist() for k, v in series_mwh.items()}
+        n = len(pv)
+        if limit and limit > 0:
+            start, end = _window_bounds(n, limit)
+            end = min(end, n)
+        else:
+            start, end = 0, n
+        series_mwh: dict[str, list] = {}
+        series_mw: dict[str, list] = {}
+        steps: list[int] = []
+        for k, v in out['series_mwh'].items():
+            steps, windowed = _downsample(v, start, end, max_points)
+            series_mwh[k] = windowed
+            series_mw[k.replace('_mwh', '_mw')] = (np.asarray(windowed) / max(dt_h, 1e-9)).tolist()
+        _, soc = _downsample(out['soc_mwh'], start, end, max_points)
         return {
             'config': cfg.__dict__,
             'kpis': out['kpis'],
+            'start': start,
+            'end': end,
+            'steps': steps,
             'series_mwh': series_mwh,
             'series_mw': series_mw,
+            'soc_mwh': soc,
             'dt_hours': dt_h,
         }
     except Exception as exc:
@@ -712,8 +805,12 @@ async def run_stream(websocket: WebSocket, run_id: str) -> None:
 
     manager = SimulationManager.get_global()
     with session_scope() as db:
-        run = _get_run_or_404(db, run_id)
-        session_id = run.session_id
+        run = db.get(SimulationRun, run_id)
+        session_id = run.session_id if run is not None else None
+    if run is None:
+        await websocket.send_json({"type": "error", "message": "Run not found"})
+        await websocket.close(code=4404)
+        return
     if not session_id:
         await websocket.send_json({"type": "error", "message": "Run has no active session"})
         await websocket.close(code=4400)
@@ -739,7 +836,7 @@ async def run_stream(websocket: WebSocket, run_id: str) -> None:
                 continue
 
             if command == "step":
-                steps = int(message.get("steps", 1))
+                steps = max(1, min(int(message.get("steps", 1)), 10000))
                 snapshot = SimulationState.model_validate(manager.step_session(session_id, steps))
                 await websocket.send_json({"type": "state", "payload": snapshot.model_dump()})
                 continue
@@ -755,8 +852,12 @@ async def run_stream(websocket: WebSocket, run_id: str) -> None:
     except WebSocketDisconnect:
         return
     except Exception as exc:  # pragma: no cover - defensive handler
-        await websocket.send_json({"type": "error", "message": str(exc)})
-        await websocket.close(code=1011)
+        try:
+            message = "Simulation session expired" if isinstance(exc, KeyError) else str(exc)
+            await websocket.send_json({"type": "error", "message": message})
+            await websocket.close(code=1011)
+        except Exception:
+            pass
 
 
 # ------------------ Digital Twins ------------------
@@ -936,6 +1037,7 @@ def _dt_to_config_overrides(components: list, connections: list) -> dict:
     """Convert digital twin components to simulation config overrides."""
     overrides = {}
     total_pv = 0.0
+    total_wind = 0.0
     total_battery = 0.0
     total_load = 0.0
 
@@ -945,6 +1047,8 @@ def _dt_to_config_overrides(components: list, connections: list) -> dict:
 
         if ctype == 'solar_pv':
             total_pv += float(params.get('capacity_kwp', 0)) / 1000  # kW to MW
+        elif ctype == 'wind_turbine':
+            total_wind += float(params.get('capacity_kw', 0)) / 1000
         elif ctype == 'battery_storage':
             total_battery += float(params.get('capacity_kwh', 0)) / 1000  # kWh to MWh
         elif ctype == 'smart_building':
@@ -954,6 +1058,8 @@ def _dt_to_config_overrides(components: list, connections: list) -> dict:
 
     if total_pv > 0:
         overrides['owned_solar_capacity_mw'] = total_pv
+    if total_wind > 0:
+        overrides['owned_wind_capacity_mw'] = total_wind
     if total_battery > 0:
         overrides['owned_battery_capacity_mwh'] = total_battery
     if total_load > 0:

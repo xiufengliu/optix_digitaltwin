@@ -18,6 +18,18 @@ export interface SimulationMetrics {
   fund_nav?: number | null;
   budget?: number | null;
   last_revenue?: number | null;
+  cumulative_revenue?: number | null;
+  done?: boolean;
+}
+
+export interface ObservationValues {
+  t?: number;
+  wind?: number;
+  solar?: number;
+  hydro?: number;
+  load?: number;
+  price?: number;
+  timestamp?: string | null;
 }
 
 export interface SimulationStatePayload {
@@ -45,6 +57,7 @@ export interface Scenario {
   created_at: string;
   updated_at: string;
   config_overrides: Record<string, unknown>;
+  digital_twin_id?: string | null;
 }
 
 export interface ScenarioCreate {
@@ -89,8 +102,37 @@ export interface EnergySeries {
   end: number;
   steps: number[];
   timestamps?: string[] | null;
+  dt_hours?: number;
   gen_mw: number[];
   load_mw: number[];
+  solar_mw?: number[];
+  wind_mw?: number[];
+  hydro_mw?: number[];
+}
+
+export interface DispatchKpis {
+  total_gen_mwh: number;
+  total_demand_mwh: number;
+  ped_absolute_mwh: number;
+  ped_ratio: number;
+  self_consumption_mwh: number;
+  export_mwh: number;
+  battery_throughput_mwh: number;
+  grid_import_mwh: number;
+  self_consumption_ratio?: number;
+  self_sufficiency_ratio?: number;
+}
+
+export interface DispatchResult {
+  config: Record<string, number | boolean>;
+  kpis: DispatchKpis;
+  start: number;
+  end: number;
+  steps: number[];
+  series_mw: Record<string, number[]>;
+  series_mwh: Record<string, number[]>;
+  soc_mwh: number[];
+  dt_hours: number;
 }
 
 // Digital Twin Builder Types

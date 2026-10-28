@@ -13,6 +13,7 @@ set -euo pipefail
 
 REPO_DIR="/opt/app/optix_digitaltwin"
 FRONTEND_DIR="$REPO_DIR/frontend"
+# nginx (sites-enabled/dt.scicloud.site) proxies the API at the site root, not under /api
 API_BASE="${API_BASE:-https://dt.scicloud.site}"
 
 echo "==> Repo dir:     $REPO_DIR"

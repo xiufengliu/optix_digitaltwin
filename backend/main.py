@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import routes
+from . import assistant, routes
 from .db import create_all, session_scope
 from .simulation_manager import SimulationManager
 from .models import Scenario
@@ -20,10 +21,21 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     SimulationManager.initialize_global()
     create_all()
     _seed_predefined_scenarios()
+    # Parse the default CSV in the background so the first run starts quickly
+    warmup = asyncio.create_task(asyncio.to_thread(_warm_data_cache))
     try:
         yield
     finally:
+        warmup.cancel()
         SimulationManager.shutdown_global()
+
+
+def _warm_data_cache() -> None:
+    try:
+        manager = SimulationManager.get_global()
+        manager._load_data(manager.settings.data_path)
+    except Exception:
+        pass
 
 
 def create_app() -> FastAPI:
@@ -43,6 +55,7 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(routes.router)
+    app.include_router(assistant.router)
     return app
 
 
@@ -157,8 +170,10 @@ def _seed_predefined_scenarios() -> None:
 
     with session_scope() as db:
         # Map existing scenarios by name for idempotent seeding + upgrades
-        existing_rows = db.query(Scenario).all()
-        existing_by_name = {row.name: row for row in existing_rows}
+        existing_rows = db.query(Scenario).order_by(Scenario.created_at.asc()).all()
+        rows_by_name: dict[str, list[Scenario]] = {}
+        for existing in existing_rows:
+            rows_by_name.setdefault(existing.name, []).append(existing)
 
         from uuid import uuid4
         # Known short descriptions from earlier seed (to be upgraded)
@@ -171,10 +186,10 @@ def _seed_predefined_scenarios() -> None:
         }
 
         for p in predefined:
-            row = existing_by_name.get(p["name"])
-            if row is None:
+            rows = rows_by_name.get(p["name"]) or []
+            if not rows:
                 db.add(Scenario(id=str(uuid4()), name=p["name"], description=p["description"], details=p.get("details"), config_overrides=p["config_overrides"]))
-            else:
+            for row in rows:
                 updated = False
                 # Upgrade details if missing
                 if not getattr(row, 'details', None):

@@ -1,7 +1,9 @@
 import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
-import type { DigitalTwinConfig, DTComponent, DTConnection, DTComponentType } from './DigitalTwinBuilder';
+import { Sky } from 'three/examples/jsm/objects/Sky.js';
+import type { DigitalTwinConfig, DTComponent, DTConnection } from './DigitalTwinBuilder';
+import { createComponentModel, createTree, grassTexture } from './twin3d/models';
 
 interface Props {
   config: DigitalTwinConfig | null;
@@ -9,475 +11,142 @@ interface Props {
   onComponentMove?: (componentId: string, x: number, y: number) => void;
 }
 
-// Create realistic 3D models for each component
-function createComponentModel(type: DTComponentType, params: Record<string, any>): THREE.Group {
-  const group = new THREE.Group();
-  
-  switch (type) {
-    case 'solar_pv': {
-      // Solar panel array - tilted blue panels with frame
-      const panelCount = 3;
-      for (let i = 0; i < panelCount; i++) {
-        const panel = new THREE.Mesh(
-          new THREE.BoxGeometry(1.2, 0.05, 0.8),
-          new THREE.MeshStandardMaterial({ color: 0x1e3a5f, metalness: 0.8, roughness: 0.2 })
-        );
-        // Grid lines on panel
-        const gridLines = new THREE.Mesh(
-          new THREE.BoxGeometry(1.18, 0.06, 0.78),
-          new THREE.MeshStandardMaterial({ color: 0x4a90d9, metalness: 0.5 })
-        );
-        panel.add(gridLines);
-        panel.position.set(i * 1.4 - 1.4, 0.8, 0);
-        panel.rotation.x = -Math.PI * 0.2;
-        group.add(panel);
-        
-        // Support pole
-        const pole = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.03, 0.03, 0.7, 8),
-          new THREE.MeshStandardMaterial({ color: 0x888888 })
-        );
-        pole.position.set(i * 1.4 - 1.4, 0.35, 0.2);
-        group.add(pole);
-      }
-      break;
-    }
-    
-    case 'smart_building': {
-      // Modern building with windows
-      const floors = params.floors || 5;
-      const height = floors * 0.6;
-      const building = new THREE.Mesh(
-        new THREE.BoxGeometry(2.4, height, 1.5),
-        new THREE.MeshStandardMaterial({ color: 0x4a5568 })
-      );
-      building.position.y = height / 2;
-      group.add(building);
-      
-      // Windows - 4 per floor
-      for (let f = 0; f < floors; f++) {
-        for (let w = 0; w < 4; w++) {
-          const window = new THREE.Mesh(
-            new THREE.BoxGeometry(0.35, 0.3, 0.02),
-            new THREE.MeshStandardMaterial({ color: 0x87ceeb, emissive: 0x2244aa, emissiveIntensity: 0.3 })
-          );
-          window.position.set(w * 0.55 - 0.825, f * 0.6 + 0.4, 0.76);
-          group.add(window);
-        }
-      }
-      
-      // Roof
-      const roof = new THREE.Mesh(
-        new THREE.BoxGeometry(2.5, 0.1, 1.6),
-        new THREE.MeshStandardMaterial({ color: 0x2d3748 })
-      );
-      roof.position.y = height + 0.05;
-      group.add(roof);
-      break;
-    }
-    
-    case 'battery_storage': {
-      // Battery container/cabinet
-      const cabinet = new THREE.Mesh(
-        new THREE.BoxGeometry(1.2, 1.5, 0.8),
-        new THREE.MeshStandardMaterial({ color: 0x22c55e })
-      );
-      cabinet.position.y = 0.75;
-      group.add(cabinet);
-      
-      // Battery cells indicator
-      for (let i = 0; i < 3; i++) {
-        const cell = new THREE.Mesh(
-          new THREE.BoxGeometry(0.3, 0.2, 0.02),
-          new THREE.MeshStandardMaterial({ color: 0x166534, emissive: 0x00ff00, emissiveIntensity: 0.2 })
-        );
-        cell.position.set(0, 0.5 + i * 0.35, 0.41);
-        group.add(cell);
-      }
-      
-      // Lightning bolt symbol
-      const bolt = new THREE.Mesh(
-        new THREE.ConeGeometry(0.15, 0.4, 4),
-        new THREE.MeshStandardMaterial({ color: 0xfbbf24 })
-      );
-      bolt.position.set(0, 1.3, 0.41);
-      bolt.rotation.z = Math.PI;
-      group.add(bolt);
-      break;
-    }
-    
-    case 'wind_turbine': {
-      // Tower
-      const tower = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.15, 0.25, 4, 8),
-        new THREE.MeshStandardMaterial({ color: 0xf5f5f5 })
-      );
-      tower.position.y = 2;
-      group.add(tower);
-      
-      // Nacelle (hub housing)
-      const nacelle = new THREE.Mesh(
-        new THREE.BoxGeometry(0.6, 0.4, 0.4),
-        new THREE.MeshStandardMaterial({ color: 0xe5e5e5 })
-      );
-      nacelle.position.set(0, 4.1, 0);
-      group.add(nacelle);
-      
-      // Hub
-      const hub = new THREE.Mesh(
-        new THREE.ConeGeometry(0.15, 0.3, 16),
-        new THREE.MeshStandardMaterial({ color: 0xcccccc })
-      );
-      hub.position.set(0, 4.1, 0.35);
-      hub.rotation.x = Math.PI / 2;
-      group.add(hub);
-      
-      // Blades
-      const bladeGroup = new THREE.Group();
-      for (let i = 0; i < 3; i++) {
-        const blade = new THREE.Mesh(
-          new THREE.BoxGeometry(0.15, 1.8, 0.05),
-          new THREE.MeshStandardMaterial({ color: 0xffffff })
-        );
-        blade.position.y = 0.9;
-        const bladeHolder = new THREE.Group();
-        bladeHolder.add(blade);
-        bladeHolder.rotation.z = (i * Math.PI * 2) / 3;
-        bladeGroup.add(bladeHolder);
-      }
-      bladeGroup.position.set(0, 4.1, 0.5);
-      bladeGroup.userData.isRotating = true;
-      group.add(bladeGroup);
-      break;
-    }
-    
-    case 'district_heating': {
-      // Heat exchanger station
-      const station = new THREE.Mesh(
-        new THREE.BoxGeometry(1.5, 1, 1),
-        new THREE.MeshStandardMaterial({ color: 0xdc2626 })
-      );
-      station.position.y = 0.5;
-      group.add(station);
-      
-      // Pipes
-      const pipe1 = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.1, 0.1, 1.2, 16),
-        new THREE.MeshStandardMaterial({ color: 0xef4444 })
-      );
-      pipe1.rotation.z = Math.PI / 2;
-      pipe1.position.set(0, 0.8, 0.6);
-      group.add(pipe1);
-      
-      const pipe2 = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.08, 0.08, 1.2, 16),
-        new THREE.MeshStandardMaterial({ color: 0x3b82f6 })
-      );
-      pipe2.rotation.z = Math.PI / 2;
-      pipe2.position.set(0, 0.5, 0.6);
-      group.add(pipe2);
-      
-      // Heat waves indicator
-      const wave = new THREE.Mesh(
-        new THREE.TorusGeometry(0.2, 0.03, 8, 16, Math.PI),
-        new THREE.MeshStandardMaterial({ color: 0xff6b6b, emissive: 0xff0000, emissiveIntensity: 0.5 })
-      );
-      wave.position.set(0, 1.2, 0);
-      wave.rotation.x = Math.PI / 2;
-      group.add(wave);
-      break;
-    }
-    
-    case 'smart_grid': {
-      // Electrical transformer/substation
-      const base = new THREE.Mesh(
-        new THREE.BoxGeometry(1, 0.3, 0.8),
-        new THREE.MeshStandardMaterial({ color: 0x374151 })
-      );
-      base.position.y = 0.15;
-      group.add(base);
-      
-      // Transformer box
-      const transformer = new THREE.Mesh(
-        new THREE.BoxGeometry(0.6, 0.8, 0.5),
-        new THREE.MeshStandardMaterial({ color: 0x6b7280 })
-      );
-      transformer.position.y = 0.7;
-      group.add(transformer);
-      
-      // Insulators
-      for (let i = 0; i < 3; i++) {
-        const insulator = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.05, 0.08, 0.4, 8),
-          new THREE.MeshStandardMaterial({ color: 0x8b5cf6 })
-        );
-        insulator.position.set(i * 0.25 - 0.25, 1.3, 0);
-        group.add(insulator);
-      }
-      
-      // Power lines
-      for (let i = 0; i < 3; i++) {
-        const wire = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.01, 0.01, 0.8, 8),
-          new THREE.MeshStandardMaterial({ color: 0x111111 })
-        );
-        wire.rotation.z = Math.PI / 2;
-        wire.position.set(0.4, 1.5, i * 0.15 - 0.15);
-        group.add(wire);
-      }
-      break;
-    }
-    
-    case 'ev_charger': {
-      // Charging station pillar
-      const pillar = new THREE.Mesh(
-        new THREE.BoxGeometry(0.3, 1.4, 0.2),
-        new THREE.MeshStandardMaterial({ color: 0x1e40af })
-      );
-      pillar.position.y = 0.7;
-      group.add(pillar);
-      
-      // Screen
-      const screen = new THREE.Mesh(
-        new THREE.BoxGeometry(0.25, 0.2, 0.02),
-        new THREE.MeshStandardMaterial({ color: 0x000000, emissive: 0x00ff00, emissiveIntensity: 0.3 })
-      );
-      screen.position.set(0, 1.1, 0.11);
-      group.add(screen);
-      
-      // Charging cable
-      const cable = new THREE.Mesh(
-        new THREE.TorusGeometry(0.15, 0.02, 8, 16, Math.PI),
-        new THREE.MeshStandardMaterial({ color: 0x111111 })
-      );
-      cable.position.set(0.2, 0.5, 0.15);
-      cable.rotation.y = Math.PI / 2;
-      group.add(cable);
-      
-      // Car silhouette
-      const car = new THREE.Mesh(
-        new THREE.BoxGeometry(0.8, 0.3, 0.4),
-        new THREE.MeshStandardMaterial({ color: 0x3b82f6, transparent: true, opacity: 0.6 })
-      );
-      car.position.set(0.8, 0.15, 0);
-      group.add(car);
-      break;
-    }
-    
-    case 'heat_pump': {
-      // Outdoor unit
-      const unit = new THREE.Mesh(
-        new THREE.BoxGeometry(1.2, 0.9, 0.5),
-        new THREE.MeshStandardMaterial({ color: 0xf5f5f5 })
-      );
-      unit.position.y = 0.45;
-      group.add(unit);
-      
-      // Fan grille
-      const grille = new THREE.Mesh(
-        new THREE.CircleGeometry(0.3, 32),
-        new THREE.MeshStandardMaterial({ color: 0x333333 })
-      );
-      grille.position.set(0, 0.5, 0.26);
-      group.add(grille);
-      
-      // Fan blades
-      const fanGroup = new THREE.Group();
-      for (let i = 0; i < 4; i++) {
-        const blade = new THREE.Mesh(
-          new THREE.BoxGeometry(0.25, 0.05, 0.02),
-          new THREE.MeshStandardMaterial({ color: 0x666666 })
-        );
-        blade.rotation.z = (i * Math.PI) / 2;
-        fanGroup.add(blade);
-      }
-      fanGroup.position.set(0, 0.5, 0.27);
-      fanGroup.userData.isRotating = true;
-      group.add(fanGroup);
-      
-      // Pipes
-      const hotPipe = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.04, 0.04, 0.5, 8),
-        new THREE.MeshStandardMaterial({ color: 0xef4444 })
-      );
-      hotPipe.position.set(-0.4, 0.7, -0.3);
-      group.add(hotPipe);
-      break;
-    }
-    
-    case 'chp_unit': {
-      // CHP engine housing
-      const housing = new THREE.Mesh(
-        new THREE.BoxGeometry(1.5, 1.2, 1),
-        new THREE.MeshStandardMaterial({ color: 0xf97316 })
-      );
-      housing.position.y = 0.6;
-      group.add(housing);
-      
-      // Exhaust stack
-      const stack = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.1, 0.12, 0.8, 16),
-        new THREE.MeshStandardMaterial({ color: 0x666666 })
-      );
-      stack.position.set(0.5, 1.6, 0);
-      group.add(stack);
-      
-      // Control panel
-      const panel = new THREE.Mesh(
-        new THREE.BoxGeometry(0.4, 0.3, 0.05),
-        new THREE.MeshStandardMaterial({ color: 0x1f2937, emissive: 0x22c55e, emissiveIntensity: 0.2 })
-      );
-      panel.position.set(-0.4, 0.8, 0.53);
-      group.add(panel);
-      break;
-    }
-    
-    case 'thermal_storage': {
-      // Hot water tank
-      const tank = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.6, 0.6, 1.8, 24),
-        new THREE.MeshStandardMaterial({ color: 0xec4899 })
-      );
-      tank.position.y = 0.9;
-      group.add(tank);
-      
-      // Insulation bands
-      for (let i = 0; i < 3; i++) {
-        const band = new THREE.Mesh(
-          new THREE.TorusGeometry(0.62, 0.03, 8, 32),
-          new THREE.MeshStandardMaterial({ color: 0xbe185d })
-        );
-        band.position.y = 0.4 + i * 0.5;
-        band.rotation.x = Math.PI / 2;
-        group.add(band);
-      }
-      
-      // Temperature gauge
-      const gauge = new THREE.Mesh(
-        new THREE.CircleGeometry(0.1, 16),
-        new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xff4444, emissiveIntensity: 0.5 })
-      );
-      gauge.position.set(0, 1.2, 0.61);
-      group.add(gauge);
-      break;
-    }
-    
-    case 'load_center': {
-      // Electrical panel
-      const panel = new THREE.Mesh(
-        new THREE.BoxGeometry(0.8, 1.2, 0.2),
-        new THREE.MeshStandardMaterial({ color: 0x4b5563 })
-      );
-      panel.position.y = 0.6;
-      group.add(panel);
-      
-      // Breakers
-      for (let row = 0; row < 3; row++) {
-        for (let col = 0; col < 2; col++) {
-          const breaker = new THREE.Mesh(
-            new THREE.BoxGeometry(0.15, 0.2, 0.05),
-            new THREE.MeshStandardMaterial({ color: 0x111111 })
-          );
-          breaker.position.set(col * 0.25 - 0.12, 0.3 + row * 0.3, 0.12);
-          group.add(breaker);
-        }
-      }
-      
-      // Status light
-      const light = new THREE.Mesh(
-        new THREE.SphereGeometry(0.05, 16, 16),
-        new THREE.MeshStandardMaterial({ color: 0x22c55e, emissive: 0x00ff00, emissiveIntensity: 0.8 })
-      );
-      light.position.set(0.25, 1.0, 0.12);
-      group.add(light);
-      break;
-    }
-  }
-  
-  return group;
-}
+const LABEL_COLORS: Record<string, string> = {
+  solar_pv: '#f5b83d', wind_turbine: '#5ab8e8', battery_storage: '#2fc59b', smart_building: '#94a3b8',
+  smart_grid: '#a78bfa', district_heating: '#f87171', heat_pump: '#fb923c', chp_unit: '#f97316',
+  thermal_storage: '#f472b6', ev_charger: '#38bdf8', load_center: '#cbd5e1',
+};
 
-// Create text sprite for labels
-function createLabel(text: string, position: THREE.Vector3, yOffset: number): THREE.Sprite {
+// Floating name tag above a component
+function createLabel(text: string, type: string, position: THREE.Vector3, yOffset: number): THREE.Sprite {
   const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d')!;
-  canvas.width = 256;
-  canvas.height = 64;
-  
-  ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+  canvas.width = 512;
+  canvas.height = 112;
+  const label = String(text ?? '').substring(0, 26);
+  ctx.font = '600 40px Inter, system-ui, Arial';
+  const w = Math.min(500, ctx.measureText(label).width + 84);
+  const x0 = (canvas.width - w) / 2;
+  ctx.fillStyle = 'rgba(11, 17, 32, 0.82)';
   ctx.beginPath();
-  ctx.roundRect(4, 4, canvas.width - 8, canvas.height - 8, 8);
+  if (typeof ctx.roundRect === 'function') ctx.roundRect(x0, 16, w, 72, 36);
+  else ctx.rect(x0, 16, w, 72); // roundRect is missing in older Safari/Firefox
   ctx.fill();
-  
-  ctx.font = 'bold 22px Arial';
-  ctx.fillStyle = '#e2e8f0';
-  ctx.textAlign = 'center';
+  ctx.fillStyle = LABEL_COLORS[type] ?? '#94a3b8';
+  ctx.beginPath();
+  ctx.arc(x0 + 38, 52, 10, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#f1f5f9';
   ctx.textBaseline = 'middle';
-  ctx.fillText(text.substring(0, 20), canvas.width / 2, canvas.height / 2);
-  
+  ctx.fillText(label, x0 + 60, 54);
+
   const texture = new THREE.CanvasTexture(canvas);
-  const material = new THREE.SpriteMaterial({ map: texture, transparent: true });
+  texture.colorSpace = THREE.SRGBColorSpace;
+  // Constant on-screen size (scale is a fraction of the viewport height)
+  const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false, sizeAttenuation: false });
   const sprite = new THREE.Sprite(material);
   sprite.position.copy(position);
-  sprite.position.y = yOffset + 0.3;
-  sprite.scale.set(1.8, 0.45, 1);
+  sprite.position.y = yOffset + 0.35;
+  sprite.center.set(0.5, 0);
+  sprite.scale.set(0.2, 0.2 * (canvas.height / canvas.width), 1);
+  sprite.renderOrder = 10;
   return sprite;
 }
 
-// Energy flow particle system
-class EnergyFlowParticles {
+let glowTexture: THREE.Texture | null = null;
+function getGlowTexture() {
+  if (!glowTexture) {
+    const c = document.createElement('canvas');
+    c.width = c.height = 64;
+    const ctx = c.getContext('2d')!;
+    const g = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+    g.addColorStop(0, 'rgba(255,255,255,1)');
+    g.addColorStop(0.25, 'rgba(255,255,255,0.8)');
+    g.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, 64, 64);
+    glowTexture = new THREE.CanvasTexture(c);
+  }
+  return glowTexture;
+}
+
+// Energy flow: a cable/pipe trace on the ground with glowing pulses moving along it
+class EnergyFlow {
+  group = new THREE.Group();
   particles: THREE.Points;
+  curve: THREE.CatmullRomCurve3;
   positions: Float32Array;
   progress: Float32Array;
-  startPos: THREE.Vector3;
-  endPos: THREE.Vector3;
   count: number;
   speed: number;
 
-  constructor(start: THREE.Vector3, end: THREE.Vector3, color: number, count = 20) {
-    this.startPos = start.clone();
-    this.endPos = end.clone();
+  constructor(start: THREE.Vector3, end: THREE.Vector3, color: number, count = 10) {
+    const mid = start.clone().lerp(end, 0.5);
+    const a = new THREE.Vector3(start.x, 0.07, start.z);
+    const b = new THREE.Vector3(end.x, 0.07, end.z);
+    this.curve = new THREE.CatmullRomCurve3([a, new THREE.Vector3(mid.x, 0.07, mid.z), b]);
     this.count = count;
-    this.speed = 0.015;
-    
+    this.speed = 0.5 / Math.max(2, a.distanceTo(b)) * 0.02;
+
+    // trench line (dark) with a coloured glowing core
+    const trace = new THREE.Mesh(
+      new THREE.TubeGeometry(this.curve, 32, 0.035, 8, false),
+      new THREE.MeshStandardMaterial({ color: 0x2b2f35, roughness: 0.8 }),
+    );
+    trace.receiveShadow = true;
+    const core = new THREE.Mesh(
+      new THREE.TubeGeometry(this.curve, 32, 0.014, 8, false),
+      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.75 }),
+    );
+    core.position.y = 0.025;
+    this.group.add(trace, core);
+
     this.positions = new Float32Array(count * 3);
     this.progress = new Float32Array(count);
-    
     for (let i = 0; i < count; i++) {
       this.progress[i] = i / count;
-      this.updateParticlePosition(i);
+      this.place(i);
     }
-    
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(this.positions, 3));
-    
-    const material = new THREE.PointsMaterial({
-      color: color,
-      size: 0.15,
-      transparent: true,
-      opacity: 1,
-      blending: THREE.AdditiveBlending,
-      sizeAttenuation: true
-    });
-    
-    this.particles = new THREE.Points(geometry, material);
+    this.particles = new THREE.Points(geometry, new THREE.PointsMaterial({
+      color, size: 0.32, map: getGlowTexture(), transparent: true, depthWrite: false,
+      blending: THREE.AdditiveBlending, sizeAttenuation: true,
+    }));
+    this.group.add(this.particles);
   }
 
-  updateParticlePosition(i: number) {
-    const t = this.progress[i];
-    this.positions[i * 3] = this.startPos.x + (this.endPos.x - this.startPos.x) * t;
-    this.positions[i * 3 + 1] = this.startPos.y + (this.endPos.y - this.startPos.y) * t + Math.sin(t * Math.PI) * 0.25;
-    this.positions[i * 3 + 2] = this.startPos.z + (this.endPos.z - this.startPos.z) * t;
+  place(i: number) {
+    const p = this.curve.getPointAt(this.progress[i]);
+    this.positions[i * 3] = p.x;
+    this.positions[i * 3 + 1] = p.y + 0.06;
+    this.positions[i * 3 + 2] = p.z;
   }
 
   update() {
     for (let i = 0; i < this.count; i++) {
-      this.progress[i] += this.speed;
-      if (this.progress[i] > 1) this.progress[i] = 0;
-      this.updateParticlePosition(i);
+      this.progress[i] = (this.progress[i] + this.speed) % 1;
+      this.place(i);
     }
     this.particles.geometry.attributes.position.needsUpdate = true;
   }
+}
+
+// Free GPU resources (geometries, materials, textures) held by an object tree
+function disposeObject(root: THREE.Object3D) {
+  root.traverse(obj => {
+    const anyObj = obj as any;
+    if (anyObj.geometry) anyObj.geometry.dispose();
+    const mats: THREE.Material[] = Array.isArray(anyObj.material)
+      ? anyObj.material
+      : anyObj.material ? [anyObj.material] : [];
+    mats.forEach(m => {
+      Object.values(m).forEach(v => {
+        if (v && (v as THREE.Texture).isTexture && v !== glowTexture) (v as THREE.Texture).dispose();
+      });
+      m.dispose();
+    });
+  });
 }
 
 export function DigitalTwin3DView({ config, animate = true, onComponentMove }: Props) {
@@ -489,8 +158,10 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
   const modelsRef = useRef<Map<string, THREE.Group>>(new Map());
   const labelsRef = useRef<THREE.Group | null>(null);
   const labelMapRef = useRef<Map<string, THREE.Sprite>>(new Map());
-  const flowParticlesRef = useRef<EnergyFlowParticles[]>([]);
+  const flowsRef = useRef<EnergyFlow[]>([]);
   const rotatingPartsRef = useRef<THREE.Object3D[]>([]);
+  const sunRef = useRef<THREE.DirectionalLight | null>(null);
+  const treesRef = useRef<THREE.Group | null>(null);
   const frameRef = useRef<number>(0);
   const raycasterRef = useRef(new THREE.Raycaster());
   const mouseRef = useRef(new THREE.Vector2());
@@ -498,6 +169,7 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
   const planeRef = useRef(new THREE.Plane(new THREE.Vector3(0, 1, 0), 0));
   const animateRef = useRef(animate);
   const onComponentMoveRef = useRef(onComponentMove);
+  const fittedKeyRef = useRef<string | null>(null);
   
   // Keep refs in sync with props
   useEffect(() => {
@@ -513,20 +185,21 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
     const container = containerRef.current;
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x0a1628);
     sceneRef.current = scene;
 
     const w = container.clientWidth || 600;
     const h = container.clientHeight || 400;
-    const camera = new THREE.PerspectiveCamera(45, w / h, 0.1, 500);
+    const camera = new THREE.PerspectiveCamera(42, w / h, 0.1, 2000);
     camera.position.set(5, 4, 5);
     cameraRef.current = camera;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(w, h);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75));
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 0.85;
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
@@ -535,6 +208,9 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
     controls.dampingFactor = 0.08;
     controls.enablePan = true;
     controls.screenSpacePanning = true;
+    controls.maxPolarAngle = Math.PI * 0.48; // stay above the ground
+    controls.minDistance = 2;
+    controls.maxDistance = 80;
     controls.mouseButtons = {
       LEFT: THREE.MOUSE.ROTATE,
       MIDDLE: THREE.MOUSE.DOLLY,
@@ -547,62 +223,58 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
     controls.target.set(0, 1, 0);
     controlsRef.current = controls;
 
-    // Lighting with shadows
-    scene.add(new THREE.AmbientLight(0xffffff, 0.4));
-    const sun = new THREE.DirectionalLight(0xffffff, 1.2);
-    sun.position.set(15, 25, 15);
-    sun.castShadow = true;
-    sun.shadow.mapSize.width = 2048;
-    sun.shadow.mapSize.height = 2048;
-    sun.shadow.camera.near = 0.5;
-    sun.shadow.camera.far = 100;
-    sun.shadow.camera.left = -20;
-    sun.shadow.camera.right = 20;
-    sun.shadow.camera.top = 20;
-    sun.shadow.camera.bottom = -20;
-    scene.add(sun);
-    
-    const fill = new THREE.DirectionalLight(0x4488ff, 0.3);
-    fill.position.set(-10, 5, -10);
-    scene.add(fill);
+    // Physical daylight sky; its reflection doubles as the environment map
+    const sunDir = new THREE.Vector3().setFromSphericalCoords(1, THREE.MathUtils.degToRad(55), THREE.MathUtils.degToRad(140));
+    const sky = new Sky();
+    sky.scale.setScalar(1000);
+    const u = sky.material.uniforms;
+    u.turbidity.value = 4;
+    u.rayleigh.value = 1.2;
+    u.mieCoefficient.value = 0.004;
+    u.mieDirectionalG.value = 0.8;
+    u.sunPosition.value.copy(sunDir);
+    scene.add(sky);
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    const envScene = new THREE.Scene();
+    const envSky = new Sky();
+    envSky.scale.setScalar(1000);
+    Object.assign(envSky.material.uniforms, THREE.UniformsUtils.clone(sky.material.uniforms));
+    envScene.add(envSky);
+    const envTarget = pmrem.fromScene(envScene, 0.02);
+    scene.environment = envTarget.texture;
+    scene.environmentIntensity = 0.7;
+    envSky.geometry.dispose();
+    envSky.material.dispose();
+    pmrem.dispose();
+    // Haze that matches the sky near the horizon, so the ground fades out naturally
+    scene.fog = new THREE.Fog(0xb9cbdc, 35, 170);
 
-    // Improved ground with gradient
-    const groundCanvas = document.createElement('canvas');
-    groundCanvas.width = 512;
-    groundCanvas.height = 512;
-    const gctx = groundCanvas.getContext('2d')!;
-    const gradient = gctx.createRadialGradient(256, 256, 0, 256, 256, 360);
-    gradient.addColorStop(0, '#1e293b');
-    gradient.addColorStop(1, '#0f172a');
-    gctx.fillStyle = gradient;
-    gctx.fillRect(0, 0, 512, 512);
-    const groundTexture = new THREE.CanvasTexture(groundCanvas);
-    
+    scene.add(new THREE.HemisphereLight(0xdfeaff, 0x5b6b45, 0.9));
+    const sun = new THREE.DirectionalLight(0xfff2de, 2.6);
+    sun.position.copy(sunDir).multiplyScalar(40);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.radius = 3;
+    sun.shadow.camera.near = 1;
+    sun.shadow.camera.far = 120;
+    sun.shadow.bias = -0.0004;
+    sun.shadow.normalBias = 0.02;
+    scene.add(sun, sun.target);
+    sunRef.current = sun;
+
+    // Grass ground
+    const groundTexture = grassTexture();
     const ground = new THREE.Mesh(
-      new THREE.PlaneGeometry(60, 60),
-      new THREE.MeshStandardMaterial({ map: groundTexture, roughness: 0.9 })
+      new THREE.PlaneGeometry(1500, 1500),
+      new THREE.MeshStandardMaterial({ map: groundTexture, roughness: 1 })
     );
     ground.rotation.x = -Math.PI / 2;
     ground.receiveShadow = true;
     scene.add(ground);
 
-    const grid = new THREE.GridHelper(60, 30, 0x3b82f6, 0x1e3a5f);
-    grid.position.y = 0.01;
-    scene.add(grid);
-
-    // Skybox gradient
-    const skyCanvas = document.createElement('canvas');
-    skyCanvas.width = 2;
-    skyCanvas.height = 512;
-    const sctx = skyCanvas.getContext('2d')!;
-    const skyGrad = sctx.createLinearGradient(0, 0, 0, 512);
-    skyGrad.addColorStop(0, '#0f172a');
-    skyGrad.addColorStop(0.5, '#1e293b');
-    skyGrad.addColorStop(1, '#334155');
-    sctx.fillStyle = skyGrad;
-    sctx.fillRect(0, 0, 2, 512);
-    const skyTexture = new THREE.CanvasTexture(skyCanvas);
-    scene.background = skyTexture;
+    const trees = new THREE.Group();
+    scene.add(trees);
+    treesRef.current = trees;
 
     const labelsGroup = new THREE.Group();
     scene.add(labelsGroup);
@@ -613,18 +285,10 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
       controls.update();
       
       if (animateRef.current) {
-        flowParticlesRef.current.forEach(fp => fp.update());
+        flowsRef.current.forEach(f => f.update());
         rotatingPartsRef.current.forEach(part => {
-          part.rotation.z += 0.02;
-        });
-        
-        // Pulse active generators
-        const time = Date.now() * 0.003;
-        modelsRef.current.forEach(model => {
-          if (model.userData.isGenerator) {
-            const pulse = 1 + Math.sin(time) * 0.03;
-            model.scale.set(pulse, pulse, pulse);
-          }
+          const { axis, speed } = part.userData.rotate as { axis: 'x' | 'y' | 'z'; speed: number };
+          part.rotation[axis] += speed;
         });
       }
       
@@ -635,11 +299,16 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
     const onResize = () => {
       const w = container.clientWidth;
       const h = container.clientHeight;
+      // Hidden / collapsed container: avoid NaN aspect and 0-sized buffers
+      if (!w || !h) return;
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
     };
     window.addEventListener('resize', onResize);
+    // Container can change size without a window resize (layout/panel changes)
+    const resizeObserver = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(onResize) : null;
+    resizeObserver?.observe(container);
 
     // Drag handlers
     const getMousePosition = (e: MouseEvent) => {
@@ -653,22 +322,22 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
       getMousePosition(e);
       raycasterRef.current.setFromCamera(mouseRef.current, camera);
       
-      const models = Array.from(modelsRef.current.entries());
-      for (const [id, model] of models) {
-        const intersects = raycasterRef.current.intersectObject(model, true);
-        if (intersects.length > 0) {
-          controls.enabled = false;
-          const point = new THREE.Vector3();
-          raycasterRef.current.ray.intersectPlane(planeRef.current, point);
-          draggedRef.current = {
-            id,
-            model,
-            offset: model.position.clone().sub(point)
-          };
-          renderer.domElement.style.cursor = 'grabbing';
-          break;
-        }
+      // Pick the nearest hit model (not the first one in insertion order)
+      let best: { id: string; model: THREE.Group; distance: number } | null = null;
+      for (const [id, model] of modelsRef.current.entries()) {
+        const hit = raycasterRef.current.intersectObject(model, true)[0];
+        if (hit && (!best || hit.distance < best.distance)) best = { id, model, distance: hit.distance };
       }
+      if (!best) return;
+      const point = new THREE.Vector3();
+      if (!raycasterRef.current.ray.intersectPlane(planeRef.current, point)) return;
+      controls.enabled = false;
+      draggedRef.current = {
+        id: best.id,
+        model: best.model,
+        offset: best.model.position.clone().sub(point)
+      };
+      renderer.domElement.style.cursor = 'grabbing';
     };
 
     const onPointerMove = (e: PointerEvent) => {
@@ -692,7 +361,8 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
       getMousePosition(e);
       raycasterRef.current.setFromCamera(mouseRef.current, camera);
       const point = new THREE.Vector3();
-      raycasterRef.current.ray.intersectPlane(planeRef.current, point);
+      // Ray parallel to / pointing away from the ground: keep last position
+      if (!raycasterRef.current.ray.intersectPlane(planeRef.current, point)) return;
       
       const newPos = point.add(draggedRef.current.offset);
       draggedRef.current.model.position.x = newPos.x;
@@ -729,13 +399,35 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
 
     return () => {
       window.removeEventListener('resize', onResize);
+      resizeObserver?.disconnect();
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
       renderer.domElement.removeEventListener('pointermove', onPointerMove);
       renderer.domElement.removeEventListener('pointerup', onPointerUp);
       renderer.domElement.removeEventListener('pointerleave', onPointerUp);
       cancelAnimationFrame(frameRef.current);
+      controls.dispose();
+      // Dispose everything in the scene (models, labels, flows, trees, sky, ground)
+      disposeObject(scene);
+      envTarget.dispose();
+      groundTexture.dispose();
+      sun.dispose(); // frees the shadow-map render target
+      modelsRef.current.clear();
+      labelMapRef.current.clear();
+      flowsRef.current = [];
+      rotatingPartsRef.current = [];
+      sunRef.current = null;
+      treesRef.current = null;
+      draggedRef.current = null;
+      fittedKeyRef.current = null;
+      sceneRef.current = null;
+      rendererRef.current = null;
+      cameraRef.current = null;
+      controlsRef.current = null;
+      labelsRef.current = null;
       renderer.dispose();
-      container.removeChild(renderer.domElement);
+      // Release the WebGL context now; browsers cap live contexts (~16)
+      renderer.forceContextLoss();
+      if (renderer.domElement.parentNode === container) container.removeChild(renderer.domElement);
     };
   }, []); // animate and onComponentMove handled via refs
 
@@ -744,15 +436,28 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
     const labelsGroup = labelsRef.current;
     if (!scene || !labelsGroup) return;
 
-    // Clear existing
-    modelsRef.current.forEach(model => scene.remove(model));
+    // Clear existing (and free their GPU resources, otherwise every config
+    // change leaks geometries/materials/textures)
+    modelsRef.current.forEach(model => { scene.remove(model); disposeObject(model); });
     modelsRef.current.clear();
-    while (labelsGroup.children.length) labelsGroup.remove(labelsGroup.children[0]);
-    flowParticlesRef.current.forEach(fp => scene.remove(fp.particles));
-    flowParticlesRef.current = [];
+    while (labelsGroup.children.length) {
+      const child = labelsGroup.children[0];
+      labelsGroup.remove(child);
+      disposeObject(child);
+    }
+    labelMapRef.current.clear();
+    flowsRef.current.forEach(f => { scene.remove(f.group); disposeObject(f.group); });
+    flowsRef.current = [];
     rotatingPartsRef.current = [];
+    const trees = treesRef.current;
+    if (trees) while (trees.children.length) { const t = trees.children[0]; trees.remove(t); disposeObject(t); }
+    // A drag in progress refers to a model that no longer exists
+    draggedRef.current = null;
+    if (controlsRef.current) controlsRef.current.enabled = true;
 
     if (!config) return;
+    const components: DTComponent[] = Array.isArray(config.components) ? config.components : [];
+    const connections: DTConnection[] = Array.isArray(config.connections) ? config.connections : [];
 
     const scale = 0.035;
     const offsetX = -5;
@@ -762,29 +467,18 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
     const GENERATORS = new Set(['solar_pv', 'wind_turbine', 'chp_unit']);
 
     // Create models
-    config.components.forEach((comp: DTComponent) => {
-      const model = createComponentModel(comp.type, comp.params);
-      const x = comp.x * scale + offsetX;
-      const z = comp.y * scale + offsetZ;
+    components.forEach((comp: DTComponent) => {
+      const model = createComponentModel(comp.type, comp.params || {});
+      const x = (Number(comp.x) || 0) * scale + offsetX;
+      const z = (Number(comp.y) || 0) * scale + offsetZ;
       model.position.set(x, 0, z);
-      
-      // Enable shadows on all meshes
-      model.traverse(child => {
-        if ((child as THREE.Mesh).isMesh) {
-          child.castShadow = true;
-          child.receiveShadow = true;
-        }
-      });
-      
-      // Mark generators for pulse animation
-      model.userData.isGenerator = GENERATORS.has(comp.type);
       
       scene.add(model);
       modelsRef.current.set(comp.id, model);
 
       // Find rotating parts
       model.traverse(child => {
-        if (child.userData.isRotating) {
+        if (child.userData.rotate) {
           rotatingPartsRef.current.push(child);
         }
       });
@@ -792,17 +486,18 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
       // Get model height for label
       const box = new THREE.Box3().setFromObject(model);
       const height = box.max.y;
-      const label = createLabel(comp.name, new THREE.Vector3(x, 0, z), height);
+      const label = createLabel(comp.name, comp.type, new THREE.Vector3(x, 0, z), Number.isFinite(height) ? height : 0);
       labelsGroup.add(label);
+      labelMapRef.current.set(comp.id, label);
     });
 
     // Create connections with correct flow direction
     // Generators: energy flows OUT; Consumers: energy flows IN
     const CONSUMERS = new Set(['smart_building', 'ev_charger', 'load_center', 'heat_pump']);
     
-    config.connections.forEach((conn: DTConnection) => {
-      const fromComp = config.components.find((c: DTComponent) => c.id === conn.from);
-      const toComp = config.components.find((c: DTComponent) => c.id === conn.to);
+    connections.forEach((conn: DTConnection) => {
+      const fromComp = components.find((c: DTComponent) => c.id === conn.from);
+      const toComp = components.find((c: DTComponent) => c.id === conn.to);
       const fromModel = modelsRef.current.get(conn.from);
       const toModel = modelsRef.current.get(conn.to);
       if (!fromModel || !toModel || !fromComp || !toComp) return;
@@ -823,28 +518,65 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove }: P
         [flowStart, flowEnd] = [flowEnd, flowStart];
       }
       
-      flowStart.y = 0.5;
-      flowEnd.y = 0.5;
-
-      const flowColor = conn.type === 'heat' ? 0xef4444 : conn.type === 'both' ? 0xa855f7 : 0x3b82f6;
-
-      // Particles flow in correct direction
-      const particles = new EnergyFlowParticles(flowStart, flowEnd, flowColor, 18);
-      scene.add(particles.particles);
-      flowParticlesRef.current.push(particles);
+      const flowColor = conn.type === 'heat' ? 0xff6a3d : conn.type === 'both' ? 0xc084fc : 0x38bdf8;
+      const flow = new EnergyFlow(flowStart, flowEnd, flowColor);
+      scene.add(flow.group);
+      flowsRef.current.push(flow);
     });
 
-    // Fit camera
-    if (config.components.length > 0) {
-      const box = new THREE.Box3();
-      modelsRef.current.forEach(m => box.expandByObject(m));
-      const center = new THREE.Vector3();
-      const size = new THREE.Vector3();
-      box.getCenter(center);
-      box.getSize(size);
+    // Fit camera only when the set of components changes; re-fitting on every
+    // config update (e.g. after a drag via onComponentMove) yanks the camera.
+    const site = new THREE.Box3();
+    modelsRef.current.forEach(m => {
+      let padded = false;
+      m.traverse(o => { if (o.userData.isPad) { site.expandByObject(o); padded = true; } });
+      if (!padded) site.expandByObject(m);
+    });
+    if (!site.isEmpty()) {
+      const c = site.getCenter(new THREE.Vector3());
+      const size = site.getSize(new THREE.Vector3());
+      const r = Math.max(size.x, size.z) / 2 + 3;
+      const sun = sunRef.current;
+      if (sun) {
+        const dir = sun.position.clone().sub(sun.target.position).normalize();
+        sun.target.position.set(c.x, 0, c.z);
+        sun.position.copy(sun.target.position).addScaledVector(dir, 40);
+        const cam = sun.shadow.camera;
+        cam.left = cam.bottom = -r - 2;
+        cam.right = cam.top = r + 2;
+        cam.updateProjectionMatrix();
+      }
+      // Landscaping: irregular clumps of trees outside the site, leaving the
+      // camera-facing side mostly open
+      if (trees) {
+        const hx = size.x / 2 + 1.6, hz = size.z / 2 + 1.6;
+        const rand = (i: number) => { const v = Math.sin(i * 127.1 + 311.7) * 43758.5453; return v - Math.floor(v); };
+        const clumps = 7 + Math.round(r);
+        for (let k = 0; k < clumps; k++) {
+          const a = rand(k) * Math.PI * 2;
+          if (Math.cos(a - Math.PI / 4) > 0.75) continue; // keep the default view corridor clear
+          const d = 1 + rand(k + 50) * 0.9;
+          const cx = c.x + Math.cos(a) * hx * d * 1.15;
+          const cz = c.z + Math.sin(a) * hz * d * 1.15;
+          const n = 2 + Math.floor(rand(k + 90) * 4);
+          for (let j = 0; j < n; j++) {
+            const tree = createTree(k * 10 + j + 1);
+            tree.position.set(cx + (rand(k * 7 + j) - 0.5) * 2.2, 0, cz + (rand(k * 13 + j) - 0.5) * 2.2);
+            trees.add(tree);
+          }
+        }
+      }
+    }
+
+    const fitKey = components.map(c => c.id).sort().join('|');
+    if (components.length > 0 && fitKey !== fittedKeyRef.current) {
+      fittedKeyRef.current = fitKey;
+      const center = site.getCenter(new THREE.Vector3());
+      const size = site.getSize(new THREE.Vector3());
+      center.y = 0.8;
       controlsRef.current?.target.copy(center);
-      const dist = Math.max(size.x, size.z) * 2;
-      cameraRef.current?.position.set(center.x + dist, dist * 0.7, center.z + dist);
+      const dist = Math.max(size.x, size.z, 4) * 0.85 + 3;
+      cameraRef.current?.position.set(center.x + dist * 0.9, dist * 0.62, center.z + dist);
       controlsRef.current?.update();
     }
   }, [config]);

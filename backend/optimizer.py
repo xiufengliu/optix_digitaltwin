@@ -50,6 +50,7 @@ class MeritOrderOptimizer:
         grid_import = np.zeros(n)
         dsm_charge = np.zeros(n)    # increase demand now
         dsm_discharge = np.zeros(n) # reduce demand later
+        soc_trace = np.zeros(n)     # battery state of charge at end of step (MWh)
 
         # DSM capacities (simple approximation per paper narrative)
         flex = max(0.0, min(1.0, self.cfg.flexible_load_share))
@@ -112,6 +113,8 @@ class MeritOrderOptimizer:
             if load_e > 1e-12:
                 grid_import[t] = load_e
 
+            soc_trace[t] = soc
+
         total_gen_mwh = float(np.sum(pv_mw) * dt)
         total_demand_mwh = float(np.sum(load_mw) * dt)
         ped_abs = total_gen_mwh - total_demand_mwh
@@ -136,7 +139,12 @@ class MeritOrderOptimizer:
                 'export_mwh': float(np.sum(pv_export)),
                 'battery_throughput_mwh': float(np.sum(pv_to_batt) + np.sum(batt_to_load)),
                 'grid_import_mwh': float(np.sum(grid_import)),
+                # Share of on-site generation used locally (directly, via battery or DSM)
+                'self_consumption_ratio': float((np.sum(pv_to_load) + np.sum(pv_to_batt) + np.sum(dsm_charge)) / (np.sum(pv_mw) * dt + 1e-9)),
+                # Share of demand covered without grid import
+                'self_sufficiency_ratio': float(1.0 - np.sum(grid_import) / (np.sum(load_mw) * dt + 1e-9)),
             },
+            'soc_mwh': soc_trace,
             'dt_hours': dt,
         }
 

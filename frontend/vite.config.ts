@@ -25,7 +25,15 @@ export default defineConfig({
       host: process.env.VITE_HMR_HOST, 
       clientPort: parseInt(process.env.VITE_HMR_PORT || '443')
     } : undefined,
-    proxy: { '/api': { target: process.env.BACKEND_URL || 'http://127.0.0.1:8000', changeOrigin: true } },
+    // Proxy API calls during dev; strip the /api prefix so backend sees root paths
+    proxy: {
+      '/api': {
+        target: process.env.BACKEND_URL || 'http://127.0.0.1:8000',
+        changeOrigin: true,
+        ws: true, // /runs/{id}/ws
+        rewrite: (path) => path.replace(/^\/api/, ''),
+      },
+    },
   },
 
   preview: {

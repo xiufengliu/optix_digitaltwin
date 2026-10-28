@@ -59,10 +59,14 @@ class SimulationManager:
     """Centralized registry for active simulation sessions."""
 
     _global_manager: Optional["SimulationManager"] = None
+    # Each fallback session holds several full-length arrays; cap memory use by
+    # evicting the least recently used session (its run can be restarted).
+    MAX_SESSIONS = 24
 
     def __init__(self, settings: Optional[SimulationSettings] = None):
         self.settings = (settings or SimulationSettings()).resolve(Path.cwd())
         self._sessions: Dict[str, SimulationSession] = {}
+        self._data_cache: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
@@ -161,7 +165,13 @@ class SimulationManager:
             last_info=info,
         )
         self._sessions[session.session_id] = session
+        while len(self._sessions) > self.MAX_SESSIONS:
+            oldest_id = next(iter(self._sessions))
+            self.close_session(oldest_id)
         return session
+
+    def has_session(self, session_id: Optional[str]) -> bool:
+        return bool(session_id) and session_id in self._sessions
 
     def close_session(self, session_id: str) -> None:
         """Close and remove a session if it exists."""
@@ -179,11 +189,17 @@ class SimulationManager:
     def get_session(self, session_id: str) -> SimulationSession:
         if session_id not in self._sessions:
             raise KeyError(f"Unknown simulation session: {session_id}")
-        return self._sessions[session_id]
+        # Mark as most recently used for eviction ordering
+        session = self._sessions.pop(session_id)
+        self._sessions[session_id] = session
+        return session
 
     def step_session(self, session_id: str, steps: int = 1) -> Dict[str, Any]:
         session = self.get_session(session_id)
         active_env = session.wrapper or session.env
+
+        if self._is_done(session):
+            return self.build_state_snapshot(session)
 
         for _ in range(max(1, steps)):
             actions = self._build_default_actions(active_env)
@@ -196,16 +212,20 @@ class SimulationManager:
             session.last_info = info
             session.steps_taken += 1
 
-            if all(terminations.get(agent, False) or truncations.get(agent, False) for agent in getattr(active_env, "agents", [])):
-                observations, info = self._reset_environment(session.env, session.wrapper)
-                session.last_observation = observations
-                session.last_info = info
-                session.last_rewards = {}
-                session.last_terminations = {}
-                session.last_truncations = {}
+            # Stop at the end of the episode. Resetting here would rewind t to 0
+            # and discard the accumulated horizon used by the PED/chart endpoints.
+            if self._is_done(session):
                 break
 
         return self.build_state_snapshot(session)
+
+    @staticmethod
+    def _is_done(session: SimulationSession) -> bool:
+        agents = getattr(session.wrapper or session.env, "agents", [])
+        return bool(agents) and all(
+            session.last_terminations.get(agent, False) or session.last_truncations.get(agent, False)
+            for agent in agents
+        )
 
     def build_state_snapshot(self, session: SimulationSession) -> Dict[str, Any]:
         env = session.wrapper or session.env
@@ -226,6 +246,8 @@ class SimulationManager:
             "fund_nav": self._safe_float(getattr(env, "equity", None)),
             "budget": self._safe_float(getattr(env, "budget", None)),
             "last_revenue": self._safe_float(getattr(env, "last_revenue", None)),
+            "cumulative_revenue": self._safe_float(getattr(env, "cumulative_revenue", None)),
+            "done": self._is_done(session),
         }
 
         return {
@@ -242,9 +264,17 @@ class SimulationManager:
     # Helpers
     # ------------------------------------------------------------------
     def _load_data(self, path: Path):
+        """Load the CSV once per (path, mtime); sessions only read from it."""
         from .data_loader import load_energy_dataframe
 
-        return load_energy_dataframe(path)
+        key = str(path)
+        mtime = path.stat().st_mtime if path.is_file() else None
+        cached = self._data_cache.get(key)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        df = load_energy_dataframe(path)
+        self._data_cache[key] = (mtime, df)
+        return df
 
     @staticmethod
     def _reset_environment(env: RenewableMultiAgentEnv, wrapper: Optional[Any]):
@@ -347,16 +377,29 @@ class _MinimalEnv:
         self._load = raw_load
         self._apply_config_overrides(raw_wind, raw_solar, raw_hydro, raw_load)
         self._price = (data["price"].to_numpy() if "price" in data.columns else np.zeros(n))
+        # Shared (uncopied) column; formatted lazily per observation
+        self._timestamps = data["timestamp"] if "timestamp" in data.columns else None
+        self.dt_hours = 1.0 / 6.0
+        try:
+            if self._timestamps is not None and len(self._timestamps) > 1:
+                delta = (self._timestamps.iloc[1] - self._timestamps.iloc[0]).total_seconds() / 3600.0
+                if delta > 0:
+                    self.dt_hours = float(delta)
+        except Exception:
+            pass
         self.t = 0
         self.equity = None
         self.budget = None
         self.last_revenue = 0.0
+        self.cumulative_revenue = 0.0
 
     def action_space(self, agent):
         return _Space(shape=(1,), dtype=np.float32)
 
     def reset(self):
         self.t = 0
+        self.last_revenue = 0.0
+        self.cumulative_revenue = 0.0
         obs = {"manager": self._build_obs(self.t)}
         info = {}
         return obs, info
@@ -367,7 +410,9 @@ class _MinimalEnv:
         load = float(self._load[idx]) if idx < len(self._load) else 0.0
         price = float(self._price[idx]) if idx < len(self._price) else 0.0
         net = pv - load
-        self.last_revenue = net * price
+        # MW × DKK/MWh × h → DKK for this step (positive = export value, negative = import cost)
+        self.last_revenue = net * price * self.dt_hours
+        self.cumulative_revenue += self.last_revenue
 
         self.t = min(idx + 1, len(self._load))
 
@@ -387,6 +432,7 @@ class _MinimalEnv:
             "hydro": float(self._hydro[i] if i < len(self._hydro) else 0.0),
             "load": float(self._load[i] if i < len(self._load) else 0.0),
             "price": float(self._price[i] if i < len(self._price) else 0.0),
+            "timestamp": str(self._timestamps.iloc[i]) if self._timestamps is not None and i < len(self._timestamps) else None,
         }
 
     def close(self):
@@ -414,9 +460,15 @@ class _MinimalEnv:
                 return np.zeros_like(raw, dtype=float)
             return (raw.astype(float) / peak) * float(target_peak_mw)
 
-        self._wind = scale_to_peak(raw_wind, as_float("owned_wind_capacity_mw"))
-        self._solar = scale_to_peak(raw_solar, as_float("owned_solar_capacity_mw"))
-        self._hydro = scale_to_peak(raw_hydro, as_float("owned_hydro_capacity_mw"))
+        local_keys = ("owned_solar_capacity_mw", "owned_wind_capacity_mw", "owned_hydro_capacity_mw", "owned_load_peak_mw")
+        if not any(key in overrides for key in local_keys):
+            return
+
+        # Local-asset mode: unspecified generators are absent (0 MW), matching
+        # routes._extract_metric_series so live values and PED metrics agree.
+        self._wind = scale_to_peak(raw_wind, as_float("owned_wind_capacity_mw") or 0.0)
+        self._solar = scale_to_peak(raw_solar, as_float("owned_solar_capacity_mw") or 0.0)
+        self._hydro = scale_to_peak(raw_hydro, as_float("owned_hydro_capacity_mw") or 0.0)
 
         load_peak = as_float("owned_load_peak_mw")
         if load_peak is not None:

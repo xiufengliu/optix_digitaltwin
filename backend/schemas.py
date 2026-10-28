@@ -59,7 +59,7 @@ class SimulationRunRead(BaseModel):
 class SimulationStepRequest(BaseModel):
     """Payload when advancing a simulation run."""
 
-    steps: int = Field(1, ge=1, le=100, description="Number of environment steps to execute")
+    steps: int = Field(1, ge=1, le=10000, description="Number of environment steps to execute")
 
 
 class SimulationState(BaseModel):

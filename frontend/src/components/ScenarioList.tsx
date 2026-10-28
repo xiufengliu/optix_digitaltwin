@@ -1,600 +1,454 @@
-import React, { useEffect, useState } from 'react';
-import type { CompareRunRow, CompareRunsResponse, Scenario, ScenarioCreate, SimulationRun } from '../types';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { apiFetch } from '../lib/api';
+import { formatDuration, formatEnergy } from '../lib/format';
+import { PedGauge } from './AnalyticsPanels';
+import { RunStatusBadge } from './RunList';
+import type { CompareRunsResponse, Scenario, ScenarioCreate, SimulationRun } from '../types';
 
 interface ScenarioListProps {
   apiBase: string;
   onRun: (runId: string) => void;
 }
 
-const defaultOverrides = {
-  owned_wind_capacity_mw: 270,
-  owned_solar_capacity_mw: 100,
-  owned_hydro_capacity_mw: 40,
-  owned_battery_capacity_mwh: 10,
-  physical_allocation: 0.88,
-  financial_allocation: 0.12,
+const PAPER_SCENARIO_NAMES = [
+  'Scenario 1: Baseline',
+  'Scenario 2: High PV Deployment',
+  'Scenario 3: High PV + Battery (4h)',
+  'Scenario 4: High PV + Large Battery',
+  'Scenario 5: DSM (Flexible Demand)',
+];
+
+/** Editable fields, shown in building-friendly units and stored in backend units. */
+type Field = { key: string; label: string; unit: string; scale: number; step: number; min?: number; max?: number; hint: string };
+const ASSET_FIELDS: Field[] = [
+  { key: 'owned_solar_capacity_mw', label: 'Solar PV', unit: 'kWp', scale: 1000, step: 1, min: 0, hint: 'Rooftop PV nameplate. ~171 kWp fits the reference roof.' },
+  { key: 'owned_wind_capacity_mw', label: 'Wind', unit: 'kW', scale: 1000, step: 1, min: 0, hint: 'On-site wind capacity.' },
+  { key: 'owned_hydro_capacity_mw', label: 'Hydro', unit: 'kW', scale: 1000, step: 1, min: 0, hint: 'On-site hydro capacity.' },
+  { key: 'owned_load_peak_mw', label: 'Peak electric load', unit: 'kW', scale: 1000, step: 1, min: 0, hint: 'The demand profile is scaled to this peak.' },
+];
+const STORAGE_FIELDS: Field[] = [
+  { key: 'owned_battery_capacity_mwh', label: 'Battery energy', unit: 'kWh', scale: 1000, step: 1, min: 0, hint: 'Usable storage capacity.' },
+  { key: 'batt_power_c_rate', label: 'Battery C-rate', unit: '1/h', scale: 1, step: 0.05, min: 0.05, max: 4, hint: '0.25 = 4-hour battery (power = energy × C-rate).' },
+  { key: 'flexible_load_share', label: 'Flexible load share', unit: '%', scale: 100, step: 1, min: 0, max: 100, hint: 'Share of demand that DSM may shift.' },
+  { key: 'max_shift_hours', label: 'Max shift window', unit: 'h', scale: 1, step: 0.5, min: 0, hint: 'How far DSM may move demand in time.' },
+  { key: 'investment_freq', label: 'Decision interval', unit: 'steps', scale: 1, step: 1, min: 1, hint: 'Lower = more responsive control.' },
+];
+const KNOWN_KEYS = new Set([...ASSET_FIELDS, ...STORAGE_FIELDS].map((f) => f.key));
+
+const NEW_SCENARIO_OVERRIDES: Record<string, number> = {
+  owned_solar_capacity_mw: 0.171,
+  owned_wind_capacity_mw: 0,
+  owned_hydro_capacity_mw: 0,
+  owned_load_peak_mw: 0.15,
+  owned_battery_capacity_mwh: 0.32,
+  batt_power_c_rate: 0.25,
   investment_freq: 12,
 };
+
+type Draft = { name: string; description: string; details: string; overrides: Record<string, unknown> };
+const newDraft = (): Draft => ({ name: 'My scenario', description: '', details: '', overrides: { ...NEW_SCENARIO_OVERRIDES } });
+const draftFrom = (s: Scenario): Draft => ({ name: s.name, description: s.description ?? '', details: s.details ?? '', overrides: { ...(s.config_overrides || {}) } });
+
+type Notice = { tone: 'ok' | 'error'; text: string } | null;
 
 export function ScenarioList({ apiBase, onRun }: ScenarioListProps) {
   const [scenarios, setScenarios] = useState<Scenario[]>([]);
   const [loading, setLoading] = useState(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [name, setName] = useState('My Scenario');
-  const [desc, setDesc] = useState('');
-  const [details, setDetails] = useState('');
-  const [overrides, setOverrides] = useState<Record<string, any>>(defaultOverrides);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [showGuide, setShowGuide] = useState(true);
-  const [runBusyId, setRunBusyId] = useState<string | null>(null);
-  const [runError, setRunError] = useState<string | null>(null);
-  const [compareRows, setCompareRows] = useState<CompareRunRow[]>([]);
-  const [compareMeta, setCompareMeta] = useState<{ commonSteps: number | null; commonPeriodHours: number | null }>({
-    commonSteps: null,
-    commonPeriodHours: null,
-  });
-  const [mobileTab, setMobileTab] = useState<'list' | 'edit' | 'compare'>('list');
+  const [draft, setDraft] = useState<Draft>(newDraft);
+  const [dirty, setDirty] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice>(null);
+  const [mobilePane, setMobilePane] = useState<'list' | 'edit' | 'compare'>('list');
 
-  const join = (p: string) => {
-    const base = apiBase.endsWith('/') ? apiBase : apiBase + '/';
-    const clean = p.replace(/^\/+/, '');
-    return new URL(clean, base).toString();
-  };
-
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true);
-    setLoadError(null);
     try {
-      const r = await fetch(join('/scenarios'));
-      if (!r.ok) {
-        const message = await r.text();
-        throw new Error(message || `Failed to load scenarios (${r.status})`);
-      }
-      const data = (await r.json()) as Scenario[];
-      setScenarios(data);
-    } catch (error: any) {
-      setScenarios([]);
-      setLoadError(error?.message ?? 'Failed to load scenarios.');
+      setScenarios(await apiFetch<Scenario[]>(apiBase, '/scenarios'));
+    } catch (e) {
+      setNotice({ tone: 'error', text: `Could not load scenarios: ${(e as Error).message}` });
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
-  };
+  }, [apiBase]);
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); }, [load]);
 
-  const saveScenario = async () => {
-    const payload: ScenarioCreate = { name, description: desc, details, config_overrides: overrides };
-    const r = await fetch(join('/scenarios'), {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
-    });
-    if (r.ok) { await load(); }
-  };
+  useEffect(() => {
+    if (!notice || notice.tone === 'error') return;
+    const t = window.setTimeout(() => setNotice(null), 3500);
+    return () => window.clearTimeout(t);
+  }, [notice]);
 
-  const runScenario = async (id: string) => {
-    setRunError(null); setRunBusyId(id);
-    // Also select + populate the form before running so details are visible
-    const s = scenarios.find((x) => x.id === id);
-    if (s) {
-      setSelectedId(s.id);
-      setName(s.name);
-      setDesc(s.description ?? '');
-      setDetails(s.details ?? '');
-      setOverrides({ ...defaultOverrides, ...(s.config_overrides || {}) });
+  // Only the oldest row with a paper name is the canonical, read-only preset;
+  // later copies with the same name are ordinary (deletable) user scenarios.
+  const paperIds = useMemo(() => {
+    const ids = new Set<string>();
+    const byAge = [...scenarios].sort((a, b) => a.created_at.localeCompare(b.created_at));
+    for (const name of PAPER_SCENARIO_NAMES) {
+      const first = byAge.find((s) => s.name === name);
+      if (first) ids.add(first.id);
     }
-    try {
-      const r = await fetch(join(`/scenarios/${id}/run`), { method: 'POST' });
-      if (r.ok) {
-        const body = await r.json();
-        onRun(body.id);
-      } else {
-        const txt = await r.text();
-        setRunError(`Run failed (${r.status}): ${txt}`);
-      }
-    } catch (e: any) {
-      setRunError(e?.message ?? String(e));
-    } finally { setRunBusyId(null); }
+    return ids;
+  }, [scenarios]);
+
+  const paper = PAPER_SCENARIO_NAMES.map((n) => scenarios.find((s) => s.name === n && paperIds.has(s.id))).filter(Boolean) as Scenario[];
+  const custom = scenarios.filter((s) => !paperIds.has(s.id));
+  const selected = scenarios.find((s) => s.id === selectedId) ?? null;
+  const readOnly = Boolean(selected && paperIds.has(selected.id));
+
+  const select = (s: Scenario | null) => {
+    if (dirty && !confirm('Discard unsaved changes?')) return;
+    setSelectedId(s?.id ?? null);
+    setDraft(s ? draftFrom(s) : newDraft());
+    setDirty(false);
+    setMobilePane('edit');
   };
 
-  const deleteScenario = async (id: string) => {
-    if (!confirm('Delete this scenario? This cannot be undone.')) return;
-    const r = await fetch(join(`/scenarios/${id}`), { method: 'DELETE' });
-    if (r.ok) { await load(); }
+  const update = (patch: Partial<Draft>) => { setDraft((d) => ({ ...d, ...patch })); setDirty(true); };
+  const setOverride = (key: string, value: number | null) => {
+    const next = { ...draft.overrides };
+    if (value === null) delete next[key]; else next[key] = value;
+    update({ overrides: next });
   };
 
-  const onChange = (key: string, value: number) => setOverrides({ ...overrides, [key]: value });
+  const payload = (name = draft.name): ScenarioCreate => ({
+    name: name.trim() || 'Untitled scenario',
+    description: draft.description,
+    details: draft.details,
+    config_overrides: draft.overrides,
+  });
 
-  const fmt = (value: number | null | undefined, digits = 1) =>
-    value == null || !Number.isFinite(value) ? '-' : value.toFixed(digits);
-
-  // duplicateScenario removed per request
-
-  const loadCompare = async () => {
+  const saveNew = async () => {
+    setBusy('save');
     try {
-      const r = await fetch(join('/runs'));
-      if (!r.ok) return;
-      const runs = (await r.json()) as SimulationRun[];
+      const name = readOnly ? `My ${draft.name.replace(/^Scenario \d+:\s*/, '')}` : draft.name;
+      const created = await apiFetch<Scenario>(apiBase, '/scenarios', { method: 'POST', body: payload(name) });
+      await load();
+      setSelectedId(created.id);
+      setDraft(draftFrom(created));
+      setDirty(false);
+      setNotice({ tone: 'ok', text: `Saved “${created.name}”.` });
+    } catch (e) {
+      setNotice({ tone: 'error', text: `Save failed: ${(e as Error).message}` });
+    } finally { setBusy(null); }
+  };
 
-      const grouped = new Map<string, SimulationRun[]>();
-      for (const run of runs) {
-        const key = run.name || run.id;
-        const bucket = grouped.get(key) ?? [];
-        bucket.push(run);
-        grouped.set(key, bucket);
-      }
+  const saveChanges = async () => {
+    if (!selected) return;
+    setBusy('save');
+    try {
+      await apiFetch<Scenario>(apiBase, `/scenarios/${selected.id}`, { method: 'PATCH', body: payload() });
+      await load();
+      setDirty(false);
+      setNotice({ tone: 'ok', text: 'Changes saved.' });
+    } catch (e) {
+      setNotice({ tone: 'error', text: `Save failed: ${(e as Error).message}` });
+    } finally { setBusy(null); }
+  };
 
-      const selectedRuns = Array.from(grouped.values())
-        .map((group) => group.find((run) => run.session_id) ?? group[0])
-        .slice(0, 8);
+  const remove = async (s: Scenario) => {
+    if (!confirm(`Delete “${s.name}”? This cannot be undone.`)) return;
+    try {
+      await apiFetch(apiBase, `/scenarios/${s.id}`, { method: 'DELETE' });
+      if (selectedId === s.id) { setSelectedId(null); setDraft(newDraft()); setDirty(false); }
+      await load();
+    } catch (e) {
+      setNotice({ tone: 'error', text: `Delete failed: ${(e as Error).message}` });
+    }
+  };
 
-      if (selectedRuns.length === 0) {
-        setCompareRows([]);
-        setCompareMeta({ commonSteps: null, commonPeriodHours: null });
-        return;
-      }
+  const run = async (s: Scenario) => {
+    if (s.id === selectedId && dirty) {
+      setNotice({ tone: 'error', text: 'Save your changes first — runs use the saved scenario.' });
+      return;
+    }
+    setBusy(`run:${s.id}`);
+    try {
+      const created = await apiFetch<SimulationRun>(apiBase, `/scenarios/${s.id}/run`, { method: 'POST' });
+      onRun(created.id);
+    } catch (e) {
+      setNotice({ tone: 'error', text: `Run failed: ${(e as Error).message}` });
+    } finally { setBusy(null); }
+  };
 
-      const cr = await fetch(join('/runs/compare'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          run_ids: selectedRuns.map((run) => run.id),
-          use_common_horizon: true,
-        }),
+  const unknownKeys = Object.keys(draft.overrides).filter((k) => !KNOWN_KEYS.has(k));
+
+  const renderCard = (s: Scenario) => {
+    const isPaper = paperIds.has(s.id);
+    const o = s.config_overrides || {};
+    const kw = (k: string) => Math.round(Number(o[k] ?? 0) * 1000);
+    return (
+      <div
+        key={s.id}
+        className={`scenario-card ${selectedId === s.id ? 'is-active' : ''}`}
+        role="button"
+        tabIndex={0}
+        onClick={() => select(s)}
+        onKeyDown={(e) => { if (e.key === 'Enter') select(s); }}
+      >
+        <div className="scenario-card-top">
+          <strong>{s.name}</strong>
+          {isPaper && <span className="badge badge-accent">Paper</span>}
+        </div>
+        {s.description && <p className="muted small clamp-2">{s.description}</p>}
+        <div className="spec-chips">
+          <span className="spec-chip" style={{ ['--chip' as string]: 'var(--c-solar)' }}>PV {kw('owned_solar_capacity_mw')} kWp</span>
+          {kw('owned_wind_capacity_mw') > 0 && <span className="spec-chip" style={{ ['--chip' as string]: 'var(--c-wind)' }}>Wind {kw('owned_wind_capacity_mw')} kW</span>}
+          {kw('owned_battery_capacity_mwh') > 0 && <span className="spec-chip" style={{ ['--chip' as string]: 'var(--c-battery)' }}>Battery {kw('owned_battery_capacity_mwh')} kWh</span>}
+          {Number(o.flexible_load_share ?? 0) > 0 && <span className="spec-chip" style={{ ['--chip' as string]: 'var(--c-dsm)' }}>DSM {Math.round(Number(o.flexible_load_share) * 100)}%</span>}
+        </div>
+        <div className="scenario-card-actions">
+          <button className="btn btn-primary btn-sm" disabled={busy === `run:${s.id}`} onClick={(e) => { e.stopPropagation(); run(s); }}>
+            {busy === `run:${s.id}` ? 'Starting…' : '▶ Run'}
+          </button>
+          {!isPaper && (
+            <button className="btn btn-ghost btn-sm btn-danger" onClick={(e) => { e.stopPropagation(); remove(s); }} aria-label={`Delete ${s.name}`}>
+              Delete
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  const renderField = (f: Field) => {
+    const raw = draft.overrides[f.key];
+    const value = raw === undefined || raw === null || raw === '' ? '' : Number((Number(raw) * f.scale).toFixed(4));
+    return (
+      <label key={f.key} className="field">
+        <span className="field-label">{f.label}</span>
+        <span className="input-unit">
+          <input
+            type="number"
+            inputMode="decimal"
+            step={f.step}
+            min={f.min}
+            max={f.max}
+            value={value}
+            disabled={readOnly}
+            placeholder="not set"
+            onChange={(e) => {
+              const v = e.target.value;
+              setOverride(f.key, v === '' ? null : Number(v) / f.scale);
+            }}
+          />
+          <span className="unit">{f.unit}</span>
+        </span>
+        <span className="field-hint">{f.hint}</span>
+      </label>
+    );
+  };
+
+  return (
+    <div className="scenarios">
+      <div className="segmented mobile-only" role="tablist">
+        {(['list', 'edit', 'compare'] as const).map((p) => (
+          <button key={p} role="tab" aria-selected={mobilePane === p} className={mobilePane === p ? 'is-active' : ''} onClick={() => setMobilePane(p)}>
+            {p === 'list' ? 'Scenarios' : p === 'edit' ? 'Editor' : 'Compare'}
+          </button>
+        ))}
+      </div>
+
+      {notice && (
+        <div className={`notice notice-${notice.tone}`} role={notice.tone === 'error' ? 'alert' : 'status'}>
+          <span>{notice.text}</span>
+          <button className="btn btn-ghost btn-sm" onClick={() => setNotice(null)} aria-label="Dismiss">✕</button>
+        </div>
+      )}
+
+      <div className="scenarios-grid">
+        <section className={`card scenarios-list ${mobilePane === 'list' ? 'is-mobile-visible' : ''}`}>
+          <div className="panel-header">
+            <h2>Scenarios</h2>
+            <div className="row gap-xs">
+              <button className="btn btn-ghost btn-icon" onClick={load} disabled={loading} aria-label="Refresh scenarios" title="Refresh"><span className={loading ? 'spin' : ''}>↻</span></button>
+              <button className="btn btn-primary btn-sm" onClick={() => select(null)}>+ New</button>
+            </div>
+          </div>
+          <h3 className="section-title">Reference scenarios (paper)</h3>
+          <div className="scenario-cards">{paper.map(renderCard)}</div>
+          <h3 className="section-title">Your scenarios</h3>
+          <div className="scenario-cards">
+            {custom.length === 0 ? <p className="muted small">None yet. Open a reference scenario and “Duplicate”, or create a new one.</p> : custom.map(renderCard)}
+          </div>
+        </section>
+
+        <section className={`card scenario-editor ${mobilePane === 'edit' ? 'is-mobile-visible' : ''}`}>
+          <div className="panel-header">
+            <div>
+              <h2>{selected ? (readOnly ? 'Reference scenario' : 'Edit scenario') : 'New scenario'}</h2>
+              {readOnly && <p className="muted small">Read-only. Duplicate it to experiment with your own values.</p>}
+            </div>
+            <div className="row gap-xs wrap">
+              {selected && (
+                <button className="btn btn-secondary btn-sm" disabled={busy === `run:${selected.id}`} onClick={() => run(selected)}>▶ Run</button>
+              )}
+              {selected && !readOnly && (
+                <button className="btn btn-primary btn-sm" disabled={!dirty || busy === 'save'} onClick={saveChanges}>Save changes</button>
+              )}
+              <button className={`btn btn-sm ${selected ? 'btn-secondary' : 'btn-primary'}`} disabled={busy === 'save'} onClick={saveNew}>
+                {readOnly ? 'Duplicate' : selected ? 'Save as new' : 'Create scenario'}
+              </button>
+            </div>
+          </div>
+
+          <div className="form-grid">
+            <label className="field span-2">
+              <span className="field-label">Name</span>
+              <input value={draft.name} disabled={readOnly} onChange={(e) => update({ name: e.target.value })} />
+            </label>
+            <label className="field span-2">
+              <span className="field-label">Summary</span>
+              <input value={draft.description} disabled={readOnly} placeholder="One line shown in lists" onChange={(e) => update({ description: e.target.value })} />
+            </label>
+            <label className="field span-2">
+              <span className="field-label">Details</span>
+              <textarea rows={3} value={draft.details} disabled={readOnly} placeholder="Assumptions, purpose, expected effects…" onChange={(e) => update({ details: e.target.value })} />
+            </label>
+          </div>
+
+          <h3 className="section-title">Generation & demand</h3>
+          <div className="form-grid">{ASSET_FIELDS.map(renderField)}</div>
+          <h3 className="section-title">Storage & flexibility</h3>
+          <div className="form-grid">{STORAGE_FIELDS.map(renderField)}</div>
+
+          {unknownKeys.length > 0 && (
+            <>
+              <h3 className="section-title">Other overrides</h3>
+              <div className="spec-chips">
+                {unknownKeys.map((k) => (
+                  <span key={k} className="spec-chip">
+                    <code>{k}</code> = {String(draft.overrides[k])}
+                    {!readOnly && <button className="chip-remove" onClick={() => setOverride(k, null)} aria-label={`Remove ${k}`}>✕</button>}
+                  </span>
+                ))}
+              </div>
+            </>
+          )}
+
+          <details className="guide">
+            <summary>How to design a Positive Energy District scenario</summary>
+            <p>A PED generates at least as much renewable energy on site as it consumes over a year (PED ratio ≥ 1.0).</p>
+            <ul>
+              <li><b>Solar PV</b> raises mid-day generation; surplus is exported.</li>
+              <li><b>Battery</b> shifts surplus PV into the evening: more self-consumption, less import and export.</li>
+              <li><b>Flexible load</b> (DSM) moves demand towards PV hours without changing annual energy.</li>
+            </ul>
+            <p>Iterate: run → step through a year → compare PED ratio and self-sufficiency below.</p>
+          </details>
+        </section>
+
+        <section className={`card scenario-compare ${mobilePane === 'compare' ? 'is-mobile-visible' : ''}`}>
+          <CompareRuns apiBase={apiBase} />
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function CompareRuns({ apiBase }: { apiBase: string }) {
+  const [runs, setRuns] = useState<SimulationRun[]>([]);
+  const [chosen, setChosen] = useState<Set<string>>(new Set());
+  const [commonHorizon, setCommonHorizon] = useState(true);
+  const [result, setResult] = useState<CompareRunsResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const loadRuns = useCallback(async () => {
+    try {
+      const all = await apiFetch<SimulationRun[]>(apiBase, '/runs');
+      setRuns(all);
+      // Default: most recent live run of each name
+      setChosen((prev) => {
+        if (prev.size) return new Set([...prev].filter((id) => all.some((r) => r.id === id && r.session_id)));
+        const seen = new Set<string>();
+        const pick = new Set<string>();
+        for (const r of all) {
+          if (!r.session_id || seen.has(r.name ?? r.id)) continue;
+          seen.add(r.name ?? r.id);
+          pick.add(r.id);
+          if (pick.size >= 6) break;
+        }
+        return pick;
       });
-      if (!cr.ok) return;
-
-      const compare = (await cr.json()) as CompareRunsResponse;
-      setCompareRows(compare.rows ?? []);
-      setCompareMeta({
-        commonSteps: compare.common_steps ?? null,
-        commonPeriodHours: compare.common_period_hours ?? null,
-      });
-    } catch {}
-  };
-
-  useEffect(() => { loadCompare(); }, []);
-
-  // Paper scenarios (S1-S5) - exact names only, not copies
-  const PAPER_SCENARIO_NAMES = [
-    'Scenario 1: Baseline',
-    'Scenario 2: High PV Deployment', 
-    'Scenario 3: High PV + Battery (4h)',
-    'Scenario 4: High PV + Large Battery',
-    'Scenario 5: DSM (Flexible Demand)',
-  ];
-  const isPaperScenario = (name: string) => PAPER_SCENARIO_NAMES.includes(name);
-  
-  // Sort: paper scenarios first (S1-S5 in order), then user scenarios
-  const sortedScenarios = [...scenarios].sort((a, b) => {
-    const aIsPaper = isPaperScenario(a.name);
-    const bIsPaper = isPaperScenario(b.name);
-    if (aIsPaper && bIsPaper) {
-      // Extract scenario number and sort ascending
-      const aNum = parseInt(a.name.match(/Scenario (\d)/)?.[1] || '0');
-      const bNum = parseInt(b.name.match(/Scenario (\d)/)?.[1] || '0');
-      return aNum - bNum;
+    } catch (e) {
+      setError((e as Error).message);
     }
-    if (aIsPaper) return -1; // Paper scenarios first
-    if (bIsPaper) return 1;
-    return 0; // Keep original order for user scenarios
+  }, [apiBase]);
+
+  useEffect(() => { loadRuns(); }, [loadRuns]);
+
+  const compare = useCallback(async () => {
+    if (chosen.size === 0) { setResult(null); return; }
+    setLoading(true);
+    try {
+      setResult(await apiFetch<CompareRunsResponse>(apiBase, '/runs/compare', { method: 'POST', body: { run_ids: [...chosen], use_common_horizon: commonHorizon } }));
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally { setLoading(false); }
+  }, [apiBase, chosen, commonHorizon]);
+
+  useEffect(() => { compare(); }, [compare]);
+
+  const rows = (result?.rows ?? []).filter((r) => r.comparable);
+  const maxEnergy = Math.max(1e-9, ...rows.flatMap((r) => [r.total_gen_mwh ?? 0, r.total_demand_mwh ?? 0]));
+  const live = runs.filter((r) => r.session_id);
+
+  const toggle = (id: string) => setChosen((prev) => {
+    const next = new Set(prev);
+    next.has(id) ? next.delete(id) : next.add(id);
+    return next;
   });
 
   return (
-    <div className="scenario-container">
-      {/* Mobile Tab Bar */}
-      <div className="scenario-mobile-tabs">
-        <button className={mobileTab === 'list' ? 'active' : ''} onClick={() => setMobileTab('list')}>
-          📋 List
-        </button>
-        <button className={mobileTab === 'edit' ? 'active' : ''} onClick={() => setMobileTab('edit')}>
-          ✏️ Edit
-        </button>
-        <button className={mobileTab === 'compare' ? 'active' : ''} onClick={() => setMobileTab('compare')}>
-          📊 Compare
-        </button>
+    <>
+      <div className="panel-header">
+        <h2>Compare runs</h2>
+        <button className="btn btn-ghost btn-icon" onClick={() => { loadRuns(); compare(); }} aria-label="Refresh comparison" title="Refresh"><span className={loading ? 'spin' : ''}>↻</span></button>
       </div>
-
-      <div className="scenario-grid">
-      <div className={`sidebar scenario-sidebar ${mobileTab === 'list' ? 'mobile-visible' : ''}`}>
-        <div className="header" style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-          <h2 style={{ flex: 1 }}>Scenarios</h2>
-          <button className="button" onClick={() => { setSelectedId(null); setName('My Scenario'); setDesc(''); setDetails(''); setOverrides({ ...defaultOverrides }); setShowGuide(true); setMobileTab('edit'); }}>New</button>
-          <button className="button" onClick={load} disabled={loading}>Refresh</button>
-        </div>
-        {loadError && (
-          <div className="metric-card" style={{ marginTop: '1rem', color: '#fecaca' }}>
-            Failed to load scenarios: {loadError}
+      {live.length === 0 ? (
+        <p className="muted small">No live runs. Run a scenario (or restart an inactive run) and step it forward to compare results.</p>
+      ) : (
+        <>
+          <div className="compare-picker">
+            {live.map((r) => (
+              <label key={r.id} className="check">
+                <input type="checkbox" checked={chosen.has(r.id)} onChange={() => toggle(r.id)} />
+                <span className="clamp-1">{r.name ?? r.id}</span>
+                <RunStatusBadge run={r} />
+              </label>
+            ))}
           </div>
-        )}
-        <div style={{ marginTop: '1rem' }}>
-          {sortedScenarios.map((s) => {
-            const isPaper = isPaperScenario(s.name);
-            return (
-            <div 
-              key={s.id} 
-              className={`run-item run-item--with-icon ${selectedId === s.id ? 'active' : ''}`} 
-              style={{ 
-                display: 'flex', 
-                alignItems: 'center', 
-                justifyContent: 'space-between',
-                background: isPaper ? 'linear-gradient(135deg, #1e3a5f 0%, #1e293b 100%)' : undefined,
-                borderLeft: isPaper ? '3px solid #3b82f6' : undefined,
-              }} 
-              onClick={() => { setSelectedId(s.id); setName(s.name); setDesc(s.description ?? ''); setDetails(s.details ?? ''); setOverrides({ ...defaultOverrides, ...(s.config_overrides || {}) }); setMobileTab('edit'); }}
-            >
-              <div style={{ flex: 1 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <strong>{s.name}</strong>
-                  {isPaper && <span style={{ fontSize: 9, padding: '2px 5px', background: '#3b82f6', borderRadius: 3, color: '#fff' }}>PAPER</span>}
-                </div>
-                <div style={{ fontSize: '0.85rem', color: '#94a3b8' }}>{s.description ?? ''}</div>
-                {s.details && (
-                  <div style={{ fontSize: '0.75rem', color: '#64748b', marginTop: 4 }}>
-                    {String(s.details).slice(0, 120)}{String(s.details).length > 120 ? '…' : ''}
-                  </div>
-                )}
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                <button className="button" onClick={() => runScenario(s.id)} aria-busy={runBusyId===s.id} aria-label={`Run ${s.name}`}>
-                  {runBusyId === s.id ? 'Running…' : 'Run'}
-                </button>
-              </div>
-              {!isPaper && (
-                <button
-                  className="icon-btn"
-                  title="Delete scenario"
-                  aria-label="Delete scenario"
-                  onClick={(e) => { e.stopPropagation(); deleteScenario(s.id); }}
-                >
-                  🗑
-                </button>
-              )}
-            </div>
-            );
-          })}
-        </div>
-      </div>
-      <div className={`scenario-edit-panel ${mobileTab === 'edit' ? 'mobile-visible' : ''}`}>
-        <div className="header"><h2>Create / Edit Scenario</h2></div>
-        {runError && (
-          <div className="metric-card" style={{ color: '#fecaca' }}>{runError}</div>
-        )}
-        <div className="metric-card">
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
-            <label>Name<input style={{ width: '100%' }} value={name} onChange={e => setName(e.target.value)} /></label>
-            <label>Description<input style={{ width: '100%' }} value={desc} onChange={e => setDesc(e.target.value)} /></label>
-            <label style={{ gridColumn: '1 / -1' }}>Details
-              <textarea style={{ width: '100%', minHeight: 90 }} value={details} onChange={e => setDetails(e.target.value)} />
-            </label>
-            <label>Wind (MW)<input type="number" value={overrides.owned_wind_capacity_mw} onChange={e => onChange('owned_wind_capacity_mw', Number(e.target.value))} /></label>
-            <label>Solar (MW)<input type="number" value={overrides.owned_solar_capacity_mw} onChange={e => onChange('owned_solar_capacity_mw', Number(e.target.value))} /></label>
-            <label>Hydro (MW)<input type="number" value={overrides.owned_hydro_capacity_mw} onChange={e => onChange('owned_hydro_capacity_mw', Number(e.target.value))} /></label>
-            <label>Battery (MWh)<input type="number" value={overrides.owned_battery_capacity_mwh} onChange={e => onChange('owned_battery_capacity_mwh', Number(e.target.value))} /></label>
-            <label>Physical Allocation<input type="number" step="0.01" value={overrides.physical_allocation} onChange={e => onChange('physical_allocation', Number(e.target.value))} /></label>
-            <label>Financial Allocation<input type="number" step="0.01" value={overrides.financial_allocation} onChange={e => onChange('financial_allocation', Number(e.target.value))} /></label>
-            <label>Investment Freq (steps)<input type="number" value={overrides.investment_freq} onChange={e => onChange('investment_freq', Number(e.target.value))} /></label>
-          </div>
-          <div style={{ marginTop: '0.75rem', display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-            {selectedId && isPaperScenario(scenarios.find(s => s.id === selectedId)?.name || '') ? (
-              <>
-                <button className="button" onClick={async () => {
-                  // Save As: create a new user scenario - remove "Scenario X:" prefix
-                  const baseName = name.replace(/^Scenario \d+:\s*/, '');
-                  const copyName = `My ${baseName}`;
-                  const payload = { name: copyName, description: desc, details, config_overrides: overrides };
-                  const r = await fetch(join('/scenarios'), {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
-                  });
-                  if (r.ok) { 
-                    const newScenario = await r.json();
-                    await load(); 
-                    setSelectedId(newScenario.id);
-                    setName(copyName);
-                    alert('New user scenario created!');
-                  }
-                }}>Save As New</button>
-                <span style={{ fontSize: 11, color: '#94a3b8' }}>Paper scenarios are read-only. Changes apply to this session only.</span>
-              </>
-            ) : (
-              <>
-                <button className="button" onClick={saveScenario}>Save Scenario</button>
-                {selectedId && (
-                  <button className="button" onClick={async () => {
-                    const url = join(`/scenarios/${selectedId}`);
-                    const r = await fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, description: desc, details, config_overrides: overrides }) });
-                    if (r.ok) { await load(); }
-                  }}>Save Changes</button>
-                )}
-              </>
-            )}
-          </div>
-        </div>
-
-        {/* PED design guideline (always visible for New; toggle for edits) */}
-        <div className="metric-card" style={{ whiteSpace: 'pre-wrap' }}>
-          <div className="header" style={{ justifyContent: 'space-between' }}>
-            <h3 style={{ margin: 0 }}>Guideline: Designing a Scenario for PED</h3>
-            <button className="button" onClick={() => setShowGuide(v => !v)}>{showGuide ? 'Hide' : 'Show'}</button>
-          </div>
-          {showGuide && (
-            <div>
-              <p>
-                PED (Positive Energy District) targets annual on‑site renewable generation
-                ≥ annual demand. Tune parameters below; then check Runs → Charts → PED to
-                monitor total generation, total demand, balance and ratio (≥ 1.0 for PED).
-              </p>
-              <ul>
-                <li>
-                  <b>Solar (MW)</b>: rooftop PV nameplate. Increasing this primarily raises mid‑day
-                  generation. Current: {String(overrides.owned_solar_capacity_mw ?? '—')} MW.
-                </li>
-                <li>
-                  <b>Battery (MWh)</b>: storage energy. Shifts PV from mid‑day to evenings; reduces imports
-                  and exports; increases self‑consumption. Current: {String(overrides.owned_battery_capacity_mwh ?? '—')} MWh.
-                </li>
-                <li>
-                  <b>Investment Freq (steps)</b>: decision cadence (lower = more responsive). Use 6 for DSM‑like
-                  responsiveness; 12 for baseline. Current: {String(overrides.investment_freq ?? '—')}.
-                </li>
-                <li>
-                  <b>Physical / Financial Allocation</b>: budget split that influences physical assets vs trading.
-                  Keep sensible totals (≈1.0). Current: {String(overrides.physical_allocation ?? '—')} / {String(overrides.financial_allocation ?? '—')}.
-                </li>
-              </ul>
-              <p>
-                <b>Suggested recipes</b>:
-                <br/>– Baseline: modest PV, no battery; observe import/export baseline.
-                <br/>– High PV: maximize PV; expect high mid‑day export.
-                <br/>– PV + Battery (4 h): add 0.32–0.64 MWh storage to boost self‑consumption.
-                <br/>– DSM‑like: keep PV+Battery and set investment_freq=6 to react faster.
-              </p>
-              <p>
-                Iterate: create → run → check PED ratio → adjust PV/battery/decisions until
-                balance ≥ 0 and ratio ≥ 1.0. Use multiple saved scenarios to compare results.
-              </p>
-            </div>
+          <label className="check muted small">
+            <input type="checkbox" checked={commonHorizon} onChange={(e) => setCommonHorizon(e.target.checked)} />
+            Compare over a common horizon (fair totals)
+          </label>
+          {result?.common_steps != null && (
+            <p className="muted small">
+              Common horizon: {result.common_steps.toLocaleString()} steps ({formatDuration(result.common_period_hours)}).
+              {result.common_steps <= 1 && ' Step every selected run forward first — one of them has not started.'}
+            </p>
           )}
-        </div>
-
-        {/* Compare runs - desktop only (inside edit panel) */}
-        <div className="metric-card desktop-compare">
-          <div className="header" style={{ justifyContent: 'space-between' }}>
-            <h3 style={{ margin: 0 }}>Compare Runs</h3>
-            <button className="button" onClick={loadCompare}>Refresh</button>
+          {error && <div className="notice notice-error">{error}</div>}
+          <div className="compare-rows">
+            {rows.map((r) => (
+              <div key={r.run_id} className="compare-row">
+                <div className="compare-row-head">
+                  <strong className="clamp-1">{r.name ?? r.run_id}</strong>
+                  <span className={`stat-value sm ${(r.ped_ratio ?? 0) >= 1 ? 'tone-good' : 'tone-bad'}`}>{(r.ped_ratio ?? 0).toFixed(2)}</span>
+                </div>
+                <PedGauge ratio={r.ped_ratio} />
+                <div className="bar-pair">
+                  <div className="bar-line"><span>Gen</span><div className="bar"><div style={{ width: `${((r.total_gen_mwh ?? 0) / maxEnergy) * 100}%`, background: 'var(--c-gen)' }} /></div><span>{formatEnergy(r.total_gen_mwh)}</span></div>
+                  <div className="bar-line"><span>Load</span><div className="bar"><div style={{ width: `${((r.total_demand_mwh ?? 0) / maxEnergy) * 100}%`, background: 'var(--c-load)' }} /></div><span>{formatEnergy(r.total_demand_mwh)}</span></div>
+                </div>
+              </div>
+            ))}
           </div>
-          {compareRows.length > 0 ? (
-            <>
-              {compareMeta.commonSteps ? (
-                <div style={{ fontSize: 11, color: '#94a3b8', marginTop: '0.75rem' }}>
-                  Compared over a common horizon of {compareMeta.commonSteps} steps ({fmt(compareMeta.commonPeriodHours, 1)} h).
-                </div>
-              ) : null}
-              {/* Visual comparison charts */}
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1rem', marginBottom: '1rem', marginTop: '1rem' }}>
-                {/* PED Ratio Chart */}
-                <div style={{ background: '#1e293b', borderRadius: 8, padding: '12px' }}>
-                  <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>PED Ratio</div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                    {compareRows.filter(r => r.ped_ratio != null).slice(0, 5).map((r, i) => {
-                      const ratio = r.ped_ratio ?? 0;
-                      const pct = Math.min(ratio * 100, 150);
-                      return (
-                        <div key={i}>
-                          <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.name ?? r.run_id}</div>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                            <div style={{ flex: 1, height: 16, background: '#0f172a', borderRadius: 4, overflow: 'hidden', position: 'relative' }}>
-                              <div style={{ position: 'absolute', left: '66.7%', top: 0, bottom: 0, width: 2, background: '#fbbf24', zIndex: 1 }} title="PED Target (1.0)" />
-                              <div style={{ height: '100%', width: `${pct / 1.5}%`, background: ratio >= 1 ? 'linear-gradient(90deg, #22c55e, #16a34a)' : 'linear-gradient(90deg, #ef4444, #dc2626)', borderRadius: 4 }} />
-                            </div>
-                            <span style={{ fontSize: 11, fontWeight: 600, color: ratio >= 1 ? '#22c55e' : '#ef4444', minWidth: 40 }}>{fmt(ratio, 2)}</span>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                {/* Generation Chart */}
-                <div style={{ background: '#1e293b', borderRadius: 8, padding: '12px' }}>
-                  <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>Generation (MWh)</div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                    {(() => {
-                      const validRows = compareRows.filter(r => r.total_gen_mwh != null).slice(0, 5);
-                      const maxGen = Math.max(...validRows.map(r => r.total_gen_mwh ?? 0), 1);
-                      return validRows.map((r, i) => {
-                        const gen = r.total_gen_mwh ?? 0;
-                        return (
-                          <div key={i}>
-                            <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.name ?? r.run_id}</div>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                              <div style={{ flex: 1, height: 16, background: '#0f172a', borderRadius: 4, overflow: 'hidden' }}>
-                                <div style={{ height: '100%', width: `${(gen / maxGen) * 100}%`, background: 'linear-gradient(90deg, #22c55e, #4ade80)', borderRadius: 4 }} />
-                              </div>
-                              <span style={{ fontSize: 11, fontWeight: 600, color: '#22c55e', minWidth: 50 }}>{fmt(gen, 0)}</span>
-                            </div>
-                          </div>
-                        );
-                      });
-                    })()}
-                  </div>
-                </div>
-
-                {/* Demand Chart */}
-                <div style={{ background: '#1e293b', borderRadius: 8, padding: '12px' }}>
-                  <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>Demand (MWh)</div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                    {(() => {
-                      const validRows = compareRows.filter(r => r.total_demand_mwh != null).slice(0, 5);
-                      const maxDemand = Math.max(...validRows.map(r => r.total_demand_mwh ?? 0), 1);
-                      return validRows.map((r, i) => {
-                        const demand = r.total_demand_mwh ?? 0;
-                        return (
-                          <div key={i}>
-                            <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.name ?? r.run_id}</div>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                              <div style={{ flex: 1, height: 16, background: '#0f172a', borderRadius: 4, overflow: 'hidden' }}>
-                                <div style={{ height: '100%', width: `${(demand / maxDemand) * 100}%`, background: 'linear-gradient(90deg, #f97316, #fb923c)', borderRadius: 4 }} />
-                              </div>
-                              <span style={{ fontSize: 11, fontWeight: 600, color: '#f97316', minWidth: 50 }}>{fmt(demand, 0)}</span>
-                            </div>
-                          </div>
-                        );
-                      });
-                    })()}
-                  </div>
-                </div>
-              </div>
-
-              {/* Data table */}
-              <div style={{ overflowX: 'auto' }}>
-                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
-                  <thead>
-                    <tr style={{ borderBottom: '1px solid #334155' }}>
-                      <th style={{ textAlign: 'left', padding: '8px', color: '#94a3b8' }}>Run</th>
-                      <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8' }}>PED</th>
-                      <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8' }}>Gen</th>
-                      <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8' }}>Load</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {compareRows.map((r, i) => (
-                      <tr key={i} style={{ borderBottom: '1px solid #1e293b' }}>
-                        <td style={{ padding: '8px', fontSize: 11 }}>{r.name ?? r.run_id}</td>
-                        <td style={{ padding: '8px', textAlign: 'right', fontWeight: 600, color: r.ped_ratio != null && r.ped_ratio >= 1 ? '#22c55e' : '#ef4444' }}>{fmt(r.ped_ratio, 3)}</td>
-                        <td style={{ padding: '8px', textAlign: 'right', color: '#22c55e' }}>{fmt(r.total_gen_mwh, 1)}</td>
-                        <td style={{ padding: '8px', textAlign: 'right', color: '#f97316' }}>{fmt(r.total_demand_mwh, 1)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
-          ) : (
-            <div style={{ textAlign: 'center', padding: '1rem', color: '#64748b' }}>
-              No runs to compare.
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Compare Panel - mobile tab only */}
-      <div className={`scenario-compare-panel ${mobileTab === 'compare' ? 'mobile-visible' : ''}`}>
-        <div className="header" style={{ marginBottom: '1rem' }}>
-          <h2>Compare Runs</h2>
-          <button className="button" onClick={loadCompare}>Refresh</button>
-        </div>
-        {compareRows.length > 0 ? (
-          <>
-            {compareMeta.commonSteps ? (
-              <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: '1rem' }}>
-                Compared over a common horizon of {compareMeta.commonSteps} steps ({fmt(compareMeta.commonPeriodHours, 1)} h).
-              </div>
-            ) : null}
-            {/* Charts - stacked vertically on mobile */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', marginBottom: '1rem' }}>
-              {/* PED Ratio Chart */}
-              <div style={{ background: '#1e293b', borderRadius: 8, padding: '12px' }}>
-                <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>PED Ratio</div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  {compareRows.filter(r => r.ped_ratio != null).slice(0, 5).map((r, i) => {
-                    const ratio = r.ped_ratio ?? 0;
-                    const pct = Math.min(ratio * 100, 150);
-                    return (
-                      <div key={i}>
-                        <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2 }}>{r.name ?? r.run_id}</div>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                          <div style={{ flex: 1, height: 16, background: '#0f172a', borderRadius: 4, overflow: 'hidden', position: 'relative' }}>
-                            <div style={{ position: 'absolute', left: '66.7%', top: 0, bottom: 0, width: 2, background: '#fbbf24', zIndex: 1 }} />
-                            <div style={{ height: '100%', width: `${pct / 1.5}%`, background: ratio >= 1 ? 'linear-gradient(90deg, #22c55e, #16a34a)' : 'linear-gradient(90deg, #ef4444, #dc2626)', borderRadius: 4 }} />
-                          </div>
-                          <span style={{ fontSize: 11, fontWeight: 600, color: ratio >= 1 ? '#22c55e' : '#ef4444', minWidth: 40 }}>{fmt(ratio, 2)}</span>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-
-              {/* Generation Chart */}
-              <div style={{ background: '#1e293b', borderRadius: 8, padding: '12px' }}>
-                <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>Generation (MWh)</div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  {(() => {
-                    const validRows = compareRows.filter(r => r.total_gen_mwh != null).slice(0, 5);
-                    const maxGen = Math.max(...validRows.map(r => r.total_gen_mwh ?? 0), 1);
-                    return validRows.map((r, i) => {
-                      const gen = r.total_gen_mwh ?? 0;
-                      return (
-                        <div key={i}>
-                          <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2 }}>{r.name ?? r.run_id}</div>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                            <div style={{ flex: 1, height: 16, background: '#0f172a', borderRadius: 4, overflow: 'hidden' }}>
-                              <div style={{ height: '100%', width: `${(gen / maxGen) * 100}%`, background: 'linear-gradient(90deg, #22c55e, #4ade80)', borderRadius: 4 }} />
-                            </div>
-                            <span style={{ fontSize: 11, fontWeight: 600, color: '#22c55e', minWidth: 50 }}>{fmt(gen, 0)}</span>
-                          </div>
-                        </div>
-                      );
-                    });
-                  })()}
-                </div>
-              </div>
-
-              {/* Demand Chart */}
-              <div style={{ background: '#1e293b', borderRadius: 8, padding: '12px' }}>
-                <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>Demand (MWh)</div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  {(() => {
-                    const validRows = compareRows.filter(r => r.total_demand_mwh != null).slice(0, 5);
-                    const maxDemand = Math.max(...validRows.map(r => r.total_demand_mwh ?? 0), 1);
-                    return validRows.map((r, i) => {
-                      const demand = r.total_demand_mwh ?? 0;
-                      return (
-                        <div key={i}>
-                          <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2 }}>{r.name ?? r.run_id}</div>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                            <div style={{ flex: 1, height: 16, background: '#0f172a', borderRadius: 4, overflow: 'hidden' }}>
-                              <div style={{ height: '100%', width: `${(demand / maxDemand) * 100}%`, background: 'linear-gradient(90deg, #f97316, #fb923c)', borderRadius: 4 }} />
-                            </div>
-                            <span style={{ fontSize: 11, fontWeight: 600, color: '#f97316', minWidth: 50 }}>{fmt(demand, 0)}</span>
-                          </div>
-                        </div>
-                      );
-                    });
-                  })()}
-                </div>
-              </div>
-            </div>
-
-            {/* Data table */}
-            <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
-                <thead>
-                  <tr style={{ borderBottom: '1px solid #334155' }}>
-                    <th style={{ textAlign: 'left', padding: '8px', color: '#94a3b8' }}>Run</th>
-                    <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8' }}>PED</th>
-                    <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8' }}>Gen</th>
-                    <th style={{ textAlign: 'right', padding: '8px', color: '#94a3b8' }}>Load</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {compareRows.map((r, i) => (
-                    <tr key={i} style={{ borderBottom: '1px solid #1e293b' }}>
-                      <td style={{ padding: '8px', fontSize: 11 }}>{r.name ?? r.run_id}</td>
-                      <td style={{ padding: '8px', textAlign: 'right', fontWeight: 600, color: r.ped_ratio != null && r.ped_ratio >= 1 ? '#22c55e' : '#ef4444' }}>{fmt(r.ped_ratio, 3)}</td>
-                      <td style={{ padding: '8px', textAlign: 'right', color: '#22c55e' }}>{fmt(r.total_gen_mwh, 1)}</td>
-                      <td style={{ padding: '8px', textAlign: 'right', color: '#f97316' }}>{fmt(r.total_demand_mwh, 1)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </>
-        ) : (
-          <div style={{ textAlign: 'center', padding: '2rem', color: '#64748b' }}>
-            No runs to compare. Run some scenarios first!
-          </div>
-        )}
-      </div>
-      </div>
-    </div>
+        </>
+      )}
+    </>
   );
 }

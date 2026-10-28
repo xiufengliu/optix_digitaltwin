@@ -1,0 +1,7 @@
+# Secrets (Claude API key)
+.env
+
+# Logs and Python caches
+*.log
+__pycache__/
+*.pyc

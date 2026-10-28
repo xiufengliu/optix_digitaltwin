@@ -1,687 +1,558 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { RunList } from './components/RunList';
-import { PedPanel } from './components/PedPanel';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { RunList, RunStatusBadge, runSource } from './components/RunList';
 import { ScenarioList } from './components/ScenarioList';
 import { DigitalTwinBuilder, type DigitalTwinConfig } from './components/DigitalTwinBuilder';
 import { DigitalTwin3DView } from './components/DigitalTwin3DView';
-import type { SimulationRun, SimulationStatePayload, WebSocketMessage } from './types';
+import { DispatchPanel, EnergyPanel, exportSeriesCsv } from './components/AnalyticsPanels';
+import { Copilot, type CopilotContext } from './components/Copilot';
+import { apiFetch, isAbort, resolveApiBase } from './lib/api';
+import { formatCompact, formatDuration, formatPower, formatTimestamp } from './lib/format';
+import { twinFromOverrides } from './lib/twin';
+import { useRunAnalytics } from './lib/useRunAnalytics';
+import type { ObservationValues, Scenario, SimulationRun, SimulationStatePayload } from './types';
 
-const DEFAULT_API_BASE = 'http://localhost:8000';
+type View = 'console' | 'scenarios' | 'builder';
+type Workspace = 'twin' | 'energy' | 'dispatch';
 
-function sanitizeBase(base: string): string {
-  return base.endsWith('/') ? base : base + '/';
-}
+const VIEWS: { id: View; label: string }[] = [
+  { id: 'console', label: 'Console' },
+  { id: 'scenarios', label: 'Scenarios' },
+  { id: 'builder', label: 'Twin Builder' },
+];
 
-const buildHttpUrl = (path: string, base: string) => {
-  const clean = path.replace(/^\/+/, '');
-  return new URL(clean, sanitizeBase(base)).toString();
-};
-const buildWsUrl = (path: string, base: string) => {
-  const clean = path.replace(/^\/+/, '');
-  const url = new URL(clean, sanitizeBase(base));
-  url.protocol = url.protocol.startsWith('https') ? 'wss:' : 'ws:';
-  return url.toString();
-};
+// Step sizes expressed in simulated time; converted with the data's step length
+const STEP_PRESETS = [
+  { label: '+1 h', hours: 1 },
+  { label: '+1 day', hours: 24 },
+  { label: '+1 week', hours: 24 * 7 },
+];
+const PLAY_SPEEDS = [
+  { label: '1 h / tick', hours: 1 },
+  { label: '6 h / tick', hours: 6 },
+  { label: '1 day / tick', hours: 24 },
+  { label: '1 week / tick', hours: 24 * 7 },
+];
+const RANGES = [
+  { label: 'Last day', hours: 24 },
+  { label: 'Last week', hours: 24 * 7 },
+  { label: 'Last 30 days', hours: 24 * 30 },
+  { label: 'Last year', hours: 24 * 365 },
+  { label: 'All', hours: null },
+];
+const MAX_STEPS_PER_REQUEST = 10000;
 
-function formatCurrency(value?: number | null): string {
-  if (value === undefined || value === null) return '—';
-  return new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 2 }).format(value);
-}
-
-function formatNumber(value?: number | null): string {
-  if (value === undefined || value === null) return '—';
-  return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+function viewFromHash(): View {
+  const h = window.location.hash.replace('#', '');
+  return (VIEWS.find((v) => v.id === h)?.id ?? 'console');
 }
 
 export default function App() {
-  // Use same origin if VITE_API_BASE is empty or not set
-  const apiBase = useMemo(() => {
-    const envBase = import.meta.env?.VITE_API_BASE as string | undefined;
-    if (envBase && envBase.trim()) return envBase;
-    // Use current origin (works with nginx proxy)
-    return window.location.origin;
-  }, []);
-  // Build WS URLs directly from apiBase to preserve https→wss mapping
+  const apiBase = useMemo(resolveApiBase, []);
 
+  const [view, setViewState] = useState<View>(viewFromHash);
+  const setView = useCallback((v: View) => {
+    setViewState(v);
+    if (window.location.hash !== `#${v}`) window.history.replaceState(null, '', `#${v}`);
+  }, []);
+  useEffect(() => {
+    const onHash = () => setViewState(viewFromHash());
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+
+  const [apiOnline, setApiOnline] = useState<boolean | null>(null);
   const [runs, setRuns] = useState<SimulationRun[]>([]);
   const [loadingRuns, setLoadingRuns] = useState(false);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
-  const [selectedRun, setSelectedRun] = useState<SimulationRun | null>(null);
-  const [selectedScenario, setSelectedScenario] = useState<any | null>(null);
-  const [currentState, setCurrentState] = useState<SimulationStatePayload | null>(null);
-  const [logs, setLogs] = useState<string[]>([]);
-  const [wsStatus, setWsStatus] = useState<'idle' | 'connecting' | 'open' | 'closed'>('idle');
-  const [tab, setTab] = useState<'runs' | 'scenarios' | 'builder'>('runs');
-  const [viewTab, setViewTab] = useState<'3d' | 'charts'>('3d');
-  const [builderView, setBuilderView] = useState<'2d' | '3d'>('2d');
-  const [dtConfig, setDtConfig] = useState<DigitalTwinConfig | null>(null);
-  const [autoRun, setAutoRun] = useState(false);
-  const [autoSteps, setAutoSteps] = useState(12);
-  const [autoIntervalMs, setAutoIntervalMs] = useState(800);
-  const [bottomSplit, setBottomSplit] = useState(0.5); // 0..1 left width ratio
-  const [draggingSplit, setDraggingSplit] = useState(false);
-  const splitRef = useState<HTMLDivElement | null>(null)[0];
-  const [centerSplit, setCenterSplit] = useState(0.48); // 0..1 top height ratio
-  const [draggingVSplit, setDraggingVSplit] = useState(false);
-  const [sidebarWidth, setSidebarWidth] = useState(320);
-  const [draggingSidebar, setDraggingSidebar] = useState(false);
-  const [bottomCollapsed, setBottomCollapsed] = useState(false);
-  const [reduceMotion, setReduceMotion] = useState(false);
-  const [mobileTab, setMobileTab] = useState<'runs' | 'view' | 'info'>('view');
+  const [scenario, setScenario] = useState<Scenario | null>(null);
+  const [runTwin, setRunTwin] = useState<DigitalTwinConfig | null>(null);
+  const [state, setState] = useState<SimulationStatePayload | null>(null);
+  const [busyRunId, setBusyRunId] = useState<string | null>(null);
+  const [stepping, setStepping] = useState(false);
+  const [playing, setPlaying] = useState(false);
+  const [playHours, setPlayHours] = useState(24);
+  const [workspace, setWorkspace] = useState<Workspace>('twin');
+  const [rangeHours, setRangeHours] = useState<number | null>(24 * 7);
+  const [reduceMotion, setReduceMotion] = useState(() => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false);
+  const [logs, setLogs] = useState<{ time: string; text: string; tone: 'info' | 'error' }[]>([]);
+  const [runsOpenMobile, setRunsOpenMobile] = useState(false);
+  const [copilotOpen, setCopilotOpen] = useState(false);
+  const [copilotRequest, setCopilotRequest] = useState<{ prompt: string; nonce: number } | null>(null);
+  const [stateNonce, setStateNonce] = useState(0);
 
-  const appendLog = useCallback((entry: string) => {
-    setLogs((prev) => {
-      const next = [...prev, `${new Date().toLocaleTimeString()} ${entry}`];
-      return next.slice(-50);
-    });
+  // Builder edits its own copy so the console keeps showing the selected run's twin
+  const [builderConfig, setBuilderConfig] = useState<DigitalTwinConfig | null>(null);
+  const [builderKey, setBuilderKey] = useState(0);
+  const [builderMode, setBuilderMode] = useState<'2d' | '3d'>('2d');
+
+  const log = useCallback((text: string, tone: 'info' | 'error' = 'info') => {
+    setLogs((prev) => [...prev.slice(-99), { time: new Date().toLocaleTimeString(), text, tone }]);
   }, []);
 
+  const selectedRun = runs.find((r) => r.id === selectedRunId) ?? null;
+  const live = Boolean(selectedRun?.session_id);
+
+  // ---- API health -------------------------------------------------------
+  useEffect(() => {
+    const check = () => apiFetch(apiBase, '/health').then(() => setApiOnline(true), () => setApiOnline(false));
+    check();
+    const id = window.setInterval(check, 20000);
+    return () => window.clearInterval(id);
+  }, [apiBase]);
+
+  // ---- Runs -------------------------------------------------------------
   const loadRuns = useCallback(async () => {
     setLoadingRuns(true);
     try {
-      const response = await fetch(buildHttpUrl('/runs', apiBase));
-      if (!response.ok) throw new Error(`Failed to load runs (${response.status})`);
-      const data: SimulationRun[] = await response.json();
+      const data = await apiFetch<SimulationRun[]>(apiBase, '/runs');
       setRuns(data);
-
-      if (data.length === 0) {
-        setSelectedRunId((prev) => {
-          if (prev !== null) return null;
-          return prev;
-        });
-        return;
-      }
-
-      // Only update selectedRunId if current selection is invalid or missing
-      setSelectedRunId((prev) => {
-        const currentExists = prev ? data.some((run) => run.id === prev) : false;
-        if (!currentExists && data.length > 0) {
-          return data[0].id;
-        }
-        return prev;
-      });
+      setSelectedRunId((prev) => (prev && data.some((r) => r.id === prev) ? prev : data.find((r) => r.session_id)?.id ?? data[0]?.id ?? null));
     } catch (error) {
-      console.error(error);
-      appendLog(`Error loading runs: ${(error as Error).message}`);
+      log(`Could not load runs: ${(error as Error).message}`, 'error');
     } finally {
       setLoadingRuns(false);
     }
-  }, [apiBase, appendLog]);
+  }, [apiBase, log]);
 
   useEffect(() => {
     loadRuns();
-    const interval = setInterval(loadRuns, 15_000);
-    return () => clearInterval(interval);
+    const id = window.setInterval(loadRuns, 15000);
+    return () => window.clearInterval(id);
   }, [loadRuns]);
 
+  const selectRun = useCallback((id: string) => {
+    setPlaying(false);
+    setSelectedRunId(id);
+    setRunsOpenMobile(false);
+  }, []);
+
+  // ---- Selected run: state, scenario and twin ---------------------------
   useEffect(() => {
-    if (!selectedRunId) {
-      setCurrentState(null);
-      setSelectedRun(null);
-      setSelectedScenario(null);
-      return;
-    }
-
-    const controller = new AbortController();
-    const fetchState = async () => {
-      try {
-        const response = await fetch(buildHttpUrl(`/runs/${selectedRunId}/state`, apiBase), {
-          signal: controller.signal,
-        });
-        if (!response.ok) throw new Error(`Failed to load state (${response.status})`);
-        const data: SimulationStatePayload = await response.json();
-        setCurrentState(data);
-      } catch (error) {
-        if ((error as Error).name !== 'AbortError') {
-          appendLog(`Error fetching state: ${(error as Error).message}`);
-        }
-      }
-    };
-    fetchState();
-    return () => controller.abort();
-  }, [apiBase, appendLog, selectedRunId]);
-
-  // Generate a default digital twin config from scenario overrides
-  const generateDTFromScenario = (scenario: any): DigitalTwinConfig => {
-    const cfg = scenario.config_overrides || {};
-    const components: any[] = [];
-    const connections: any[] = [];
-    let x = 150, connId = 1;
-    
-    // Always add a building
-    components.push({ id: 'bld-1', type: 'smart_building', name: 'Building', x: 300, y: 180, params: { floors: 5, area_m2: 2000, load_kw: 150 } });
-    
-    // Add solar if configured
-    if (cfg.owned_solar_capacity_mw > 0) {
-      components.push({ id: 'pv-1', type: 'solar_pv', name: `Solar (${(cfg.owned_solar_capacity_mw * 1000).toFixed(0)} kWp)`, x: 300, y: 60, params: { capacity_kwp: cfg.owned_solar_capacity_mw * 1000 } });
-      connections.push({ id: `c${connId++}`, from: 'pv-1', to: 'bld-1', type: 'electricity' });
-    }
-    
-    // Add battery if configured
-    if (cfg.owned_battery_capacity_mwh > 0) {
-      components.push({ id: 'bat-1', type: 'battery_storage', name: `Battery (${(cfg.owned_battery_capacity_mwh * 1000).toFixed(0)} kWh)`, x: 450, y: 120, params: { capacity_kwh: cfg.owned_battery_capacity_mwh * 1000 } });
-      connections.push({ id: `c${connId++}`, from: 'bat-1', to: 'bld-1', type: 'electricity' });
-      if (cfg.owned_solar_capacity_mw > 0) connections.push({ id: `c${connId++}`, from: 'pv-1', to: 'bat-1', type: 'electricity' });
-    }
-    
-    // Add wind if configured
-    if (cfg.owned_wind_capacity_mw > 0) {
-      components.push({ id: 'wind-1', type: 'wind_turbine', name: `Wind (${(cfg.owned_wind_capacity_mw * 1000).toFixed(0)} kW)`, x: 150, y: 60, params: { capacity_kw: cfg.owned_wind_capacity_mw * 1000 } });
-      connections.push({ id: `c${connId++}`, from: 'wind-1', to: 'bld-1', type: 'electricity' });
-    }
-    
-    // Always add grid connection
-    components.push({ id: 'grid-1', type: 'smart_grid', name: 'Grid', x: 450, y: 260, params: { import_limit_kw: 500, export_limit_kw: 200 } });
-    connections.push({ id: `c${connId++}`, from: 'grid-1', to: 'bld-1', type: 'electricity' });
-    
-    // Add district heating
-    components.push({ id: 'dh-1', type: 'district_heating', name: 'District Heating', x: 150, y: 260, params: { capacity_kw: 200 } });
-    connections.push({ id: `c${connId++}`, from: 'dh-1', to: 'bld-1', type: 'heat' });
-    
-    return { id: `gen-${scenario.id}`, name: scenario.name, components, connections, created_at: scenario.created_at };
-  };
-
-  // Load run details, scenario info, and digital twin when selection changes
-  useEffect(() => {
+    setState(null);
+    setScenario(null);
+    setRunTwin(null);
+    if (!selectedRunId) return;
     const ac = new AbortController();
-    const load = async () => {
-      if (!selectedRunId) return;
+    (async () => {
       try {
-        const r = await fetch(buildHttpUrl(`/runs/${selectedRunId}`, apiBase), { signal: ac.signal });
-        if (!r.ok) return;
-        const run: SimulationRun = await r.json();
-        setSelectedRun(run);
-        
-        let dtLoaded = false;
-        
-        // Load linked digital twin if exists
-        if (run.digital_twin_id) {
-          const dt = await fetch(buildHttpUrl(`/digital-twins/${run.digital_twin_id}`, apiBase), { signal: ac.signal });
-          if (dt.ok) {
-            const dtData = await dt.json();
-            setDtConfig({ id: dtData.id, name: dtData.name, components: dtData.components || [], connections: dtData.connections || [], created_at: dtData.created_at });
-            dtLoaded = true;
-          }
-        }
-        
+        const run = await apiFetch<SimulationRun>(apiBase, `/runs/${selectedRunId}`, { signal: ac.signal });
+        let sc: Scenario | null = null;
         if (run.scenario_id) {
-          const s = await fetch(buildHttpUrl(`/scenarios/${run.scenario_id}`, apiBase), { signal: ac.signal });
-          if (s.ok) {
-            const scenario = await s.json();
-            setSelectedScenario(scenario);
-            
-            if (!dtLoaded && scenario.digital_twin_id) {
-              const dt = await fetch(buildHttpUrl(`/digital-twins/${scenario.digital_twin_id}`, apiBase), { signal: ac.signal });
-              if (dt.ok) {
-                const dtData = await dt.json();
-                setDtConfig({ id: dtData.id, name: dtData.name, components: dtData.components || [], connections: dtData.connections || [], created_at: dtData.created_at });
-                dtLoaded = true;
-              }
-            }
-            
-            // Generate default DT from scenario config if no linked DT
-            if (!dtLoaded) {
-              setDtConfig(generateDTFromScenario(scenario));
-            }
-          } else {
-            setSelectedScenario(null);
-          }
-        } else {
-          setSelectedScenario(null);
+          sc = await apiFetch<Scenario>(apiBase, `/scenarios/${run.scenario_id}`, { signal: ac.signal }).catch(() => null);
+          setScenario(sc);
         }
-      } catch {}
-    };
-    load();
-    return () => ac.abort();
-  }, [apiBase, selectedRunId]);
-
-  useEffect(() => {
-    if (!selectedRunId) return;
-
-    const url = buildWsUrl(`/runs/${selectedRunId}/ws`, apiBase);
-    setWsStatus('connecting');
-    appendLog(`Connecting to ${url}`);
-
-    const socket = new WebSocket(url);
-
-    socket.onopen = () => {
-      setWsStatus('open');
-      appendLog('WebSocket connected');
-      socket.send(JSON.stringify({ command: 'state' }));
-    };
-
-    socket.onclose = (event) => {
-      setWsStatus('closed');
-      appendLog(`WebSocket closed (code ${event.code})`);
-    };
-
-    socket.onerror = (event) => {
-      console.error('WebSocket error', event);
-      appendLog('WebSocket error encountered');
-    };
-
-    socket.onmessage = (event) => {
-      try {
-        const message: WebSocketMessage = JSON.parse(event.data);
-        if (message.type === 'state') {
-          setCurrentState(message.payload);
-        } else if (message.type === 'error') {
-          appendLog(`Backend error: ${message.message}`);
+        const twinId = run.digital_twin_id ?? sc?.digital_twin_id;
+        let twin: DigitalTwinConfig | null = null;
+        if (twinId) {
+          twin = await apiFetch<DigitalTwinConfig>(apiBase, `/digital-twins/${twinId}`, { signal: ac.signal }).catch(() => null);
+        }
+        if (!twin) {
+          const overrides = (sc?.config_overrides ?? (run.config?.config_overrides as Record<string, unknown> | undefined)) || null;
+          twin = twinFromOverrides(`gen-${run.id}`, sc?.name ?? run.name ?? 'Run twin', overrides, run.created_at);
+        }
+        setRunTwin(twin);
+        if (run.session_id) {
+          setState(await apiFetch<SimulationStatePayload>(apiBase, `/runs/${selectedRunId}/state`, { signal: ac.signal }));
         }
       } catch (error) {
-        console.error('Malformed message', error);
+        if (!isAbort(error)) log(`Could not load run: ${(error as Error).message}`, 'error');
       }
-    };
+    })();
+    return () => ac.abort();
+  }, [apiBase, selectedRunId, selectedRun?.session_id, stateNonce, log]);
 
-    return () => {
-      socket.close();
-    };
-  }, [appendLog, selectedRunId, apiBase]);
+  const metrics = state?.metrics ?? {};
+  const obs = (state?.observation?.manager ?? Object.values(state?.observation ?? {})[0] ?? {}) as ObservationValues;
+  const done = Boolean(metrics.done);
 
-  const handleSelectRun = (runId: string) => {
-    setSelectedRunId(runId);
-  };
+  const analytics = useRunAnalytics({
+    apiBase,
+    runId: selectedRunId,
+    live,
+    timestep: metrics.timestep,
+    rangeHours,
+    includeDispatch: workspace === 'dispatch',
+  });
+  const dtHours = analytics.series?.dt_hours ?? 1 / 6;
+  const hoursToSteps = (hours: number) => Math.max(1, Math.min(MAX_STEPS_PER_REQUEST, Math.round(hours / dtHours)));
 
-  const handleStep = async (count: number) => {
-    if (!selectedRunId) return;
+  // ---- Simulation control ----------------------------------------------
+  const step = useCallback(async (count: number): Promise<SimulationStatePayload | null> => {
+    if (!selectedRunId) return null;
     try {
-      const response = await fetch(buildHttpUrl(`/runs/${selectedRunId}/step`, apiBase), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ steps: count }),
-      });
-      if (!response.ok) throw new Error(`Step failed (${response.status})`);
-      const data: SimulationStatePayload = await response.json();
-      setCurrentState(data);
-      appendLog(`Advanced simulation by ${count} step(s)`);
+      const next = await apiFetch<SimulationStatePayload>(apiBase, `/runs/${selectedRunId}/step`, { method: 'POST', body: { steps: count } });
+      setState(next);
+      return next;
     } catch (error) {
-      appendLog(`Error stepping simulation: ${(error as Error).message}`);
+      log(`Step failed: ${(error as Error).message}`, 'error');
+      if ((error as { status?: number }).status === 410 || (error as { status?: number }).status === 409) loadRuns();
+      return null;
+    }
+  }, [apiBase, selectedRunId, log, loadRuns]);
+
+  const stepBy = async (hours: number) => {
+    setStepping(true);
+    const next = await step(hoursToSteps(hours));
+    setStepping(false);
+    if (next) log(`Advanced ${formatDuration(hours)} → ${formatTimestamp((next.observation?.manager as ObservationValues | undefined)?.timestamp)}`);
+  };
+
+  // Play loop: one request at a time, stops on completion, error or run change
+  const playRef = useRef(false);
+  useEffect(() => {
+    playRef.current = playing;
+    if (!playing) return;
+    let cancelled = false;
+    (async () => {
+      log(`Playing at ${formatDuration(playHours)} per tick`);
+      while (!cancelled && playRef.current) {
+        const next = await step(hoursToSteps(playHours));
+        if (!next || next.metrics?.done) {
+          if (next?.metrics?.done) log('Reached the end of the dataset.');
+          setPlaying(false);
+          break;
+        }
+        await new Promise((r) => window.setTimeout(r, reduceMotion ? 900 : 450));
+      }
+    })();
+    return () => { cancelled = true; };
+    // hoursToSteps depends on dtHours only
+  }, [playing, playHours, step, dtHours, reduceMotion, log]);
+
+  const restartRun = async (runId: string) => {
+    setBusyRunId(runId);
+    try {
+      await apiFetch<SimulationRun>(apiBase, `/runs/${runId}/restart`, { method: 'POST' });
+      log('Run restarted from the beginning of the dataset.');
+      setSelectedRunId(runId);
+      await loadRuns();
+    } catch (error) {
+      log(`Restart failed: ${(error as Error).message}`, 'error');
+    } finally {
+      setBusyRunId(null);
     }
   };
 
-  // Check if simulation is completed (all agents terminated)
-  const isSimulationComplete = currentState?.terminations && 
-    Object.values(currentState.terminations).some(t => t === true);
-
-  // Auto-run loop - stops when simulation completes
-  useEffect(() => {
-    if (!autoRun || !selectedRunId || tab !== 'runs' || selectedRun?.status !== 'running') return;
-    if (isSimulationComplete) {
-      setAutoRun(false);
-      appendLog('✓ Simulation completed!');
-      return;
+  const deleteRun = async (runId: string) => {
+    try {
+      await apiFetch(apiBase, `/runs/${runId}`, { method: 'DELETE' });
+      if (runId === selectedRunId) { setPlaying(false); setSelectedRunId(null); }
+      await loadRuns();
+    } catch (error) {
+      log(`Delete failed: ${(error as Error).message}`, 'error');
     }
-    let cancelled = false;
-    let timer: number | undefined;
+  };
 
-    const tick = async () => {
-      if (cancelled) return;
-      await handleStep(autoSteps);
-      timer = window.setTimeout(tick, Math.max(100, autoIntervalMs));
-    };
+  const openRun = (runId: string) => {
+    setView('console');
+    setSelectedRunId(runId);
+    loadRuns();
+    log('New run started.');
+  };
 
-    timer = window.setTimeout(tick, 0);
-    return () => { cancelled = true; if (timer) window.clearTimeout(timer); };
-  }, [autoRun, autoSteps, autoIntervalMs, selectedRunId, tab, selectedRun?.status, isSimulationComplete]);
+  const askCopilot = (prompt: string) => {
+    setCopilotRequest({ prompt, nonce: Date.now() });
+    setCopilotOpen(true);
+  };
 
-  const metrics = currentState?.metrics ?? {};
+  const copilotContext = useMemo<CopilotContext>(() => ({
+    view,
+    run_id: view === 'console' ? selectedRun?.id : null,
+    run_name: view === 'console' ? selectedRun?.name : null,
+    simulated_time: view === 'console' && live ? (obs.timestamp ?? null) : null,
+  }), [view, selectedRun?.id, selectedRun?.name, live, obs.timestamp]);
 
-  // Drag handler for bottom split
-  useEffect(() => {
-    const onMove = (e: MouseEvent) => {
-      if (!draggingSplit) return;
-      const container = document.querySelector('.split-container') as HTMLDivElement | null;
-      if (!container) return;
-      const rect = container.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const ratio = Math.max(0.2, Math.min(0.8, x / rect.width));
-      setBottomSplit(ratio);
-    };
-    const onUp = () => setDraggingSplit(false);
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-    return () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-  }, [draggingSplit]);
+  const onTwinChanged = useCallback((kind: 'run' | 'scenario') => {
+    log(kind === 'run' ? 'Copilot advanced a simulation.' : 'Copilot saved a scenario.');
+    loadRuns();
+    if (kind === 'run') setStateNonce((n) => n + 1);
+  }, [log, loadRuns]);
 
-  // Drag handler for vertical split
-  useEffect(() => {
-    const onMove = (e: MouseEvent) => {
-      if (!draggingVSplit) return;
-      const container = document.querySelector('.vsplit-container') as HTMLDivElement | null;
-      if (!container) return;
-      const rect = container.getBoundingClientRect();
-      const y = e.clientY - rect.top;
-      const ratio = Math.max(0.25, Math.min(0.85, y / rect.height));
-      setCenterSplit(ratio);
-    };
-    const onUp = () => setDraggingVSplit(false);
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-    return () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-  }, [draggingVSplit]);
+  const editTwin = () => {
+    setBuilderConfig(runTwin);
+    setBuilderKey((k) => k + 1);
+    setView('builder');
+  };
 
-  // Drag handler for sidebar width
-  useEffect(() => {
-    const onMove = (e: MouseEvent) => {
-      if (!draggingSidebar) return;
-      const shell = document.querySelector('.app-shell') as HTMLDivElement | null;
-      if (!shell) return;
-      const rect = shell.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const min = 220; const max = Math.max(360, rect.width * 0.5);
-      setSidebarWidth(Math.max(min, Math.min(max, x)));
-    };
-    const onUp = () => setDraggingSidebar(false);
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-    return () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-  }, [draggingSidebar]);
+  // ---- Render -----------------------------------------------------------
+  const totalSteps = metrics.total_steps ?? 0;
+  const timestep = metrics.timestep ?? 0;
+  const progress = totalSteps ? Math.min(1, timestep / totalSteps) : 0;
+  const genNow = (obs.solar ?? 0) + (obs.wind ?? 0) + (obs.hydro ?? 0);
+  const netNow = genNow - (obs.load ?? 0);
+  const controlsDisabled = !live || done || stepping || playing;
 
   return (
-    <div className="app-shell" style={{ ['--sidebar-width' as any]: `${sidebarWidth}px` }}>
-      {tab === 'runs' ? (
-        <>
-          {/* Mobile Tab Bar for Console */}
-          <div className="console-mobile-tabs">
-            <button className={mobileTab === 'runs' ? 'active' : ''} onClick={() => setMobileTab('runs')}>
-              📋 Runs
+    <div className="app">
+      <header className="topbar">
+        <div className="brand">
+          <span className="brand-mark" aria-hidden>◆</span>
+          <div>
+            <div className="brand-name">OptiX Digital Twin</div>
+            <div className="brand-sub">Positive Energy District simulator</div>
+          </div>
+        </div>
+        <nav className="nav" role="tablist" aria-label="Main views">
+          {VIEWS.map((v) => (
+            <button key={v.id} role="tab" aria-selected={view === v.id} className={`nav-tab ${view === v.id ? 'is-active' : ''}`} onClick={() => setView(v.id)}>
+              {v.label}
             </button>
-            <button className={mobileTab === 'view' ? 'active' : ''} onClick={() => setMobileTab('view')}>
-              👁️ View
-            </button>
-            <button className={mobileTab === 'info' ? 'active' : ''} onClick={() => setMobileTab('info')}>
-              ℹ️ Info
-            </button>
+          ))}
+        </nav>
+        <div className="topbar-right">
+          <div className={`api-pill ${apiOnline === false ? 'is-down' : apiOnline ? 'is-up' : ''}`} title={apiBase}>
+            <span className="dot" /> <span className="api-pill-text">{apiOnline === false ? 'API offline' : apiOnline ? 'API online' : 'Connecting…'}</span>
+          </div>
+          <button className={`btn btn-sm copilot-toggle ${copilotOpen ? 'is-active' : ''}`} onClick={() => setCopilotOpen((o) => !o)} aria-pressed={copilotOpen}>
+            <span aria-hidden>✦</span> Copilot
+          </button>
+        </div>
+      </header>
+
+      {view === 'console' && (
+        <div className="console">
+          <div className={`console-runs ${runsOpenMobile ? 'is-open' : ''}`}>
+            <RunList
+              runs={runs}
+              selectedId={selectedRunId}
+              onSelect={selectRun}
+              onRefresh={loadRuns}
+              onDelete={deleteRun}
+              onRestart={restartRun}
+              onNewRun={() => setView('scenarios')}
+              isLoading={loadingRuns}
+              busyId={busyRunId}
+            />
           </div>
 
-          <div className={`console-panel console-runs-panel ${mobileTab === 'runs' ? 'mobile-visible' : ''}`}>
-          <RunList
-            runs={runs}
-            selectedId={selectedRunId}
-            onSelect={(id) => { handleSelectRun(id); setMobileTab('view'); }}
-            onRefresh={loadRuns}
-            onDelete={async (runId) => {
-              try {
-                const url = buildHttpUrl(`/runs/${runId}`, apiBase);
-                const r = await fetch(url, { method: 'DELETE' });
-                if (!r.ok) throw new Error(`Delete failed (${r.status})`);
-                if (selectedRunId === runId) setSelectedRunId(null);
-                await loadRuns();
-              } catch (e: any) {
-                appendLog(`Delete run error: ${e?.message ?? String(e)}`);
-              }
-            }}
-            isLoading={loadingRuns}
-          />
-          </div>
-          <div className="sidebar-divider" onMouseDown={() => setDraggingSidebar(true)} title="Resize sidebar" />
-          <main className={`main-content console-panel console-view-panel ${mobileTab === 'view' ? 'mobile-visible' : ''}`}>
-            <div className="header console-header">
-              <div>
-                <h1>Digital Twin Console</h1>
-                <p style={{ color: '#64748b', margin: 0, fontSize: 12 }}>WS: {wsStatus}</p>
+          <main className="console-main">
+            <button className="btn btn-secondary btn-sm mobile-only runs-toggle" onClick={() => setRunsOpenMobile((v) => !v)}>
+              {runsOpenMobile ? 'Hide runs' : `Runs (${runs.length})`}
+            </button>
+
+            {!selectedRun ? (
+              <div className="card empty-hero">
+                <h2>Start a simulation</h2>
+                <p className="muted">Choose a reference scenario (baseline, high PV, battery, DSM) or design your own digital twin.</p>
+                <div className="row gap-sm center">
+                  <button className="btn btn-primary" onClick={() => setView('scenarios')}>Browse scenarios</button>
+                  <button className="btn btn-secondary" onClick={() => setView('builder')}>Open twin builder</button>
+                </div>
               </div>
-              <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
-                {/* Navigation */}
-                <button className="button" onClick={() => setTab('builder')}>🏗️ Builder</button>
-                <button className="button button-secondary" onClick={() => setTab('scenarios')}>Scenarios</button>
-                
-                <span className="header-divider" />
-                
-                {/* View tabs */}
-                <button className="button" onClick={() => setViewTab('3d')} style={{ background: viewTab==='3d' ? '#2563eb' : '#475569' }}>3D</button>
-                <button className="button" onClick={() => setViewTab('charts')} style={{ background: viewTab==='charts' ? '#2563eb' : '#475569' }}>Charts</button>
-                
-                <span className="header-divider" />
-                
-                {/* Progress indicator */}
-                {selectedRunId && metrics.total_steps && (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                    <div style={{ width: 100, height: 8, background: '#334155', borderRadius: 4, overflow: 'hidden' }}>
-                      <div style={{ 
-                        height: '100%', 
-                        width: `${Math.min(((metrics.timestep || 0) / metrics.total_steps) * 100, 100)}%`,
-                        background: isSimulationComplete ? '#22c55e' : '#3b82f6',
-                        transition: 'width 0.3s'
-                      }} />
+            ) : (
+              <>
+                <section className="card run-header">
+                  <div className="run-title">
+                    <div>
+                      <h1>{selectedRun.name ?? 'Untitled run'}</h1>
+                      <div className="row gap-xs wrap muted small">
+                        <RunStatusBadge run={selectedRun} />
+                        <span className="tag">{runSource(selectedRun)}</span>
+                        {scenario && <span>{scenario.description}</span>}
+                      </div>
                     </div>
-                    <span style={{ fontSize: 11, color: '#94a3b8', minWidth: 80 }}>
-                      {metrics.timestep || 0} / {metrics.total_steps}
-                      {isSimulationComplete && ' ✓'}
-                    </span>
+                    <div className="run-title-side">
+                    <button className="btn btn-sm copilot-ask" onClick={() => askCopilot(`Explain how “${selectedRun.name ?? 'this run'}” is performing so far and what would most improve it.`)}>
+                      ✦ Ask AI about this run
+                    </button>
+                    <div className="sim-clock">
+                      <span className="stat-label">Simulated time</span>
+                      <strong>{live ? formatTimestamp(obs.timestamp) : '—'}</strong>
+                    </div>
+                    </div>
                   </div>
-                )}
-                
-                {/* Simulation controls */}
-                <button className="button" onClick={() => handleStep(1)} disabled={!selectedRunId || selectedRun?.status !== 'running' || isSimulationComplete}>Step</button>
-                <button className="button" onClick={() => handleStep(12)} disabled={!selectedRunId || selectedRun?.status !== 'running' || isSimulationComplete}>×12</button>
-                <button className="button" onClick={() => setAutoRun(v => !v)} disabled={!selectedRunId || selectedRun?.status !== 'running' || isSimulationComplete} style={{ background: autoRun ? '#dc2626' : '#2563eb' }}>
-                  {autoRun ? '⏸ Pause' : '▶ Auto'}
-                </button>
-                
-                {/* Auto settings */}
-                <input type="number" value={autoSteps} min={1} max={288} onChange={(e) => setAutoSteps(Math.max(1, Math.min(288, Number(e.target.value))))} style={{ width: 50 }} title="Steps per interval" />
-                <input type="number" value={autoIntervalMs} min={100} step={100} onChange={(e) => setAutoIntervalMs(Math.max(100, Number(e.target.value)))} style={{ width: 60 }} title="Interval (ms)" />
-                
-                {/* Options */}
-                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: '0.8rem', color: '#94a3b8' }}>
-                  <input type="checkbox" checked={reduceMotion} onChange={(e) => setReduceMotion(e.target.checked)} /> Reduce motion
-                </label>
-                <button className="button button-secondary" onClick={() => setBottomCollapsed(v => !v)} style={{ padding: '0.35rem 0.5rem' }}>
-                  {bottomCollapsed ? '▼' : '▲'}
-                </button>
-              </div>
-            </div>
 
-            <section className="metrics-grid">
-              <article className="metric-card">
-                <div className="metric-label">Timestep</div>
-                <div className="metric-value">{metrics.timestep ?? '—'}</div>
-              </article>
-              <article className="metric-card">
-                <div className="metric-label">Fund NAV (DKK)</div>
-                <div className="metric-value">{formatCurrency(metrics.fund_nav)}</div>
-              </article>
-              <article className="metric-card">
-                <div className="metric-label">Trading Budget (DKK)</div>
-                <div className="metric-value">{formatCurrency(metrics.budget)}</div>
-              </article>
-              <article className="metric-card">
-                <div className="metric-label">Last Revenue</div>
-                <div className="metric-value">{formatNumber(metrics.last_revenue)}</div>
-              </article>
-            </section>
-
-            {/* Vertical split: top (3D/Charts) and bottom (Scenario/Log) */}
-            <section className="vsplit-container" style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
-              <div
-                className="vsplit-pane"
-                style={{
-                  flexBasis: bottomCollapsed ? '100%' : `${Math.round(centerSplit * 100)}%`,
-                  flexGrow: 0,
-                  flexShrink: 0,
-                  minHeight: 0,
-                  padding: viewTab === '3d' ? 0 : '1rem',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  overflow: 'hidden',
-                }}
-              >
-                {viewTab === '3d' ? (
-                  <div className="viewer-panel" style={{ minHeight: 320, height: '100%', position: 'relative' }}>
-                    <div style={{ position: 'absolute', top: 8, right: 8, zIndex: 20, display: 'flex', gap: 8, alignItems: 'center', background: 'rgba(15,23,42,0.65)', padding: '6px 8px', borderRadius: 6, border: '1px solid rgba(148,163,184,0.2)' }}>
-                      <button className="button" onClick={() => setTab('builder')} style={{ fontSize: 11, padding: '4px 8px' }}>
-                        🏗️ Edit Digital Twin
+                  {!live ? (
+                    <div className="notice notice-warn">
+                      <span>This run has no active session (sessions are kept in memory and end when the backend restarts).</span>
+                      <button className="btn btn-primary btn-sm" disabled={busyRunId === selectedRun.id} onClick={() => restartRun(selectedRun.id)}>
+                        {busyRunId === selectedRun.id ? 'Starting…' : 'Restart run'}
                       </button>
                     </div>
-                    <DigitalTwin3DView config={dtConfig} animate={!reduceMotion} />
-                    {!dtConfig && (
-                      <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', textAlign: 'center', color: '#64748b' }}>
-                        <div style={{ fontSize: 48, marginBottom: 12 }}>🏗️</div>
-                        <div>No digital twin configured</div>
-                        <button className="button" onClick={() => setTab('builder')} style={{ marginTop: 12 }}>
-                          Create Digital Twin
-                        </button>
+                  ) : (
+                    <>
+                      <div className="progress" role="progressbar" aria-valuemin={0} aria-valuemax={totalSteps} aria-valuenow={timestep}>
+                        <div className={`progress-fill ${done ? 'is-done' : ''}`} style={{ width: `${progress * 100}%` }} />
                       </div>
-                    )}
-                  </div>
-                ) : (
-                  <div className="metrics-grid" style={{ height: '100%', overflow: 'auto' }}>
-                    <PedPanel apiBase={apiBase} runId={selectedRunId} />
-                  </div>
-                )}
-              </div>
+                      <div className="row between wrap gap-sm">
+                        <span className="muted small">
+                          {formatDuration(timestep * dtHours)} of {formatDuration(totalSteps * dtHours)} simulated · step {timestep.toLocaleString()} / {totalSteps.toLocaleString()}
+                          {done && ' · complete'}
+                        </span>
+                        <div className="controls">
+                          {STEP_PRESETS.map((p) => (
+                            <button key={p.label} className="btn btn-secondary btn-sm" disabled={controlsDisabled} onClick={() => stepBy(p.hours)}>{p.label}</button>
+                          ))}
+                          <span className="divider" />
+                          <select className="select-sm" value={playHours} onChange={(e) => setPlayHours(Number(e.target.value))} aria-label="Playback speed">
+                            {PLAY_SPEEDS.map((s) => <option key={s.hours} value={s.hours}>{s.label}</option>)}
+                          </select>
+                          <button className={`btn btn-sm ${playing ? 'btn-danger-solid' : 'btn-primary'}`} disabled={!live || done || stepping} onClick={() => setPlaying((p) => !p)}>
+                            {playing ? '❚❚ Pause' : '▶ Play'}
+                          </button>
+                          <button className="btn btn-ghost btn-sm" disabled={busyRunId === selectedRun.id || playing} onClick={() => { if (confirm('Restart this run from the beginning?')) restartRun(selectedRun.id); }} title="Restart from t = 0">
+                            ↺ Reset
+                          </button>
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </section>
 
-              {!bottomCollapsed && (
-                <div
-                  className="vsplit-divider desktop-only"
-                  onMouseDown={() => setDraggingVSplit(true)}
-                  onDoubleClick={() => setCenterSplit(0.58)}
-                />
-              )}
+                <section className="kpis">
+                  <Kpi label="Generation now" value={live ? formatPower(genNow) : '—'} color="var(--c-gen)" />
+                  <Kpi label="Load now" value={live ? formatPower(obs.load) : '—'} color="var(--c-load)" />
+                  <Kpi label={netNow >= 0 ? 'Exporting' : 'Importing'} value={live ? formatPower(Math.abs(netNow)) : '—'} color={netNow >= 0 ? 'var(--c-export)' : 'var(--c-grid)'} />
+                  <Kpi label="Spot price" value={live && obs.price != null ? `${obs.price.toFixed(0)} DKK/MWh` : '—'} color="var(--c-price)" />
+                  <Kpi
+                    label="PED ratio (so far)"
+                    value={analytics.ped ? analytics.ped.ped_ratio.toFixed(2) : '—'}
+                    tone={analytics.ped ? (analytics.ped.ped_ratio >= 1 ? 'good' : 'bad') : undefined}
+                    color="var(--accent)"
+                  />
+                  <Kpi
+                    label="Net grid value"
+                    value={live && metrics.cumulative_revenue != null ? `${formatCompact(metrics.cumulative_revenue)} DKK` : '—'}
+                    tone={metrics.cumulative_revenue != null ? (metrics.cumulative_revenue >= 0 ? 'good' : 'bad') : undefined}
+                    hint="export value − import cost"
+                    color="var(--c-battery)"
+                  />
+                </section>
 
-              {/* Bottom split: scenario info (left), log (right) */}
-              {!bottomCollapsed && (
-              <div className="split-container desktop-only" style={{ flexBasis: `${Math.round((1 - centerSplit) * 100)}%`, flexGrow: 0, flexShrink: 0, minHeight: 0, overflow: 'hidden' }}>
-                {/* Scenario info on the left */}
-                <div className="split-pane" style={{ flexBasis: `${Math.round(bottomSplit * 100)}%`, padding: '1rem', minHeight: 220, display: 'flex', flexDirection: 'column', overflow: 'auto' }}>
-                  <div className="metric-label">Scenario</div>
-                  {selectedScenario ? (
-                    <div>
-                    <h3 style={{ margin: '0.25rem 0 0.5rem 0' }}>{selectedScenario.name}</h3>
-                    <p style={{ color: '#94a3b8' }}>{selectedScenario.description ?? '—'}</p>
-                    <div style={{ marginTop: '0.5rem', fontSize: '0.95rem', whiteSpace: 'pre-wrap' }}>
-                      {selectedScenario.details && (
-                        <p style={{ marginTop: 0 }}>{selectedScenario.details}</p>
+                <section className="card workspace">
+                  <div className="workspace-bar">
+                    <div className="segmented" role="tablist" aria-label="Workspace view">
+                      {([['twin', '3D twin'], ['energy', 'Energy'], ['dispatch', 'Dispatch']] as const).map(([id, label]) => (
+                        <button key={id} role="tab" aria-selected={workspace === id} className={workspace === id ? 'is-active' : ''} onClick={() => setWorkspace(id)}>{label}</button>
+                      ))}
+                    </div>
+                    <div className="row gap-xs wrap">
+                      {workspace === 'twin' ? (
+                        <>
+                          <label className="check small muted"><input type="checkbox" checked={reduceMotion} onChange={(e) => setReduceMotion(e.target.checked)} /> Reduce motion</label>
+                          <button className="btn btn-secondary btn-sm" onClick={editTwin} disabled={!runTwin}>Edit in builder</button>
+                        </>
+                      ) : (
+                        <>
+                          {analytics.loading && <span className="muted small">Updating…</span>}
+                          <select className="select-sm" value={rangeHours ?? 'all'} onChange={(e) => setRangeHours(e.target.value === 'all' ? null : Number(e.target.value))} aria-label="Chart time range">
+                            {RANGES.map((r) => <option key={r.label} value={r.hours ?? 'all'}>{r.label}</option>)}
+                          </select>
+                          <button className="btn btn-ghost btn-sm" disabled={!analytics.series} onClick={() => exportSeriesCsv(analytics.series, analytics.dispatch)}>Export CSV</button>
+                        </>
                       )}
                     </div>
-                    <div style={{ marginTop: '0.5rem', fontSize: '0.9rem' }}>
-                      <div style={{ color: '#94a3b8', marginBottom: 4 }}>Overrides</div>
-                      <ul style={{ margin: 0, paddingLeft: '1.25rem' }}>
-                        {Object.entries(selectedScenario.config_overrides || {}).map(([k, v]: any) => (
-                          <li key={k}><code>{k}</code>: <span>{String(v)}</span></li>
-                        ))}
-                      </ul>
-                    </div>
                   </div>
-                ) : (
-                  <div>—</div>
-                )}
-              </div>
+                  {analytics.error && workspace !== 'twin' && <div className="notice notice-error">{analytics.error}</div>}
+                  <div className="workspace-body">
+                    {workspace === 'twin' && (
+                      <div className="viewer">
+                        <DigitalTwin3DView config={runTwin} animate={!reduceMotion} />
+                        {!runTwin && <div className="viewer-empty muted">Loading twin…</div>}
+                      </div>
+                    )}
+                    {workspace === 'energy' && (live ? <EnergyPanel ped={analytics.ped} series={analytics.series} /> : <InactiveHint />)}
+                    {workspace === 'dispatch' && (live ? <DispatchPanel dispatch={analytics.dispatch} series={analytics.series} /> : <InactiveHint />)}
+                  </div>
+                </section>
 
-              {/* Divider */}
-                <div
-                  className="split-divider"
-                  onMouseDown={() => setDraggingSplit(true)}
-                  onDoubleClick={() => setBottomSplit(0.5)}
-                />
-
-              {/* Log on the right */}
-              <div className="split-pane" style={{ flexBasis: `${Math.round((1 - bottomSplit) * 100)}%`, padding: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-                <div className="log-panel" style={{ flex: 1, overflow: 'auto' }}>
-                  {logs.map((entry, idx) => (
-                    <div key={idx}>{entry}</div>
-                  ))}
-                </div>
-              </div>
-              {/* end split-container */}
-              </div>
-              )}
-            </section>
-
-          </main>
-
-          {/* Mobile Info Panel */}
-          <div className={`console-panel console-info-panel ${mobileTab === 'info' ? 'mobile-visible' : ''}`}>
-            <div style={{ padding: '1rem', overflowY: 'auto', height: '100%' }}>
-              <div className="metric-card" style={{ marginBottom: '1rem' }}>
-                <div className="metric-label">Scenario</div>
-                {selectedScenario ? (
-                  <div>
-                    <h3 style={{ margin: '0.25rem 0 0.5rem 0' }}>{selectedScenario.name}</h3>
-                    <p style={{ color: '#94a3b8', fontSize: 12 }}>{selectedScenario.description ?? '—'}</p>
-                    {selectedScenario.details && (
-                      <p style={{ fontSize: 12, marginTop: 8 }}>{selectedScenario.details}</p>
+                <section className="details-grid">
+                  <div className="card">
+                    <h3 className="section-title">Scenario</h3>
+                    {scenario ? (
+                      <>
+                        <strong>{scenario.name}</strong>
+                        {scenario.details && <p className="muted small prewrap">{scenario.details}</p>}
+                        <div className="spec-chips">
+                          {Object.entries(scenario.config_overrides || {}).map(([k, v]) => (
+                            <span key={k} className="spec-chip"><code>{k}</code> {String(v)}</span>
+                          ))}
+                        </div>
+                      </>
+                    ) : (
+                      <p className="muted small">{selectedRun.digital_twin_id ? 'Run created from a digital twin design.' : 'Custom run without a linked scenario.'}</p>
                     )}
                   </div>
-                ) : (
-                  <div style={{ color: '#64748b' }}>No scenario selected</div>
-                )}
-              </div>
-              <div className="metric-card">
-                <div className="metric-label">Log</div>
-                <div style={{ fontSize: 11, fontFamily: 'monospace', maxHeight: 200, overflowY: 'auto' }}>
-                  {logs.slice(-10).map((entry, idx) => (
-                    <div key={idx} style={{ color: '#94a3b8' }}>{entry}</div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          </div>
-        </>
-      ) : tab === 'scenarios' ? (
-        <main style={{ gridColumn: '1 / -1', gridRow: '1 / -1', padding: '1.5rem', overflowY: 'auto' }}>
-          <div className="header" style={{ marginBottom: '1rem' }}>
-            <h1>Scenarios</h1>
-            <div style={{ display: 'flex', gap: '0.5rem' }}>
-              <button className="button" onClick={() => setTab('runs')}>Back to Runs</button>
-            </div>
-          </div>
-          <ScenarioList apiBase={apiBase} onRun={(runId) => { setTab('runs'); setSelectedRunId(runId); loadRuns(); }} />
+                  <div className="card">
+                    <div className="row between">
+                      <h3 className="section-title">Activity</h3>
+                      {logs.length > 0 && <button className="btn btn-ghost btn-sm" onClick={() => setLogs([])}>Clear</button>}
+                    </div>
+                    <div className="log" aria-live="polite">
+                      {logs.length === 0 ? <span className="muted small">No activity yet.</span> : [...logs].reverse().map((l, i) => (
+                        <div key={i} className={l.tone === 'error' ? 'log-error' : ''}><span className="log-time">{l.time}</span>{l.text}</div>
+                      ))}
+                    </div>
+                  </div>
+                </section>
+              </>
+            )}
+          </main>
+        </div>
+      )}
+
+      {view === 'scenarios' && (
+        <main className="page">
+          <ScenarioList apiBase={apiBase} onRun={openRun} />
         </main>
-      ) : tab === 'builder' ? (
-        <main className="main-content" style={{ gridColumn: '1 / -1', display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
-          <div className="header" style={{ flexShrink: 0 }}>
+      )}
+
+      {view === 'builder' && (
+        <main className="builder-page">
+          <div className="builder-bar">
             <div>
-              <h1>🏗️ Digital Twin Builder</h1>
-              <p style={{ color: '#64748b', margin: 0 }}>Drag and drop components to design your PED system</p>
+              <h1>Digital twin builder</h1>
+              <p className="muted small">Drag components onto the canvas, connect them, then save or run the design.</p>
             </div>
-            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-              <button className="button" onClick={() => setBuilderView('2d')} disabled={builderView === '2d'}>2D Editor</button>
-              <button className="button" onClick={() => setBuilderView('3d')} disabled={builderView === '3d'}>3D Preview</button>
-              <button className="button" onClick={() => setTab('scenarios')}>Scenarios</button>
-              <button className="button" onClick={() => setTab('runs')}>Back to Runs</button>
+            <div className="segmented" role="tablist" aria-label="Builder mode">
+              <button role="tab" aria-selected={builderMode === '2d'} className={builderMode === '2d' ? 'is-active' : ''} onClick={() => setBuilderMode('2d')}>2D editor</button>
+              <button role="tab" aria-selected={builderMode === '3d'} className={builderMode === '3d' ? 'is-active' : ''} onClick={() => setBuilderMode('3d')}>3D preview</button>
             </div>
           </div>
-          <div style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
-            {builderView === '2d' ? (
-              <DigitalTwinBuilder 
-                onConfigChange={setDtConfig} 
-                initialConfig={dtConfig} 
+          <div className="builder-body">
+            {builderMode === '2d' ? (
+              <DigitalTwinBuilder
+                key={builderKey}
+                onConfigChange={setBuilderConfig}
+                initialConfig={builderConfig}
                 apiBase={apiBase}
-                onRunSimulation={(runId) => {
-                  setSelectedRunId(runId);
-                  setTab('runs');
-                  loadRuns();
-                }}
+                onRunSimulation={openRun}
               />
             ) : (
-              <DigitalTwin3DView 
-                config={dtConfig} 
-                animate={!reduceMotion} 
-                onComponentMove={(id, x, y) => {
-                  if (!dtConfig) return;
-                  setDtConfig({
-                    ...dtConfig,
-                    components: dtConfig.components.map(c => 
-                      c.id === id ? { ...c, x, y } : c
-                    )
-                  });
-                }}
+              <DigitalTwin3DView
+                config={builderConfig}
+                animate={!reduceMotion}
+                onComponentMove={(id, x, y) =>
+                  setBuilderConfig((prev) => prev && { ...prev, components: prev.components.map((c) => (c.id === id ? { ...c, x, y } : c)) })
+                }
               />
             )}
           </div>
         </main>
-      ) : null}
+      )}
+
+      <Copilot
+        apiBase={apiBase}
+        open={copilotOpen}
+        onClose={() => setCopilotOpen(false)}
+        context={copilotContext}
+        request={copilotRequest}
+        onTwinChanged={onTwinChanged}
+      />
     </div>
   );
+}
+
+function Kpi({ label, value, hint, tone, color }: { label: string; value: string; hint?: string; tone?: 'good' | 'bad'; color: string }) {
+  return (
+    <div className="kpi" style={{ ['--kpi-color' as string]: color }}>
+      <div className="stat-label">{label}</div>
+      <div className={`kpi-value ${tone ? `tone-${tone}` : ''}`}>{value}</div>
+      {hint && <div className="stat-hint">{hint}</div>}
+    </div>
+  );
+}
+
+function InactiveHint() {
+  return <div className="chart-empty tall">Restart this run to explore its energy data.</div>;
 }

@@ -1,4 +1,5 @@
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { Fragment, useState, useRef, useCallback, useEffect, useId } from 'react';
+import { DeviceIcon, NumberField, PALETTE_GROUPS, paramMeta, specLine } from './builder/builderUi';
 
 // Digital Twin component types for PED simulation
 export type DTComponentType = 
@@ -131,6 +132,44 @@ const COMPONENT_LIST = Object.entries(COMPONENT_DEFS).map(([type, def]) => ({
   ...def
 }));
 
+// Canvas cards are centred on (x + 30, y + 30), the anchor used by saved
+// designs and the 3D view; their visual size is independent of that anchor.
+const NODE_ANCHOR = 30;
+const CARD_W = 150;
+const CARD_H = 64;
+const GRID = 20;
+const snap = (v: number) => Math.round(v / GRID) * GRID;
+const clampZoom = (k: number) => Math.max(0.4, Math.min(2, k));
+
+// Unique id even for several adds within the same millisecond
+let idSeq = 0;
+const makeId = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${(idSeq++).toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+
+// Drop components of unknown type (would crash rendering via COMPONENT_DEFS[type])
+// and connections whose endpoints don't exist; tolerate missing fields.
+function sanitizeConfig(cfg: Partial<DigitalTwinConfig> | null | undefined): { components: DTComponent[]; connections: DTConnection[] } {
+  const rawComps = Array.isArray(cfg?.components) ? cfg!.components : [];
+  const components = rawComps
+    .filter(c => c && typeof c.id === 'string' && c.type in COMPONENT_DEFS)
+    .map(c => ({ ...c, x: Number(c.x) || 0, y: Number(c.y) || 0, name: c.name ?? COMPONENT_DEFS[c.type].label, params: c.params || {} }));
+  const ids = new Set(components.map(c => c.id));
+  const rawConns = Array.isArray(cfg?.connections) ? cfg!.connections : [];
+  const connections = rawConns.filter(c => c && ids.has(c.from) && ids.has(c.to));
+  return { components, connections };
+}
+
+// Backend ids are server-generated (uuid / numeric); client ids start with "dt-"
+const isBackendId = (id: string | null | undefined): id is string => !!id && !id.startsWith('dt-');
+
+function loadLocalConfig(): DigitalTwinConfig | null {
+  try {
+    const saved = localStorage.getItem('dt_builder_config');
+    return saved ? (JSON.parse(saved) as DigitalTwinConfig) : null;
+  } catch {
+    return null;
+  }
+}
+
 interface Props {
   onConfigChange?: (config: DigitalTwinConfig) => void;
   initialConfig?: DigitalTwinConfig | null;
@@ -139,17 +178,19 @@ interface Props {
 }
 
 export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onRunSimulation }: Props) {
-  const [components, setComponents] = useState<DTComponent[]>(initialConfig?.components || []);
-  const [connections, setConnections] = useState<DTConnection[]>(initialConfig?.connections || []);
+  // Start from initialConfig, else the config persisted in localStorage
+  // (read synchronously so the save effect can't overwrite it with an empty design)
+  const [startConfig] = useState<DigitalTwinConfig | null>(() => initialConfig || loadLocalConfig());
+  const [components, setComponents] = useState<DTComponent[]>(() => sanitizeConfig(startConfig).components);
+  const [connections, setConnections] = useState<DTConnection[]>(() => sanitizeConfig(startConfig).connections);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [connectingFrom, setConnectingFrom] = useState<string | null>(null);
-  const [configName, setConfigName] = useState(initialConfig?.name || 'My Digital Twin');
+  const [configName, setConfigName] = useState(startConfig?.name || 'My Digital Twin');
   const [draggedType, setDraggedType] = useState<DTComponentType | null>(null);
-  // Only use savedId if it's a real backend ID (numeric), not client-generated (dt-*)
+  // Only use savedId if it's a real backend ID, not client-generated (dt-*)
   const [savedId, setSavedId] = useState<string | null>(() => {
-    const id = initialConfig?.id;
-    if (id && /^\d+$/.test(id)) return id; // numeric backend ID
-    return null;
+    const id = startConfig?.id != null ? String(startConfig.id) : null;
+    return isBackendId(id) ? id : null;
   });
   const [saving, setSaving] = useState(false);
   const [running, setRunning] = useState(false);
@@ -157,17 +198,49 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
   const [linkedScenarioId, setLinkedScenarioId] = useState<string | null>(null);
   const [mobilePanel, setMobilePanel] = useState<'palette' | 'canvas' | 'properties'>('canvas');
   const [touchDrag, setTouchDrag] = useState<{ id: string; offsetX: number; offsetY: number } | null>(null);
-  const [zoom, setZoom] = useState(1);
+  // Pan (x, y in screen px) and zoom (k) of the canvas content
+  const [view, setView] = useState({ x: 0, y: 0, k: 1 });
+  const zoom = view.k;
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  const [pointer, setPointer] = useState<{ x: number; y: number } | null>(null);
+  const [notice, setNotice] = useState<{ text: string; tone: 'ok' | 'error' } | null>(null);
+  const [paletteQuery, setPaletteQuery] = useState('');
+  const [templatesOpen, setTemplatesOpen] = useState(false);
+  const [hoverConn, setHoverConn] = useState<string | null>(null);
+  const panRef = useRef<{ startX: number; startY: number; viewX: number; viewY: number; moved: boolean } | null>(null);
+  const [fitNonce, setFitNonce] = useState(1);
+  const markerId = useId().replace(/:/g, '');
   const [pinchStart, setPinchStart] = useState<number | null>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
+  // Existing component being moved with HTML5 drag (offset of the grab point)
+  const moveDragRef = useRef<{ id: string; offsetX: number; offsetY: number } | null>(null);
+  const onConfigChangeRef = useRef(onConfigChange);
+  onConfigChangeRef.current = onConfigChange;
+  const localIdRef = useRef(startConfig?.id && !isBackendId(String(startConfig.id)) ? String(startConfig.id) : `dt-${Date.now()}`);
+  const createdAtRef = useRef(startConfig?.created_at || new Date().toISOString());
+  // Last config we emitted / adopted; used to tell our own echo (parent passes
+  // the onConfigChange value back as initialConfig) from a real external change.
+  const syncedConfigRef = useRef<DigitalTwinConfig | null | undefined>(initialConfig);
 
-  // Zoom handlers
-  const handleWheel = (e: React.WheelEvent) => {
-    if (e.ctrlKey || e.metaKey) {
+  // Zoom handler. React registers wheel listeners as passive, so preventDefault()
+  // in onWheel is ignored and ctrl+wheel also zooms the whole page; use a native listener.
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
       e.preventDefault();
-      setZoom(z => Math.max(0.5, Math.min(2, z - e.deltaY * 0.001)));
-    }
-  };
+      if (e.ctrlKey || e.metaKey) {
+        // Zoom around the cursor
+        zoomAround(viewRef.current.k * Math.exp(-e.deltaY * 0.0015), e.clientX, e.clientY);
+      } else {
+        // Two-finger scroll / wheel pans the canvas
+        setView(v => ({ ...v, x: v.x - e.deltaX, y: v.y - e.deltaY }));
+      }
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, []);
 
   const handlePinchStart = (e: React.TouchEvent) => {
     if (e.touches.length === 2) {
@@ -186,7 +259,9 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
         e.touches[0].clientY - e.touches[1].clientY
       );
       const scale = dist / pinchStart;
-      setZoom(z => Math.max(0.5, Math.min(2, z * scale)));
+      const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      zoomAround(viewRef.current.k * scale, cx, cy);
       setPinchStart(dist);
     }
   };
@@ -201,12 +276,8 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     const touch = e.touches[0];
     const comp = components.find(c => c.id === id);
     if (!comp || !canvasRef.current) return;
-    const rect = canvasRef.current.getBoundingClientRect();
-    setTouchDrag({
-      id,
-      offsetX: (touch.clientX - rect.left) / zoom - comp.x,
-      offsetY: (touch.clientY - rect.top) / zoom - comp.y
-    });
+    const pt = toCanvasCoords(touch.clientX, touch.clientY);
+    setTouchDrag({ id, offsetX: pt.x - comp.x, offsetY: pt.y - comp.y });
     setSelectedId(id);
   };
 
@@ -218,13 +289,15 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     if (!touchDrag || !canvasRef.current) return;
     e.preventDefault();
     const touch = e.touches[0];
-    const rect = canvasRef.current.getBoundingClientRect();
-    const x = Math.max(0, (touch.clientX - rect.left) / zoom - touchDrag.offsetX);
-    const y = Math.max(0, (touch.clientY - rect.top) / zoom - touchDrag.offsetY);
-    updateComponentPosition(touchDrag.id, x, y);
+    const pt = toCanvasCoords(touch.clientX, touch.clientY);
+    updateComponentPosition(touchDrag.id, Math.max(0, pt.x - touchDrag.offsetX), Math.max(0, pt.y - touchDrag.offsetY));
   };
 
   const handleTouchEnd = () => {
+    if (touchDrag) {
+      const c = components.find(cc => cc.id === touchDrag.id);
+      if (c) updateComponentPosition(c.id, snap(c.x), snap(c.y));
+    }
     setTouchDrag(null);
     setPinchStart(null);
   };
@@ -243,73 +316,141 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
   // Load scenarios for linking
   useEffect(() => {
     if (!apiBase) return;
-    fetch(join('/scenarios'))
-      .then(r => r.json())
-      .then(data => setScenarios(data || []))
+    const ctrl = new AbortController();
+    fetch(join('/scenarios'), { signal: ctrl.signal })
+      .then(r => (r.ok ? r.json() : []))
+      .then(data => setScenarios(Array.isArray(data) ? data : []))
       .catch(() => {});
+    return () => ctrl.abort();
   }, [apiBase]);
 
-  // Load saved config from localStorage
+  // Adopt externally provided configs (not our own echoed onConfigChange value)
   useEffect(() => {
-    if (!initialConfig) {
-      try {
-        const saved = localStorage.getItem('dt_builder_config');
-        if (saved) {
-          const cfg = JSON.parse(saved) as DigitalTwinConfig;
-          setComponents(cfg.components || []);
-          setConnections(cfg.connections || []);
-          setConfigName(cfg.name || 'My Digital Twin');
-        }
-      } catch {}
+    if (!initialConfig || initialConfig === syncedConfigRef.current) return;
+    syncedConfigRef.current = initialConfig;
+    const { components: comps, connections: conns } = sanitizeConfig(initialConfig);
+    setComponents(comps);
+    setConnections(conns);
+    setConfigName(initialConfig.name || 'My Digital Twin');
+    const id = initialConfig.id != null ? String(initialConfig.id) : null;
+    if (isBackendId(id)) {
+      setSavedId(id);
+    } else {
+      setSavedId(null);
+      if (id) localIdRef.current = id;
     }
+    if (initialConfig.created_at) createdAtRef.current = initialConfig.created_at;
+    setSelectedId(null);
+    setConnectingFrom(null);
+    setFitNonce(n => n + 1);
   }, [initialConfig]);
 
-  // Save and notify on changes
+  // Save and notify on changes. initialConfig/onConfigChange are deliberately not
+  // deps: the parent feeds our output back as initialConfig, which would loop forever.
   useEffect(() => {
     const config: DigitalTwinConfig = {
-      id: initialConfig?.id || `dt-${Date.now()}`,
+      id: savedId || localIdRef.current,
       name: configName,
       components,
       connections,
-      created_at: initialConfig?.created_at || new Date().toISOString()
+      created_at: createdAtRef.current
     };
     try {
       localStorage.setItem('dt_builder_config', JSON.stringify(config));
     } catch {}
-    onConfigChange?.(config);
-  }, [components, connections, configName, onConfigChange, initialConfig]);
+    syncedConfigRef.current = config;
+    onConfigChangeRef.current?.(config);
+  }, [components, connections, configName, savedId]);
 
-  const handleDragStart = (type: DTComponentType) => {
+  const handleDragStart = (type: DTComponentType, e: React.DragEvent) => {
+    // Firefox won't start an HTML5 drag without data
+    try { e.dataTransfer.setData('text/plain', type); } catch {}
+    e.dataTransfer.effectAllowed = 'copy';
+    moveDragRef.current = null;
     setDraggedType(type);
   };
 
+  // Canvas (content) coordinates of a client point; content is panned then scaled
+  const toCanvasCoords = (clientX: number, clientY: number) => {
+    const rect = canvasRef.current!.getBoundingClientRect();
+    const v = viewRef.current;
+    return { x: (clientX - rect.left - v.x) / v.k, y: (clientY - rect.top - v.y) / v.k };
+  };
+
+  // Zoom keeping the content point under (clientX, clientY) fixed
+  function zoomAround(nextK: number, clientX?: number, clientY?: number) {
+    const el = canvasRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const px = (clientX ?? rect.left + rect.width / 2) - rect.left;
+    const py = (clientY ?? rect.top + rect.height / 2) - rect.top;
+    setView(v => {
+      const k = clampZoom(nextK);
+      return { k, x: px - ((px - v.x) / v.k) * k, y: py - ((py - v.y) / v.k) * k };
+    });
+  }
+
+  // Frame all components in the visible canvas
+  const fitView = useCallback(() => {
+    const el = canvasRef.current;
+    if (!el || components.length === 0) return;
+    const rect = el.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const xs = components.map(c => c.x + NODE_ANCHOR);
+    const ys = components.map(c => c.y + NODE_ANCHOR);
+    const minX = Math.min(...xs) - CARD_W / 2, maxX = Math.max(...xs) + CARD_W / 2;
+    const minY = Math.min(...ys) - CARD_H / 2, maxY = Math.max(...ys) + CARD_H / 2;
+    const k = clampZoom(Math.min((rect.width - 96) / (maxX - minX), (rect.height - 96) / (maxY - minY), 1.15));
+    setView({ k, x: rect.width / 2 - ((minX + maxX) / 2) * k, y: rect.height / 2 - ((minY + maxY) / 2) * k });
+  }, [components]);
+
+  // Fit after mount, template loads and imports (not on every edit)
+  useEffect(() => {
+    if (fitNonce) fitView();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fitNonce]);
+
+  const notify = (text: string, tone: 'ok' | 'error' = 'ok') => setNotice({ text, tone });
+  useEffect(() => {
+    if (!notice) return;
+    const t = window.setTimeout(() => setNotice(null), notice.tone === 'error' ? 6000 : 3000);
+    return () => window.clearTimeout(t);
+  }, [notice]);
+
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
-    if (!draggedType || !canvasRef.current) return;
-    
-    const rect = canvasRef.current.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    
+    if (!canvasRef.current) return;
+    const { x, y } = toCanvasCoords(e.clientX, e.clientY);
+
+    // Moving an existing component
+    const move = moveDragRef.current;
+    if (move) {
+      moveDragRef.current = null;
+      updateComponentPosition(move.id, snap(x - move.offsetX), snap(y - move.offsetY));
+      return;
+    }
+
+    if (!draggedType) return;
     const def = COMPONENT_DEFS[draggedType];
     const newComp: DTComponent = {
-      id: `${draggedType}-${Date.now()}`,
+      id: makeId(draggedType),
       type: draggedType,
       name: def.label,
-      x,
-      y,
+      x: snap(x - NODE_ANCHOR),
+      y: snap(y - NODE_ANCHOR),
       params: { ...def.defaultParams }
     };
     
     setComponents(prev => [...prev, newComp]);
+    setSelectedId(newComp.id);
     setDraggedType(null);
-  }, [draggedType]);
+  }, [draggedType, zoom]);
 
-  const handleCanvasClick = (e: React.MouseEvent) => {
-    if (e.target === canvasRef.current) {
-      setSelectedId(null);
-      setConnectingFrom(null);
-    }
+  // Clicks on components / connections stop propagation; anything else that
+  // reaches the canvas (the zoom wrapper, empty state, ...) is background.
+  const handleCanvasClick = () => {
+    setSelectedId(null);
+    setConnectingFrom(null);
   };
 
   // Connection validation rules - which components can connect
@@ -350,12 +491,17 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
       // Validate and create connection
       const validation = validateConnection(connectingFrom, id);
       if (!validation.valid) {
-        alert(validation.error);
+        notify(validation.error ?? 'These components cannot be connected', 'error');
+        setConnectingFrom(null);
+        return;
+      }
+      if (connections.some(c => (c.from === connectingFrom && c.to === id) || (c.from === id && c.to === connectingFrom))) {
+        notify('These components are already connected', 'error');
         setConnectingFrom(null);
         return;
       }
       const newConn: DTConnection = {
-        id: `conn-${Date.now()}`,
+        id: makeId('conn'),
         from: connectingFrom,
         to: id,
         type: validation.type,
@@ -363,6 +509,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
       };
       setConnections(prev => [...prev, newConn]);
       setConnectingFrom(null);
+      setSelectedId(newConn.id);
     } else {
       setSelectedId(id);
     }
@@ -377,10 +524,12 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     setComponents(prev => prev.filter(c => c.id !== id));
     setConnections(prev => prev.filter(c => c.from !== id && c.to !== id));
     setSelectedId(null);
+    setConnectingFrom(prev => (prev === id ? null : prev));
   };
 
   const deleteConnection = (id: string) => {
     setConnections(prev => prev.filter(c => c.id !== id));
+    setSelectedId(prev => (prev === id ? null : prev));
   };
 
   const updateComponentParam = (id: string, key: string, value: number | string | boolean) => {
@@ -393,12 +542,17 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     setComponents(prev => prev.map(c => c.id === id ? { ...c, x, y } : c));
   };
 
-  const handleComponentDrag = (id: string, e: React.DragEvent) => {
-    if (!canvasRef.current) return;
-    const rect = canvasRef.current.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    if (x > 0 && y > 0) updateComponentPosition(id, x, y);
+  // Position is committed in handleDrop (dragend coordinates are unreliable,
+  // e.g. 0,0 in Firefox); here we only remember where the component was grabbed.
+  const handleComponentDragStart = (id: string, e: React.DragEvent) => {
+    e.stopPropagation();
+    const comp = components.find(c => c.id === id);
+    if (!comp || !canvasRef.current) return;
+    try { e.dataTransfer.setData('text/plain', id); } catch {}
+    e.dataTransfer.effectAllowed = 'move';
+    const { x, y } = toCanvasCoords(e.clientX, e.clientY);
+    moveDragRef.current = { id, offsetX: x - comp.x, offsetY: y - comp.y };
+    setDraggedType(null);
   };
 
   const selectedComp = components.find(c => c.id === selectedId);
@@ -468,7 +622,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     // PED status
     const netBalance = annualGenMwh - annualLoadMwh;
     const ratio = annualLoadMwh > 0 ? annualGenMwh / annualLoadMwh : 0;
-    const isPed = netBalance >= 0;
+    const isPed = annualLoadMwh > 0 && netBalance >= 0;
     const shortfallKw = isPed ? 0 : (annualLoadMwh - annualGenMwh) / 8.76 / solarCF; // kWp needed
     
     return {
@@ -494,8 +648,36 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
       setComponents([]);
       setConnections([]);
       setSelectedId(null);
+      setConnectingFrom(null);
       setSavedId(null);
+      setLinkedScenarioId(null);
     }
+  };
+
+  // Persist the current design: PATCH the saved twin, or POST a new one (also
+  // when the saved twin no longer exists). Returns the backend id.
+  const persistTwin = async (): Promise<{ ok: true; id: string } | { ok: false; error: string }> => {
+    const payload = {
+      name: configName,
+      description: `Digital twin with ${components.length} components`,
+      components: components.map(c => ({ ...c })),
+      // Never send connections whose endpoints were removed
+      connections: connections
+        .filter(c => components.some(k => k.id === c.from) && components.some(k => k.id === c.to))
+        .map(c => ({ ...c })),
+    };
+    const send = (url: string, method: string) => fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    let r = savedId ? await send(join(`/digital-twins/${encodeURIComponent(savedId)}`), 'PATCH') : null;
+    if (!r || r.status === 404) r = await send(join('/digital-twins'), 'POST');
+    if (!r.ok) return { ok: false, error: await r.text() };
+    const data = await r.json();
+    const id = String(data.id);
+    setSavedId(id);
+    return { ok: true, id };
   };
 
   // Save digital twin to backend
@@ -503,31 +685,14 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     if (!apiBase) return;
     setSaving(true);
     try {
-      const payload = {
-        name: configName,
-        description: `Digital twin with ${components.length} components`,
-        components: components.map(c => ({ ...c })),
-        connections: connections.map(c => ({ ...c })),
-      };
-      
-      const url = savedId ? join(`/digital-twins/${savedId}`) : join('/digital-twins');
-      const method = savedId ? 'PATCH' : 'POST';
-      
-      const r = await fetch(url, {
-        method,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      
-      if (r.ok) {
-        const data = await r.json();
-        setSavedId(data.id);
-        alert('Saved successfully!');
+      const res = await persistTwin();
+      if (res.ok) {
+        notify('Digital twin saved.');
       } else {
-        alert('Save failed: ' + (await r.text()));
+        notify('Save failed: ' + res.error, 'error');
       }
     } catch (e: any) {
-      alert('Save error: ' + e.message);
+      notify('Save error: ' + (e?.message || String(e)), 'error');
     } finally {
       setSaving(false);
     }
@@ -536,49 +701,35 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
   // Run simulation from this digital twin
   const runSimulation = async () => {
     if (!apiBase) {
-      alert('API not configured');
+      notify('API not configured', 'error');
       return;
     }
     if (components.length === 0) {
-      alert('Please add components to your digital twin first');
+      notify('Add components to your digital twin first', 'error');
       return;
     }
     
     setRunning(true);
     try {
-      // Auto-save if not saved yet
-      let dtId = savedId;
-      if (!dtId) {
-        const savePayload = {
-          name: configName,
-          description: `Digital twin with ${components.length} components`,
-          components: components.map(c => ({ ...c })),
-          connections: connections.map(c => ({ ...c })),
-        };
-        const saveRes = await fetch(join('/digital-twins'), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(savePayload),
-        });
-        if (!saveRes.ok) {
-          alert('Failed to save: ' + (await saveRes.text()));
-          return;
-        }
-        const saveData = await saveRes.json();
-        dtId = saveData.id;
-        setSavedId(dtId);
+      // Always persist first: the run uses the stored twin, so unsaved edits
+      // to an already-saved twin would otherwise be silently ignored.
+      const saveRes = await persistTwin();
+      if (!saveRes.ok) {
+        notify('Failed to save: ' + saveRes.error, 'error');
+        return;
       }
+      const dtId = saveRes.id;
       
       // Now run the simulation
-      const r = await fetch(join(`/digital-twins/${dtId}/run`), { method: 'POST' });
+      const r = await fetch(join(`/digital-twins/${encodeURIComponent(dtId)}/run`), { method: 'POST' });
       if (r.ok) {
         const data = await r.json();
         onRunSimulation?.(data.id);
       } else {
-        alert('Run failed: ' + (await r.text()));
+        notify('Run failed: ' + (await r.text()), 'error');
       }
     } catch (e: any) {
-      alert('Run error: ' + (e?.message || String(e)));
+      notify('Run error: ' + (e?.message || String(e)), 'error');
     } finally {
       setRunning(false);
     }
@@ -587,7 +738,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
   // Create scenario from digital twin config
   const createScenarioFromDT = async () => {
     if (!apiBase) {
-      alert('API not configured');
+      notify('API not configured', 'error');
       return;
     }
     const overrides = calcConfigOverrides();
@@ -612,15 +763,18 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
         setLinkedScenarioId(data.id);
         // Refresh scenarios list
         const sr = await fetch(join('/scenarios'));
-        if (sr.ok) setScenarios(await sr.json());
-        alert('Scenario created! You can now run it from the Scenarios tab.');
+        if (sr.ok) {
+          const list = await sr.json();
+          if (Array.isArray(list)) setScenarios(list);
+        }
+        notify('Scenario created — run it from the Scenarios page.');
       } else {
         const errText = await r.text();
-        alert('Failed to create scenario: ' + errText);
+        notify('Failed to create scenario: ' + errText, 'error');
       }
     } catch (e: any) {
       console.error('Create scenario error:', e);
-      alert('Error creating scenario: ' + (e?.message || String(e)));
+      notify('Error creating scenario: ' + (e?.message || String(e)), 'error');
     }
   };
 
@@ -654,7 +808,8 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     a.href = url;
     a.download = `${configName.replace(/\s+/g, '_')}.json`;
     a.click();
-    URL.revokeObjectURL(url);
+    // Revoking synchronously can cancel the download in some browsers
+    setTimeout(() => URL.revokeObjectURL(url), 0);
   };
 
   const importConfig = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -664,12 +819,20 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     reader.onload = (ev) => {
       try {
         const cfg = JSON.parse(ev.target?.result as string) as DigitalTwinConfig;
-        setComponents(cfg.components || []);
-        setConnections(cfg.connections || []);
-        setConfigName(cfg.name || 'Imported Config');
-      } catch { alert('Invalid config file'); }
+        const { components: comps, connections: conns } = sanitizeConfig(cfg);
+        setComponents(comps);
+        setConnections(conns);
+        setConfigName(cfg?.name || 'Imported Config');
+        // Imported design is new: don't overwrite the previously saved twin
+        setSavedId(null);
+        setSelectedId(null);
+        setConnectingFrom(null);
+        setFitNonce(n => n + 1);
+      } catch { notify('Invalid config file', 'error'); }
     };
     reader.readAsText(file);
+    // Allow re-importing the same file
+    e.target.value = '';
   };
 
   // Predefined templates matching paper Scenarios 1-5 and additional PED designs
@@ -788,7 +951,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     industrial_microgrid: {
       name: 'Industrial Microgrid',
       components: [
-        { id: 'chp-1', type: 'chp_unit', name: 'CHP Plant', x: 100, y: 100, params: { capacity_kw_e: 500, capacity_kw_th: 600, efficiency_e: 0.38, efficiency_th: 0.45 } },
+        { id: 'chp-1', type: 'chp_unit', name: 'CHP Plant', x: 100, y: 100, params: { electrical_kw: 500, thermal_kw: 600, efficiency_e: 0.38, efficiency_th: 0.45 } },
         { id: 'pv-1', type: 'solar_pv', name: 'Rooftop PV', x: 300, y: 50, params: { capacity_kwp: 400, tilt_deg: 15, azimuth_deg: 180, efficiency: 0.20 } },
         { id: 'wind-1', type: 'wind_turbine', name: 'Wind Farm', x: 500, y: 50, params: { capacity_kw: 800, hub_height_m: 80, rotor_diameter_m: 60, cut_in_speed: 3 } },
         { id: 'bat-1', type: 'battery_storage', name: 'Industrial Battery', x: 300, y: 200, params: { capacity_kwh: 2000, power_kw: 500, efficiency: 0.92, initial_soc: 0.6 } },
@@ -844,7 +1007,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
         { id: 'pv-1', type: 'solar_pv', name: 'Solar Farm', x: 300, y: 50, params: { capacity_kwp: 1000, tilt_deg: 30, azimuth_deg: 180, efficiency: 0.22 } },
         { id: 'bat-1', type: 'battery_storage', name: 'Grid Battery A', x: 150, y: 180, params: { capacity_kwh: 5000, power_kw: 1500, efficiency: 0.93, initial_soc: 0.7 } },
         { id: 'bat-2', type: 'battery_storage', name: 'Grid Battery B', x: 350, y: 180, params: { capacity_kwh: 5000, power_kw: 1500, efficiency: 0.93, initial_soc: 0.7 } },
-        { id: 'chp-1', type: 'chp_unit', name: 'Backup CHP', x: 500, y: 100, params: { capacity_kw_e: 400, capacity_kw_th: 500, efficiency_e: 0.35, efficiency_th: 0.45 } },
+        { id: 'chp-1', type: 'chp_unit', name: 'Backup CHP', x: 500, y: 100, params: { electrical_kw: 400, thermal_kw: 500, efficiency_e: 0.35, efficiency_th: 0.45 } },
         { id: 'load-1', type: 'load_center', name: 'Town Center', x: 250, y: 300, params: { base_load_kw: 800, peak_load_kw: 1500, load_profile: 'residential' } },
         { id: 'bld-1', type: 'smart_building', name: 'Resort Hotel', x: 450, y: 300, params: { floors: 10, area_m2: 8000, load_kw: 400, flexible_load_pct: 30 } },
         { id: 'dh-1', type: 'district_heating', name: 'District Heat', x: 100, y: 300, params: { supply_temp_c: 80, return_temp_c: 45, capacity_kw: 600 } },
@@ -867,10 +1030,15 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     const template = TEMPLATES[templateId];
     if (!template) return;
     if (components.length > 0 && !confirm('This will replace your current design. Continue?')) return;
-    setComponents(template.components);
+    // Template layouts were drawn for small icons; spread them out for the cards
+    setComponents(template.components.map(c => ({ ...c, x: snap(c.x * 1.4), y: snap(c.y * 1.4) })));
     setConnections(template.connections);
     setConfigName(template.name);
     setSavedId(null); // Reset saved state for new template
+    setFitNonce(n => n + 1);
+    setSelectedId(null);
+    setConnectingFrom(null);
+    setLinkedScenarioId(null);
     
     // Auto-link to matching backend scenario (S1-S5)
     const scenarioNum = templateId.match(/scenario_(\d)/)?.[1];
@@ -888,499 +1056,535 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     if (!canvasRef.current) return;
     const def = COMPONENT_DEFS[type];
     const newComp: DTComponent = {
-      id: `${type}-${Date.now()}`,
+      id: makeId(type),
       type,
       name: def.label,
-      x: 100 + Math.random() * 150,
-      y: 80 + Math.random() * 100,
+      ...(() => {
+        const rect = canvasRef.current!.getBoundingClientRect();
+        const c = toCanvasCoords(rect.left + rect.width / 2, rect.top + rect.height / 2);
+        return { x: snap(c.x - NODE_ANCHOR + (Math.random() - 0.5) * 120), y: snap(c.y - NODE_ANCHOR + (Math.random() - 0.5) * 80) };
+      })(),
       params: { ...def.defaultParams }
     };
     setComponents(prev => [...prev, newComp]);
     setMobilePanel('canvas');
   };
 
+  const duplicateComponent = (id: string) => {
+    const src = components.find(c => c.id === id);
+    if (!src) return;
+    const copy: DTComponent = { ...src, id: makeId(src.type), name: `${src.name} (copy)`, x: snap(src.x + CARD_W + GRID * 2), y: src.y, params: { ...src.params } };
+    setComponents(prev => [...prev, copy]);
+    setSelectedId(copy.id);
+  };
+
+  // Keyboard: Delete removes the selection, Escape cancels connecting / deselects
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+      if (e.key === 'Escape') {
+        setConnectingFrom(null);
+        setSelectedId(null);
+        setTemplatesOpen(false);
+      } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedId) {
+        e.preventDefault();
+        if (components.some(c => c.id === selectedId)) deleteComponent(selectedId);
+        else deleteConnection(selectedId);
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'd' && selectedId && components.some(c => c.id === selectedId)) {
+        e.preventDefault();
+        duplicateComponent(selectedId);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
+  // Background drag pans the canvas; a click without movement deselects
+  const isBackground = (target: EventTarget | null) => {
+    const el = target as HTMLElement | null;
+    return !!el && !el.closest('.bn-node, .bn-conn-hit, .bn-overlay');
+  };
+  const onCanvasPointerDown = (e: React.PointerEvent) => {
+    if (e.button !== 0 || e.pointerType === 'touch' || !isBackground(e.target)) return;
+    panRef.current = { startX: e.clientX, startY: e.clientY, viewX: view.x, viewY: view.y, moved: false };
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  };
+  const onCanvasPointerMove = (e: React.PointerEvent) => {
+    const pan = panRef.current;
+    if (pan) {
+      const dx = e.clientX - pan.startX, dy = e.clientY - pan.startY;
+      if (Math.abs(dx) + Math.abs(dy) > 3) pan.moved = true;
+      if (pan.moved) setView(v => ({ ...v, x: pan.viewX + dx, y: pan.viewY + dy }));
+    }
+    if (connectingFrom && canvasRef.current) setPointer(toCanvasCoords(e.clientX, e.clientY));
+  };
+  const onCanvasPointerUp = (e: React.PointerEvent) => {
+    const pan = panRef.current;
+    panRef.current = null;
+    if (pan && !pan.moved && isBackground(e.target)) handleCanvasClick();
+  };
+
+  // Where a connection leaves a card: intersection of the centre line with the card edge
+  const edgePoint = (cx: number, cy: number, tx: number, ty: number) => {
+    const dx = tx - cx, dy = ty - cy;
+    if (!dx && !dy) return { x: cx, y: cy };
+    const s = Math.min((CARD_W / 2 + 4) / Math.abs(dx || 1e-9), (CARD_H / 2 + 4) / Math.abs(dy || 1e-9));
+    return { x: cx + dx * s, y: cy + dy * s };
+  };
+  const connPath = (a: { x: number; y: number }, b: { x: number; y: number }) => {
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const horizontal = Math.abs(dx) >= Math.abs(dy);
+    const c = (horizontal ? Math.abs(dx) : Math.abs(dy)) * 0.45;
+    return horizontal
+      ? `M${a.x},${a.y} C${a.x + Math.sign(dx) * c},${a.y} ${b.x - Math.sign(dx) * c},${b.y} ${b.x},${b.y}`
+      : `M${a.x},${a.y} C${a.x},${a.y + Math.sign(dy) * c} ${b.x},${b.y - Math.sign(dy) * c} ${b.x},${b.y}`;
+  };
+  const CONN_COLORS: Record<DTConnection['type'], string> = { electricity: '#38bdf8', heat: '#fb7a4a', both: '#c084fc' };
+  const canConnectTo = (id: string) => !!connectingFrom && connectingFrom !== id && validateConnection(connectingFrom, id).valid;
+
+  const TEMPLATE_MENU: { group: string; items: { id: string; label: string; hint: string }[] }[] = [
+    { group: 'Paper scenarios', items: [
+      { id: 'scenario_1_baseline', label: 'S1 · Baseline', hint: '30 kWp existing PV, no battery' },
+      { id: 'scenario_2_high_pv', label: 'S2 · High PV', hint: '171 kWp rooftop PV' },
+      { id: 'scenario_3_pv_battery', label: 'S3 · PV + battery', hint: '171 kWp + 320 kWh (4 h)' },
+      { id: 'scenario_4_large_battery', label: 'S4 · Large battery', hint: '171 kWp + 640 kWh' },
+      { id: 'scenario_5_dsm', label: 'S5 · Demand flexibility', hint: 'PV + battery + 30 % DSM' },
+    ] },
+    { group: 'Other designs', items: [
+      { id: 'smart_district', label: 'Smart district', hint: 'Two residential blocks, community PV and battery' },
+      { id: 'industrial_microgrid', label: 'Industrial microgrid', hint: 'CHP, PV, storage and process loads' },
+      { id: 'university_campus', label: 'University campus', hint: 'Several buildings, heat pumps, EV charging' },
+      { id: 'renewable_island', label: 'Renewable island', hint: 'Wind, PV and storage, weak grid' },
+    ] },
+  ];
+
+  const q = paletteQuery.trim().toLowerCase();
+  const pedPct = Math.min(ped.ratio, 1.5) / 1.5 * 100;
+
   return (
-    <div className="dt-builder-container">
+    <div className="dt-builder-container bn">
       {/* Mobile Tab Bar */}
       <div className="dt-mobile-tabs">
-        <button className={mobilePanel === 'palette' ? 'active' : ''} onClick={() => setMobilePanel('palette')}>
-          🧩 Add
-        </button>
-        <button className={mobilePanel === 'canvas' ? 'active' : ''} onClick={() => setMobilePanel('canvas')}>
-          🎨 Canvas
-        </button>
-        <button className={mobilePanel === 'properties' ? 'active' : ''} onClick={() => setMobilePanel('properties')}>
-          ⚙️ Props
-        </button>
+        <button className={mobilePanel === 'palette' ? 'active' : ''} onClick={() => setMobilePanel('palette')}>Components</button>
+        <button className={mobilePanel === 'canvas' ? 'active' : ''} onClick={() => setMobilePanel('canvas')}>Canvas</button>
+        <button className={mobilePanel === 'properties' ? 'active' : ''} onClick={() => setMobilePanel('properties')}>Properties</button>
       </div>
 
       <div className="dt-builder-main">
-      {/* Left Panel - Component Palette */}
-      <div className={`dt-panel dt-palette-panel ${mobilePanel === 'palette' ? 'mobile-visible' : ''}`}>
-        <h3 style={{ margin: '0 0 12px', fontSize: 14, color: '#94a3b8' }}>Components</h3>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }} className="dt-component-list">
-          {COMPONENT_LIST.map(comp => (
-            <div
-              key={comp.type}
-              draggable
-              onDragStart={() => handleDragStart(comp.type)}
-              onClick={() => handleMobileTap(comp.type)}
-              style={{
-                padding: '8px 10px',
-                background: '#1e293b',
-                borderRadius: 6,
-                cursor: 'grab',
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                border: `2px solid ${comp.color}33`,
-                transition: 'all 0.15s'
-              }}
-              onMouseEnter={e => (e.currentTarget.style.borderColor = comp.color)}
-              onMouseLeave={e => (e.currentTarget.style.borderColor = `${comp.color}33`)}
-              title={comp.description}
-            >
-              <span style={{ fontSize: 20 }}>{comp.icon}</span>
-              <span style={{ fontSize: 12 }}>{comp.label}</span>
-            </div>
-          ))}
-        </div>
-
-        {/* PED Dashboard */}
-        <div style={{ marginTop: 20, padding: 10, background: '#1e293b', borderRadius: 8, fontSize: 10 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-            <h4 style={{ margin: 0, fontSize: 12, color: '#94a3b8' }}>PED Status</h4>
-            <span style={{ padding: '2px 6px', borderRadius: 4, fontSize: 9, background: ped.isPed ? '#166534' : '#7f1d1d' }}>
-              {ped.isPed ? '✓ PED' : `${(ped.ratio * 100).toFixed(0)}%`}
-            </span>
+        {/* ---------------- Left: component library + PED estimate ---------------- */}
+        <aside className={`dt-panel dt-palette-panel bn-side ${mobilePanel === 'palette' ? 'mobile-visible' : ''}`}>
+          <div className="bn-side-head">
+            <h3>Components</h3>
+            <span className="muted small">Drag onto the canvas, or click to add</span>
           </div>
-          
-          {/* Annual Energy Balance Bar */}
-          <div style={{ marginBottom: 8 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
-              <span style={{ color: '#64748b' }}>Annual Balance</span>
-              <span style={{ color: ped.netBalance >= 0 ? '#22c55e' : '#ef4444' }}>
-                {ped.netBalance >= 0 ? '+' : ''}{ped.netBalance.toFixed(1)} MWh
-              </span>
-            </div>
-            <div style={{ height: 6, background: '#334155', borderRadius: 3, overflow: 'hidden' }}>
-              <div style={{ 
-                height: '100%', 
-                width: `${Math.min(ped.ratio * 100, 100)}%`,
-                background: ped.isPed ? 'linear-gradient(90deg, #22c55e, #16a34a)' : 'linear-gradient(90deg, #ef4444, #dc2626)',
-                borderRadius: 3
-              }} />
-            </div>
-          </div>
-
-          {/* Key Metrics */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4, marginBottom: 8 }}>
-            <div style={{ padding: 4, background: '#0f172a', borderRadius: 4 }}>
-              <div style={{ color: '#64748b', fontSize: 9 }}>Generation</div>
-              <div style={{ color: '#22c55e', fontWeight: 600 }}>{ped.annualGenMwh.toFixed(0)} MWh/y</div>
-            </div>
-            <div style={{ padding: 4, background: '#0f172a', borderRadius: 4 }}>
-              <div style={{ color: '#64748b', fontSize: 9 }}>Consumption</div>
-              <div style={{ color: '#ef4444', fontWeight: 600 }}>{ped.annualLoadMwh.toFixed(0)} MWh/y</div>
-            </div>
-            <div style={{ padding: 4, background: '#0f172a', borderRadius: 4 }}>
-              <div style={{ color: '#64748b', fontSize: 9 }}>Self-Consumption</div>
-              <div style={{ color: '#eab308', fontWeight: 600 }}>{(ped.selfConsumptionRate * 100).toFixed(0)}%</div>
-            </div>
-            <div style={{ padding: 4, background: '#0f172a', borderRadius: 4 }}>
-              <div style={{ color: '#64748b', fontSize: 9 }}>Self-Sufficiency</div>
-              <div style={{ color: '#3b82f6', fontWeight: 600 }}>{(ped.selfSufficiencyRate * 100).toFixed(0)}%</div>
-            </div>
-          </div>
-
-          {/* Grid Interaction */}
-          <div style={{ padding: 6, background: '#0f172a', borderRadius: 4, marginBottom: 8 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span style={{ color: '#64748b' }}>Grid Import:</span>
-              <span style={{ color: '#f97316' }}>{ped.gridImportMwh.toFixed(1)} MWh/y</span>
-            </div>
-            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span style={{ color: '#64748b' }}>Grid Export:</span>
-              <span style={{ color: '#22c55e' }}>{ped.gridExportMwh.toFixed(1)} MWh/y</span>
-            </div>
-          </div>
-
-          {/* Economics & Environment */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4 }}>
-            <div style={{ padding: 4, background: '#0f172a', borderRadius: 4 }}>
-              <div style={{ color: '#64748b', fontSize: 9 }}>Est. Grid Cost</div>
-              <div style={{ color: '#f97316', fontWeight: 600 }}>€{(ped.annualGridCost/1000).toFixed(1)}k/y</div>
-            </div>
-            <div style={{ padding: 4, background: '#0f172a', borderRadius: 4 }}>
-              <div style={{ color: '#64748b', fontSize: 9 }}>Est. CAPEX</div>
-              <div style={{ color: '#8b5cf6', fontWeight: 600 }}>€{(ped.totalCapex/1000).toFixed(0)}k</div>
-            </div>
-            <div style={{ padding: 4, background: '#0f172a', borderRadius: 4 }}>
-              <div style={{ color: '#64748b', fontSize: 9 }}>CO₂ Emissions</div>
-              <div style={{ color: '#94a3b8', fontWeight: 600 }}>{(ped.annualCO2/1000).toFixed(1)} t/y</div>
-            </div>
-            <div style={{ padding: 4, background: '#0f172a', borderRadius: 4 }}>
-              <div style={{ color: '#64748b', fontSize: 9 }}>CO₂ Savings</div>
-              <div style={{ color: '#22c55e', fontWeight: 600 }}>{(ped.co2Savings/1000).toFixed(1)} t/y</div>
-            </div>
-          </div>
-
-          {/* Recommendation */}
-          {!ped.isPed && ped.shortfallKw > 0 && (
-            <div style={{ marginTop: 8, padding: 6, background: '#1e3a5f', borderRadius: 4, fontSize: 9 }}>
-              💡 Add ~{ped.shortfallKw.toFixed(0)} kWp solar to achieve PED
-            </div>
-          )}
-        </div>
-
-        {/* Actions */}
-        <div style={{ marginTop: 16, display: 'flex', flexDirection: 'column', gap: 6 }}>
-          {apiBase && (
-            <>
-              <button onClick={saveToBackend} disabled={saving || components.length === 0} style={{ ...btnStyle, background: '#16a34a' }}>
-                {saving ? '💾 Saving...' : savedId ? '💾 Update' : '💾 Save'}
-              </button>
-              <button onClick={runSimulation} disabled={running || components.length === 0} style={{ ...btnStyle, background: '#2563eb' }}>
-                {running ? '▶️ Starting...' : '▶️ Run Simulation'}
-              </button>
-              <button onClick={createScenarioFromDT} disabled={components.length === 0} style={{ ...btnStyle, background: '#7c3aed' }}>
-                📋 Create Scenario
-              </button>
-            </>
-          )}
-          <button onClick={exportConfig} style={btnStyle}>📤 Export JSON</button>
-          <label style={{ ...btnStyle, textAlign: 'center', cursor: 'pointer' }}>
-            📥 Import JSON
-            <input type="file" accept=".json" onChange={importConfig} style={{ display: 'none' }} />
-          </label>
-          <button onClick={clearAll} style={{ ...btnStyle, background: '#7f1d1d' }}>🗑️ Clear All</button>
-        </div>
-
-        {/* Linked Scenario indicator */}
-        {apiBase && linkedScenarioId && (
-          <div style={{ marginTop: 16, padding: 8, background: '#1e3a5f', borderRadius: 6, fontSize: 11 }}>
-            <span style={{ color: '#94a3b8' }}>Linked: </span>
-            <span style={{ color: '#60a5fa' }}>{scenarios.find(s => s.id === linkedScenarioId)?.name || linkedScenarioId}</span>
-            <button onClick={() => setLinkedScenarioId(null)} style={{ marginLeft: 8, background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 10 }}>✕</button>
-          </div>
-        )}
-
-        {/* Templates */}
-        <div style={{ marginTop: 20 }}>
-          <h4 style={{ margin: '0 0 8px', fontSize: 12, color: '#94a3b8' }}>Paper Scenarios</h4>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <button onClick={() => { loadTemplate('scenario_1_baseline'); setMobilePanel('canvas'); }} style={{ ...btnStyle, background: '#1e40af', fontSize: 10, padding: '6px 8px' }}>
-              S1: Baseline
-            </button>
-            <button onClick={() => { loadTemplate('scenario_2_high_pv'); setMobilePanel('canvas'); }} style={{ ...btnStyle, background: '#1e40af', fontSize: 10, padding: '6px 8px' }}>
-              S2: High PV
-            </button>
-            <button onClick={() => { loadTemplate('scenario_3_pv_battery'); setMobilePanel('canvas'); }} style={{ ...btnStyle, background: '#1e40af', fontSize: 10, padding: '6px 8px' }}>
-              S3: PV + Battery
-            </button>
-            <button onClick={() => { loadTemplate('scenario_4_large_battery'); setMobilePanel('canvas'); }} style={{ ...btnStyle, background: '#1e40af', fontSize: 10, padding: '6px 8px' }}>
-              S4: Large Battery
-            </button>
-            <button onClick={() => { loadTemplate('scenario_5_dsm'); setMobilePanel('canvas'); }} style={{ ...btnStyle, background: '#1e40af', fontSize: 10, padding: '6px 8px' }}>
-              S5: DSM
-            </button>
-          </div>
-          <h4 style={{ margin: '12px 0 8px', fontSize: 12, color: '#94a3b8' }}>Other Templates</h4>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <button onClick={() => { loadTemplate('smart_district'); setMobilePanel('canvas'); }} style={{ ...btnStyle, background: '#065f46', fontSize: 10, padding: '6px 8px' }}>
-              🏘️ Smart District
-            </button>
-            <button onClick={() => { loadTemplate('industrial_microgrid'); setMobilePanel('canvas'); }} style={{ ...btnStyle, background: '#7c2d12', fontSize: 10, padding: '6px 8px' }}>
-              🏭 Industrial Microgrid
-            </button>
-            <button onClick={() => { loadTemplate('university_campus'); setMobilePanel('canvas'); }} style={{ ...btnStyle, background: '#4c1d95', fontSize: 10, padding: '6px 8px' }}>
-              🎓 University Campus
-            </button>
-            <button onClick={() => { loadTemplate('renewable_island'); setMobilePanel('canvas'); }} style={{ ...btnStyle, background: '#0e7490', fontSize: 10, padding: '6px 8px' }}>
-              🏝️ Renewable Island
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Center - Canvas */}
-      <div className={`dt-panel dt-canvas-panel ${mobilePanel === 'canvas' ? 'mobile-visible' : ''}`}>
-        {/* Toolbar */}
-        <div className="dt-toolbar">
-          <input
-            value={configName}
-            onChange={e => setConfigName(e.target.value)}
-            style={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 4, padding: '4px 8px', color: '#e2e8f0', fontSize: 14, flex: 1, minWidth: 0, maxWidth: 200 }}
-          />
-          <span className="dt-toolbar-info">
-            {components.length} • {connections.length}
-          </span>
-          {/* Zoom controls */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginLeft: 'auto' }}>
-            <button onClick={() => setZoom(z => Math.max(0.5, z - 0.1))} style={{ ...btnStyle, padding: '4px 8px', fontSize: 14 }}>−</button>
-            <span style={{ fontSize: 11, color: '#94a3b8', minWidth: 40, textAlign: 'center' }}>{Math.round(zoom * 100)}%</span>
-            <button onClick={() => setZoom(z => Math.min(2, z + 0.1))} style={{ ...btnStyle, padding: '4px 8px', fontSize: 14 }}>+</button>
-            <button onClick={() => setZoom(1)} style={{ ...btnStyle, padding: '4px 6px', fontSize: 10 }}>Reset</button>
-          </div>
-          {connectingFrom && (
-            <span style={{ fontSize: 12, color: '#eab308' }}>
-              🔗 Click to connect
-            </span>
-          )}
-        </div>
-
-        {/* Drop Canvas */}
-        <div
-          ref={canvasRef}
-          onDrop={handleDrop}
-          onDragOver={e => e.preventDefault()}
-          onClick={handleCanvasClick}
-          onWheel={handleWheel}
-          onTouchStart={e => { if (e.touches.length === 2) handlePinchStart(e); }}
-          onTouchMove={handleTouchMove}
-          onTouchEnd={handleTouchEnd}
-          style={{
-            flex: 1,
-            position: 'relative',
-            background: 'linear-gradient(#0f172a 1px, transparent 1px), linear-gradient(90deg, #0f172a 1px, transparent 1px), #1e293b',
-            backgroundSize: `${20 * zoom}px ${20 * zoom}px`,
-            overflow: 'hidden',
-            touchAction: touchDrag || pinchStart ? 'none' : 'pan-x pan-y'
-          }}
-        >
-          {/* Zoomable content wrapper */}
-          <div style={{ transform: `scale(${zoom})`, transformOrigin: '0 0', width: `${100/zoom}%`, height: `${100/zoom}%`, position: 'relative' }}>
-          {/* SVG for connections */}
-          <svg style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'none' }}>
-            <defs>
-              <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-                <polygon points="0 0, 10 3.5, 0 7" fill="#64748b" />
-              </marker>
-              <marker id="arrowhead-heat" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-                <polygon points="0 0, 10 3.5, 0 7" fill="#ef4444" />
-              </marker>
-            </defs>
-            {connections.map(conn => {
-              const fromComp = components.find(c => c.id === conn.from);
-              const toComp = components.find(c => c.id === conn.to);
-              if (!fromComp || !toComp) return null;
-              const color = conn.type === 'heat' ? '#ef4444' : conn.type === 'both' ? '#a855f7' : '#3b82f6';
-              const x1 = fromComp.x + 30, y1 = fromComp.y + 30;
-              const x2 = toComp.x + 30, y2 = toComp.y + 30;
+          <input className="bn-search" placeholder="Search components…" value={paletteQuery} onChange={e => setPaletteQuery(e.target.value)} aria-label="Search components" />
+          <div className="dt-component-list bn-palette">
+            {PALETTE_GROUPS.map(group => {
+              const items = group.types.filter(t => !q || COMPONENT_DEFS[t].label.toLowerCase().includes(q) || COMPONENT_DEFS[t].description.toLowerCase().includes(q));
+              if (items.length === 0) return null;
               return (
-                <g key={conn.id} onClick={() => setSelectedId(conn.id)} style={{ cursor: 'pointer', pointerEvents: 'stroke' }}>
-                  <line
-                    x1={x1} y1={y1} x2={x2} y2={y2}
-                    stroke={color} strokeWidth={3} strokeDasharray={conn.type === 'heat' ? '8,4' : 'none'}
-                    markerEnd="url(#arrowhead)"
-                  />
-                  {/* Animated flow dot */}
-                  <circle r="4" fill={color}>
-                    <animateMotion dur="2s" repeatCount="indefinite" path={`M${x1},${y1} L${x2},${y2}`} />
-                  </circle>
-                  <circle r="4" fill={color}>
-                    <animateMotion dur="2s" repeatCount="indefinite" begin="0.66s" path={`M${x1},${y1} L${x2},${y2}`} />
-                  </circle>
-                  <circle r="4" fill={color}>
-                    <animateMotion dur="2s" repeatCount="indefinite" begin="1.33s" path={`M${x1},${y1} L${x2},${y2}`} />
-                  </circle>
-                </g>
+                <div key={group.title} className="bn-group">
+                  <div className="bn-group-title">{group.title}</div>
+                  {items.map(type => {
+                    const def = COMPONENT_DEFS[type];
+                    return (
+                      <div
+                        key={type}
+                        className="bn-palette-item"
+                        draggable
+                        role="button"
+                        tabIndex={0}
+                        onDragStart={e => handleDragStart(type, e)}
+                        onDragEnd={() => setDraggedType(null)}
+                        onClick={() => handleMobileTap(type)}
+                        onKeyDown={e => { if (e.key === 'Enter') handleMobileTap(type); }}
+                        title={def.description}
+                        style={{ ['--tc' as string]: def.color }}
+                      >
+                        <span className="bn-icon-tile"><DeviceIcon type={type} size={20} /></span>
+                        <span className="bn-palette-text">
+                          <span className="bn-palette-label">{def.label}</span>
+                          <span className="bn-palette-desc">{def.description}</span>
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
               );
             })}
-          </svg>
-
-          {/* Components */}
-          {components.map(comp => {
-            const def = COMPONENT_DEFS[comp.type];
-            const isSelected = selectedId === comp.id;
-            const isConnecting = connectingFrom === comp.id;
-            const status = getComponentStatus(comp.id);
-            return (
-              <div
-                key={comp.id}
-                draggable
-                onDragEnd={e => handleComponentDrag(comp.id, e)}
-                onClick={e => handleComponentClick(comp.id, e)}
-                onTouchStart={e => handleTouchStart(comp.id, e)}
-                style={{
-                  position: 'absolute',
-                  left: comp.x,
-                  top: comp.y,
-                  width: 60,
-                  height: 60,
-                  background: `${def.color}22`,
-                  border: `2px solid ${isSelected || isConnecting ? '#fff' : status === 'isolated' ? '#f97316' : def.color}`,
-                  borderRadius: 8,
-                  display: 'flex',
-                  flexDirection: 'column',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  cursor: 'move',
-                  boxShadow: isSelected ? '0 0 12px rgba(255,255,255,0.3)' : status === 'isolated' ? '0 0 8px rgba(249,115,22,0.5)' : 'none',
-                  transition: touchDrag?.id === comp.id ? 'none' : 'box-shadow 0.15s',
-                  touchAction: 'none'
-                }}
-              >
-                {/* Status badge */}
-                <div style={{
-                  position: 'absolute',
-                  top: -6,
-                  right: -6,
-                  width: 14,
-                  height: 14,
-                  borderRadius: '50%',
-                  background: status === 'valid' ? '#22c55e' : '#f97316',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  fontSize: 8,
-                  border: '2px solid #0f172a'
-                }}>
-                  {status === 'valid' ? '✓' : '!'}
-                </div>
-                <span style={{ fontSize: 24 }}>{def.icon}</span>
-                <span style={{ fontSize: 9, color: '#94a3b8', marginTop: 2, textAlign: 'center', maxWidth: 56, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {comp.name}
-                </span>
-              </div>
-            );
-          })}
-
-          {/* Empty state */}
-          {components.length === 0 && (
-            <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', textAlign: 'center', color: '#64748b' }}>
-              <div style={{ fontSize: 48, marginBottom: 12 }}>🏗️</div>
-              <div>Drag components here to build your digital twin</div>
-            </div>
-          )}
           </div>
-        </div>
-      </div>
 
-      {/* Right Panel - Properties */}
-      <div className={`dt-panel dt-properties-panel ${mobilePanel === 'properties' ? 'mobile-visible' : ''}`}>
-        <h3 style={{ margin: '0 0 12px', fontSize: 14, color: '#94a3b8' }}>Properties</h3>
-        
-        {selectedComp ? (
-          <div>
-            <div style={{ marginBottom: 12 }}>
-              <label style={{ fontSize: 11, color: '#64748b' }}>Name</label>
-              <input
-                value={selectedComp.name}
-                onChange={e => setComponents(prev => prev.map(c => c.id === selectedComp.id ? { ...c, name: e.target.value } : c))}
-                style={inputStyle}
-              />
+          <div className="bn-ped">
+            <div className="row between">
+              <span className="bn-ped-title">Quick PED estimate</span>
+              <span className={`badge ${ped.isPed ? 'badge-live' : ped.annualLoadMwh > 0 ? 'badge-bad' : 'badge-idle'}`}>
+                {ped.annualLoadMwh > 0 ? (ped.isPed ? 'PED' : `${(ped.ratio * 100).toFixed(0)}%`) : 'No load'}
+              </span>
             </div>
+            {ped.annualLoadMwh > 0 ? (
+              <>
+                <div className="ped-gauge">
+                  <div className="ped-gauge-track">
+                    <div className={`ped-gauge-fill ${ped.isPed ? 'is-good' : ''}`} style={{ width: `${pedPct}%` }} />
+                    <div className="ped-gauge-target" style={{ left: `${100 / 1.5}%` }} />
+                  </div>
+                  <div className="ped-gauge-scale"><span>0</span><span>1.0 target</span><span>1.5+</span></div>
+                </div>
+                <dl className="bn-kv">
+                  <dt>Generation</dt><dd className="tone-good">{ped.annualGenMwh.toFixed(0)} MWh/y</dd>
+                  <dt>Consumption</dt><dd className="tone-bad">{ped.annualLoadMwh.toFixed(0)} MWh/y</dd>
+                  <dt>Balance</dt><dd className={ped.netBalance >= 0 ? 'tone-good' : 'tone-bad'}>{ped.netBalance >= 0 ? '+' : ''}{ped.netBalance.toFixed(0)} MWh/y</dd>
+                  <dt>Self-sufficiency</dt><dd>{(ped.selfSufficiencyRate * 100).toFixed(0)}%</dd>
+                  <dt>Grid import / export</dt><dd>{ped.gridImportMwh.toFixed(0)} / {ped.gridExportMwh.toFixed(0)} MWh</dd>
+                  <dt>Est. CAPEX</dt><dd>€{(ped.totalCapex / 1000).toFixed(0)}k</dd>
+                  <dt>CO₂ avoided</dt><dd>{(ped.co2Savings / 1000).toFixed(1)} t/y</dd>
+                </dl>
+                {!ped.isPed && ped.shortfallKw > 0 && (
+                  <div className="bn-tip">Roughly <b>{ped.shortfallKw.toFixed(0)} kWp</b> more PV would close the gap.</div>
+                )}
+                <p className="bn-fine">Rule-of-thumb figures. Run a simulation, or ask the Copilot, for results based on real 10-minute data.</p>
+              </>
+            ) : (
+              <p className="muted small">Add a building or load centre to estimate the annual energy balance.</p>
+            )}
+          </div>
+        </aside>
 
-            <div style={{ fontSize: 11, color: '#64748b', marginBottom: 8 }}>Parameters</div>
-            {Object.entries(selectedComp.params).map(([key, val]) => (
-              <div key={key} style={{ marginBottom: 8 }}>
-                <label style={{ fontSize: 10, color: '#94a3b8', display: 'block', marginBottom: 2 }}>
-                  {key.replace(/_/g, ' ')}
-                </label>
-                {typeof val === 'boolean' ? (
-                  <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
-                    <input
-                      type="checkbox"
-                      checked={val}
-                      onChange={e => updateComponentParam(selectedComp.id, key, e.target.checked)}
-                    />
-                    {val ? 'Enabled' : 'Disabled'}
-                  </label>
-                ) : typeof val === 'number' ? (
-                  <input
-                    type="number"
-                    value={val}
-                    onChange={e => updateComponentParam(selectedComp.id, key, parseFloat(e.target.value) || 0)}
-                    style={inputStyle}
-                  />
-                ) : (
-                  <input
-                    value={val}
-                    onChange={e => updateComponentParam(selectedComp.id, key, e.target.value)}
-                    style={inputStyle}
-                  />
+        {/* ---------------- Centre: canvas ---------------- */}
+        <section className={`dt-panel dt-canvas-panel ${mobilePanel === 'canvas' ? 'mobile-visible' : ''}`}>
+          <div className="dt-toolbar bn-toolbar">
+            <input className="bn-title" value={configName} onChange={e => setConfigName(e.target.value)} aria-label="Design name" />
+            <span className="dt-toolbar-info bn-chip">{components.length} components · {connections.length} links</span>
+            {apiBase && linkedScenarioId && (
+              <span className="bn-chip bn-chip-accent" title="Linked scenario">
+                {scenarios.find(s => s.id === linkedScenarioId)?.name || 'Linked scenario'}
+                <button className="chip-remove" onClick={() => setLinkedScenarioId(null)} aria-label="Unlink scenario">✕</button>
+              </span>
+            )}
+            <div className="bn-toolbar-right">
+              <div className="bn-menu">
+                <button className="btn btn-secondary btn-sm" onClick={() => setTemplatesOpen(o => !o)} aria-expanded={templatesOpen}>Templates ▾</button>
+                {templatesOpen && (
+                  <div className="bn-menu-pop" role="menu">
+                    {TEMPLATE_MENU.map(g => (
+                      <div key={g.group}>
+                        <div className="bn-group-title">{g.group}</div>
+                        {g.items.map(t => (
+                          <button key={t.id} role="menuitem" className="bn-menu-item" onClick={() => { setTemplatesOpen(false); loadTemplate(t.id); setMobilePanel('canvas'); }}>
+                            <span>{t.label}</span>
+                            <span className="muted small">{t.hint}</span>
+                          </button>
+                        ))}
+                      </div>
+                    ))}
+                    <div className="bn-menu-sep" />
+                    <button className="bn-menu-item" onClick={() => { setTemplatesOpen(false); exportConfig(); }}><span>Export as JSON</span></button>
+                    <label className="bn-menu-item" style={{ cursor: 'pointer' }}>
+                      <span>Import JSON…</span>
+                      <input type="file" accept=".json" onChange={e => { setTemplatesOpen(false); importConfig(e); }} style={{ display: 'none' }} />
+                    </label>
+                    {apiBase && <button className="bn-menu-item" disabled={components.length === 0} onClick={() => { setTemplatesOpen(false); createScenarioFromDT(); }}><span>Create scenario from design</span></button>}
+                    <button className="bn-menu-item bn-danger" onClick={() => { setTemplatesOpen(false); clearAll(); }}><span>Clear canvas</span></button>
+                  </div>
                 )}
               </div>
-            ))}
-
-            <div style={{ marginTop: 16, display: 'flex', flexDirection: 'column', gap: 6 }}>
-              <button onClick={() => startConnection(selectedComp.id)} style={{ ...btnStyle, background: '#1d4ed8' }}>
-                🔗 Connect to...
-              </button>
-              <button onClick={() => deleteComponent(selectedComp.id)} style={{ ...btnStyle, background: '#7f1d1d' }}>
-                🗑️ Delete
-              </button>
-            </div>
-          </div>
-        ) : connections.find(c => c.id === selectedId) ? (
-          <div>
-            {(() => {
-              const conn = connections.find(c => c.id === selectedId)!;
-              const fromComp = components.find(c => c.id === conn.from);
-              const toComp = components.find(c => c.id === conn.to);
-              return (
+              {apiBase && (
                 <>
-                  <div style={{ fontSize: 12, marginBottom: 12 }}>
-                    <b>{fromComp?.name}</b> → <b>{toComp?.name}</b>
-                  </div>
-                  <div style={{ marginBottom: 8 }}>
-                    <label style={{ fontSize: 10, color: '#94a3b8' }}>Type</label>
-                    <select
-                      value={conn.type}
-                      onChange={e => setConnections(prev => prev.map(c => c.id === conn.id ? { ...c, type: e.target.value as DTConnection['type'] } : c))}
-                      style={inputStyle}
-                    >
-                      <option value="electricity">⚡ Electricity</option>
-                      <option value="heat">🔥 Heat</option>
-                      <option value="both">🔄 Both</option>
-                    </select>
-                  </div>
-                  <div style={{ marginBottom: 8 }}>
-                    <label style={{ fontSize: 10, color: '#94a3b8' }}>Capacity (kW)</label>
-                    <input
-                      type="number"
-                      value={conn.capacity_kw || 0}
-                      onChange={e => setConnections(prev => prev.map(c => c.id === conn.id ? { ...c, capacity_kw: parseFloat(e.target.value) || 0 } : c))}
-                      style={inputStyle}
-                    />
-                  </div>
-                  <button onClick={() => deleteConnection(conn.id)} style={{ ...btnStyle, background: '#7f1d1d', marginTop: 12 }}>
-                    🗑️ Delete Connection
+                  <button className="btn btn-secondary btn-sm" onClick={saveToBackend} disabled={saving || components.length === 0}>
+                    {saving ? 'Saving…' : savedId ? 'Save' : 'Save twin'}
+                  </button>
+                  <button className="btn btn-primary btn-sm" onClick={runSimulation} disabled={running || components.length === 0}>
+                    {running ? 'Starting…' : '▶ Run simulation'}
                   </button>
                 </>
-              );
-            })()}
+              )}
+            </div>
           </div>
-        ) : (
-          <div style={{ color: '#64748b', fontSize: 12 }}>
-            Select a component or connection to edit its properties
+
+          <div
+            ref={canvasRef}
+            className={`bn-canvas ${connectingFrom ? 'is-connecting' : ''}`}
+            onDrop={handleDrop}
+            onDragOver={e => e.preventDefault()}
+            onPointerDown={onCanvasPointerDown}
+            onPointerMove={onCanvasPointerMove}
+            onPointerUp={onCanvasPointerUp}
+            onPointerLeave={() => setPointer(null)}
+            onTouchStart={e => { if (e.touches.length === 2) handlePinchStart(e); }}
+            onTouchMove={handleTouchMove}
+            onTouchEnd={handleTouchEnd}
+            style={{
+              backgroundSize: `${GRID * zoom}px ${GRID * zoom}px`,
+              backgroundPosition: `${view.x}px ${view.y}px`,
+              touchAction: touchDrag || pinchStart ? 'none' : 'pan-x pan-y',
+            }}
+          >
+            {/* Pannable / zoomable content */}
+            <div className="bn-content" style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${zoom})` }}>
+              <svg className="bn-links" width={1} height={1}>
+                <defs>
+                  {(Object.keys(CONN_COLORS) as DTConnection['type'][]).map(t => (
+                    <marker key={t} id={`${markerId}-${t}`} markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto" markerUnits="userSpaceOnUse">
+                      <path d="M0,0.5 L8,4.5 L0,8.5 z" fill={CONN_COLORS[t]} />
+                    </marker>
+                  ))}
+                </defs>
+                {connections.map(conn => {
+                  const a = components.find(c => c.id === conn.from);
+                  const b = components.find(c => c.id === conn.to);
+                  if (!a || !b) return null;
+                  const ac = { x: a.x + NODE_ANCHOR, y: a.y + NODE_ANCHOR };
+                  const bc = { x: b.x + NODE_ANCHOR, y: b.y + NODE_ANCHOR };
+                  const p1 = edgePoint(ac.x, ac.y, bc.x, bc.y);
+                  const p2 = edgePoint(bc.x, bc.y, ac.x, ac.y);
+                  const d = connPath(p1, p2);
+                  const color = CONN_COLORS[conn.type] ?? CONN_COLORS.electricity;
+                  const active = selectedId === conn.id || hoverConn === conn.id;
+                  return (
+                    <g key={conn.id}>
+                      {active && <path d={d} stroke={color} strokeOpacity={0.25} strokeWidth={9} fill="none" />}
+                      <path d={d} stroke={color} strokeWidth={active ? 3 : 2.2} fill="none" strokeDasharray={conn.type === 'heat' ? '7 5' : undefined} markerEnd={`url(#${markerId}-${conn.type})`} />
+                      <path d={d} className="bn-flow" stroke="#fff" strokeOpacity={0.85} strokeWidth={2.2} fill="none" />
+                      <path
+                        d={d}
+                        className="bn-conn-hit"
+                        stroke="transparent"
+                        strokeWidth={14}
+                        fill="none"
+                        onClick={e => { e.stopPropagation(); setSelectedId(conn.id); setConnectingFrom(null); }}
+                        onMouseEnter={() => setHoverConn(conn.id)}
+                        onMouseLeave={() => setHoverConn(h => (h === conn.id ? null : h))}
+                      />
+                      {active && (
+                        <g transform={`translate(${(p1.x + p2.x) / 2},${(p1.y + p2.y) / 2})`} className="bn-overlay">
+                          <rect x={-34} y={-11} width={68} height={22} rx={11} fill="#0b1120" stroke={color} strokeOpacity={0.7} />
+                          <text textAnchor="middle" dominantBaseline="central" fill="#e6ecf5" fontSize={11} fontWeight={600}>
+                            {conn.capacity_kw ? `${conn.capacity_kw} kW` : conn.type}
+                          </text>
+                        </g>
+                      )}
+                    </g>
+                  );
+                })}
+                {/* Rubber band while connecting */}
+                {connectingFrom && pointer && (() => {
+                  const src = components.find(c => c.id === connectingFrom);
+                  if (!src) return null;
+                  const sc = { x: src.x + NODE_ANCHOR, y: src.y + NODE_ANCHOR };
+                  return <path d={connPath(edgePoint(sc.x, sc.y, pointer.x, pointer.y), pointer)} stroke="#94a3b8" strokeWidth={2} strokeDasharray="5 5" fill="none" />;
+                })()}
+              </svg>
+
+              {components.map(comp => {
+                const def = COMPONENT_DEFS[comp.type];
+                const isSelected = selectedId === comp.id;
+                const isSource = connectingFrom === comp.id;
+                const status = getComponentStatus(comp.id);
+                const target = connectingFrom && !isSource ? (canConnectTo(comp.id) ? 'ok' : 'no') : null;
+                return (
+                  <div
+                    key={comp.id}
+                    className={`bn-node ${isSelected ? 'is-selected' : ''} ${isSource ? 'is-source' : ''} ${target === 'ok' ? 'is-target' : ''} ${target === 'no' ? 'is-disabled' : ''}`}
+                    draggable
+                    onDragStart={e => handleComponentDragStart(comp.id, e)}
+                    onDragEnd={() => { moveDragRef.current = null; }}
+                    onClick={e => handleComponentClick(comp.id, e)}
+                    onTouchStart={e => handleTouchStart(comp.id, e)}
+                    style={{
+                      left: comp.x + NODE_ANCHOR - CARD_W / 2,
+                      top: comp.y + NODE_ANCHOR - CARD_H / 2,
+                      width: CARD_W,
+                      height: CARD_H,
+                      ['--tc' as string]: def.color,
+                      transition: touchDrag?.id === comp.id ? 'none' : undefined,
+                    }}
+                  >
+                    <span className="bn-icon-tile"><DeviceIcon type={comp.type} size={22} /></span>
+                    <span className="bn-node-text">
+                      <span className="bn-node-name" title={comp.name}>{comp.name}</span>
+                      <span className="bn-node-spec">{specLine(comp.type, comp.params)}</span>
+                    </span>
+                    <span className={`bn-status ${status === 'valid' ? 'is-ok' : 'is-warn'}`} title={status === 'valid' ? 'Connected' : 'Not connected yet'} />
+                    <button
+                      className="bn-port"
+                      title="Drag a link: click here, then click another component"
+                      aria-label={`Connect ${comp.name}`}
+                      onPointerDown={e => e.stopPropagation()}
+                      onClick={e => { e.stopPropagation(); startConnection(comp.id); setPointer(null); }}
+                    >+</button>
+                  </div>
+                );
+              })}
+            </div>
+
+            {components.length === 0 && (
+              <div className="bn-empty bn-overlay">
+                <div className="bn-empty-icons">
+                  <DeviceIcon type="solar_pv" size={30} color="#f5b83d" />
+                  <DeviceIcon type="smart_building" size={34} color="#94a3b8" />
+                  <DeviceIcon type="battery_storage" size={30} color="#2fc59b" />
+                </div>
+                <h3>Design your energy district</h3>
+                <p className="muted small">Drag components from the left onto the canvas, then link them with the <b>+</b> port.</p>
+                <button className="btn btn-primary btn-sm" onClick={() => setTemplatesOpen(true)}>Start from a template</button>
+              </div>
+            )}
+
+            {connectingFrom && (
+              <div className="bn-hint bn-overlay">
+                Click a highlighted component to link it · <kbd>Esc</kbd> to cancel
+              </div>
+            )}
+
+            <div className="bn-legend bn-overlay">
+              {(Object.keys(CONN_COLORS) as DTConnection['type'][]).map(t => (
+                <span key={t}><i style={{ background: CONN_COLORS[t] }} />{t === 'both' ? 'Electricity + heat' : t === 'heat' ? 'Heat' : 'Electricity'}</span>
+              ))}
+            </div>
+            <div className="bn-zoom bn-overlay">
+              <button onClick={() => zoomAround(zoom / 1.2)} aria-label="Zoom out">−</button>
+              <button onClick={() => setView(v => ({ ...v, k: 1 }))} className="bn-zoom-pct" title="Reset to 100%">{Math.round(zoom * 100)}%</button>
+              <button onClick={() => zoomAround(zoom * 1.2)} aria-label="Zoom in">+</button>
+              <button onClick={fitView} title="Fit all components in view">Fit</button>
+            </div>
+
+            {notice && (
+              <div className={`bn-toast bn-overlay ${notice.tone === 'error' ? 'is-error' : ''}`} role={notice.tone === 'error' ? 'alert' : 'status'}>
+                {notice.text}
+              </div>
+            )}
           </div>
-        )}
-      </div>
+        </section>
+
+        {/* ---------------- Right: properties ---------------- */}
+        <aside className={`dt-panel dt-properties-panel bn-side ${mobilePanel === 'properties' ? 'mobile-visible' : ''}`}>
+          {selectedComp ? (() => {
+            const def = COMPONENT_DEFS[selectedComp.type];
+            const links = connections.filter(c => c.from === selectedComp.id || c.to === selectedComp.id);
+            return (
+              <div className="bn-props">
+                <div className="bn-props-head" style={{ ['--tc' as string]: def.color }}>
+                  <span className="bn-icon-tile lg"><DeviceIcon type={selectedComp.type} size={26} /></span>
+                  <div>
+                    <div className="bn-props-type">{def.label}</div>
+                    <div className="muted small">{def.description}</div>
+                  </div>
+                </div>
+                <label className="field">
+                  <span className="field-label">Name</span>
+                  <input value={selectedComp.name} onChange={e => setComponents(prev => prev.map(c => c.id === selectedComp.id ? { ...c, name: e.target.value } : c))} />
+                </label>
+                <div className="bn-section">Parameters</div>
+                <div className="bn-fields">
+                  {Object.entries(selectedComp.params).map(([key, val]) => {
+                    const meta = paramMeta(key);
+                    return (
+                      <label key={key} className={`field ${typeof val === 'boolean' ? 'field-inline' : ''}`}>
+                        <span className="field-label">{meta.label}</span>
+                        {typeof val === 'boolean' ? (
+                          <span className="bn-switch">
+                            <input type="checkbox" checked={val} onChange={e => updateComponentParam(selectedComp.id, key, e.target.checked)} />
+                            <span>{val ? 'On' : 'Off'}</span>
+                          </span>
+                        ) : typeof val === 'number' ? (
+                          <NumberField value={val} step={meta.step} min={meta.min} max={meta.max} unit={meta.unit} onChange={v => updateComponentParam(selectedComp.id, key, v)} />
+                        ) : meta.options ? (
+                          <select value={String(val)} onChange={e => updateComponentParam(selectedComp.id, key, e.target.value)}>
+                            {meta.options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                            {!meta.options.some(o => o.value === val) && <option value={String(val)}>{String(val)}</option>}
+                          </select>
+                        ) : (
+                          <input value={String(val)} onChange={e => updateComponentParam(selectedComp.id, key, e.target.value)} />
+                        )}
+                        {meta.hint && <span className="field-hint">{meta.hint}</span>}
+                      </label>
+                    );
+                  })}
+                </div>
+                <div className="bn-section">Links ({links.length})</div>
+                {links.length === 0 ? (
+                  <p className="muted small">Not connected yet. Use <b>Connect</b> or the <b>+</b> port on the card.</p>
+                ) : (
+                  <ul className="bn-links-list">
+                    {links.map(l => {
+                      const other = components.find(c => c.id === (l.from === selectedComp.id ? l.to : l.from));
+                      return (
+                        <li key={l.id}>
+                          <button onClick={() => setSelectedId(l.id)}>
+                            <i style={{ background: CONN_COLORS[l.type] }} />
+                            {l.from === selectedComp.id ? '→' : '←'} {other?.name ?? '—'}
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+                <div className="bn-actions">
+                  <button className="btn btn-primary btn-sm" onClick={() => startConnection(selectedComp.id)}>Connect…</button>
+                  <button className="btn btn-secondary btn-sm" onClick={() => duplicateComponent(selectedComp.id)} title="Ctrl/⌘ + D">Duplicate</button>
+                  <button className="btn btn-ghost btn-sm btn-danger" onClick={() => deleteComponent(selectedComp.id)} title="Delete key">Delete</button>
+                </div>
+              </div>
+            );
+          })() : connections.find(c => c.id === selectedId) ? (() => {
+            const conn = connections.find(c => c.id === selectedId)!;
+            const fromComp = components.find(c => c.id === conn.from);
+            const toComp = components.find(c => c.id === conn.to);
+            return (
+              <div className="bn-props">
+                <div className="bn-section" style={{ marginTop: 0 }}>Connection</div>
+                <div className="bn-conn-ends">
+                  {fromComp && <span className="bn-conn-end" style={{ ['--tc' as string]: COMPONENT_DEFS[fromComp.type].color }}><DeviceIcon type={fromComp.type} size={16} />{fromComp.name}</span>}
+                  <span className="muted">→</span>
+                  {toComp && <span className="bn-conn-end" style={{ ['--tc' as string]: COMPONENT_DEFS[toComp.type].color }}><DeviceIcon type={toComp.type} size={16} />{toComp.name}</span>}
+                </div>
+                <div className="field">
+                  <span className="field-label">Carrier</span>
+                  <div className="segmented">
+                    {(['electricity', 'heat', 'both'] as const).map(t => (
+                      <button key={t} className={conn.type === t ? 'is-active' : ''} onClick={() => setConnections(prev => prev.map(c => c.id === conn.id ? { ...c, type: t } : c))}>
+                        {t === 'both' ? 'Both' : t === 'heat' ? 'Heat' : 'Electricity'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <label className="field">
+                  <span className="field-label">Capacity</span>
+                  <NumberField value={conn.capacity_kw || 0} step={10} min={0} unit="kW" onChange={v => setConnections(prev => prev.map(c => c.id === conn.id ? { ...c, capacity_kw: v } : c))} />
+                </label>
+                <div className="bn-actions">
+                  <button className="btn btn-ghost btn-sm btn-danger" onClick={() => deleteConnection(conn.id)}>Delete connection</button>
+                </div>
+              </div>
+            );
+          })() : (
+            <div className="bn-props">
+              <div className="bn-section" style={{ marginTop: 0 }}>Properties</div>
+              <p className="muted small">Select a component or a connection to edit it.</p>
+              <div className="bn-section">Design summary</div>
+              <dl className="bn-kv">
+                {PALETTE_GROUPS.map(g => {
+                  const count = components.filter(c => g.types.includes(c.type)).length;
+                  return <Fragment key={g.title}><dt>{g.title}</dt><dd>{count}</dd></Fragment>;
+                })}
+                <dt>Links</dt><dd>{connections.length}</dd>
+                <dt>Unconnected</dt><dd className={components.some(c => getComponentStatus(c.id) !== 'valid') ? 'tone-bad' : ''}>{components.filter(c => getComponentStatus(c.id) !== 'valid').length}</dd>
+              </dl>
+              <div className="bn-section">Shortcuts</div>
+              <ul className="bn-shortcuts">
+                <li><kbd>Drag</kbd> background to pan</li>
+                <li><kbd>Ctrl</kbd>/<kbd>⌘</kbd> + scroll to zoom</li>
+                <li><kbd>Del</kbd> delete selection</li>
+                <li><kbd>Ctrl</kbd>/<kbd>⌘</kbd> + <kbd>D</kbd> duplicate</li>
+                <li><kbd>Esc</kbd> cancel / deselect</li>
+              </ul>
+            </div>
+          )}
+        </aside>
       </div>
     </div>
   );
 }
-
-const btnStyle: React.CSSProperties = {
-  padding: '8px 12px',
-  background: '#334155',
-  border: 'none',
-  borderRadius: 4,
-  color: '#e2e8f0',
-  fontSize: 12,
-  cursor: 'pointer'
-};
-
-const inputStyle: React.CSSProperties = {
-  width: '100%',
-  padding: '6px 8px',
-  background: '#1e293b',
-  border: '1px solid #334155',
-  borderRadius: 4,
-  color: '#e2e8f0',
-  fontSize: 12
-};
 
 export default DigitalTwinBuilder;
