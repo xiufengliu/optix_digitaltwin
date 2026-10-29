@@ -4,10 +4,10 @@ import { ScenarioList } from './components/ScenarioList';
 import { DigitalTwinBuilder, type DigitalTwinConfig } from './components/DigitalTwinBuilder';
 import { DigitalTwin3DView } from './components/DigitalTwin3DView';
 import { DispatchPanel, EnergyPanel, exportSeriesCsv } from './components/AnalyticsPanels';
-import { Copilot, type CopilotContext } from './components/Copilot';
+import { Copilot, type CopilotContext, type CopilotStatus, type ScenarioInfo } from './components/Copilot';
 import { apiFetch, isAbort, resolveApiBase } from './lib/api';
 import { formatCompact, formatDuration, formatPower, formatTimestamp } from './lib/format';
-import { twinFromOverrides } from './lib/twin';
+import { twinFromOverrides, twinSummary } from './lib/twin';
 import { useRunAnalytics } from './lib/useRunAnalytics';
 import type { ObservationValues, Scenario, SimulationRun, SimulationStatePayload } from './types';
 
@@ -268,7 +268,8 @@ export default function App() {
 
   // What each page shows decides the copilot's role (see backend/assistant.py)
   const [builderMeta, setBuilderMeta] = useState<{ isReference: boolean; selected: string | null }>({ isReference: false, selected: null });
-  const [selectedScenario, setSelectedScenario] = useState<{ id: string; name: string } | null>(null);
+  const [scenarioPage, setScenarioPage] = useState<{ selected: ScenarioInfo | null; customCount: number } | null>(null);
+  const selectedScenario = scenarioPage?.selected ?? null;
   const [dataNonce, setDataNonce] = useState(0);
   const copilotContext = useMemo<CopilotContext>(() => ({
     view,
@@ -332,6 +333,24 @@ export default function App() {
     ? (obs.grid_export ?? 0) - (obs.grid_import ?? 0)
     : genNow - (obs.load ?? 0);
   const controlsDisabled = !live || done || stepping || playing;
+
+  // What the console shows, so the copilot can suggest prompts that fit it
+  const copilotStatus = useMemo<CopilotStatus>(() => ({
+    console: {
+      runCount: runs.length,
+      otherRunName: runs.find((r) => r.id !== selectedRunId)?.name ?? null,
+      live,
+      done,
+      progress,
+      simulatedHours: timestep * dtHours,
+      pedRatio: analytics.ped?.ped_ratio ?? null,
+      importing: netNow < 0,
+      workspace,
+      design: runTwin ? twinSummary(runTwin) : null,
+      hasHeat: Boolean(runTwin?.components.some((c) => ['heat_pump', 'district_heating', 'chp_unit'].includes(c.type))),
+    },
+    scenarios: scenarioPage ?? undefined,
+  }), [runs, selectedRunId, live, done, progress, timestep, dtHours, analytics.ped, netNow, workspace, runTwin, scenarioPage]);
   const twinLive = useMemo(
     () => (live && state ? {
       timestamp: obs.timestamp, solarMw: obs.solar, windMw: obs.wind, hydroMw: obs.hydro, loadMw: obs.load,
@@ -556,7 +575,7 @@ export default function App() {
 
       {view === 'scenarios' && (
         <main className="page">
-          <ScenarioList apiBase={apiBase} onRun={openRun} onOpenTwin={openTwin} refreshKey={dataNonce} onSelectScenario={setSelectedScenario} />
+          <ScenarioList apiBase={apiBase} onRun={openRun} onOpenTwin={openTwin} refreshKey={dataNonce} onSelectScenario={setScenarioPage} />
         </main>
       )}
 
@@ -603,6 +622,7 @@ export default function App() {
         request={copilotRequest}
         onTwinChanged={onTwinChanged}
         onApplyDesign={applyDesign}
+        status={copilotStatus}
       />
     </div>
   );

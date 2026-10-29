@@ -6,6 +6,7 @@ import { RunStatusBadge, runDesign } from './RunList';
 import type { CompareRunsResponse, Scenario, ScenarioCreate, SimulationRun } from '../types';
 import type { DigitalTwinConfig } from './DigitalTwinBuilder';
 import { formatTwinSummary, twinSummary } from '../lib/twin';
+import type { ScenarioInfo } from './Copilot';
 import { ScenarioDesignFields, countChanges, type ComponentChanges } from './ScenarioDesignFields';
 
 interface ScenarioListProps {
@@ -15,8 +16,8 @@ interface ScenarioListProps {
   onOpenTwin?: (twinId: string) => void;
   /** Changes when scenarios or runs were changed elsewhere (e.g. by the copilot) */
   refreshKey?: number;
-  /** Reports the selected scenario (copilot context) */
-  onSelectScenario?: (s: { id: string; name: string } | null) => void;
+  /** Reports the selected scenario (copilot context and suggestions) */
+  onSelectScenario?: (s: { selected: ScenarioInfo | null; customCount: number }) => void;
 }
 
 type SavedTwin = DigitalTwinConfig & { updated_at?: string };
@@ -124,16 +125,35 @@ export function ScenarioList({ apiBase, onRun, onOpenTwin, refreshKey = 0, onSel
   const paper = PAPER_SCENARIO_NAMES.map((n) => scenarios.find((s) => s.name === n && paperIds.has(s.id))).filter(Boolean) as Scenario[];
   const custom = scenarios.filter((s) => !paperIds.has(s.id));
   const selected = scenarios.find((s) => s.id === selectedId) ?? null;
-  useEffect(() => {
-    onSelectScenario?.(selected ? { id: selected.id, name: selected.name } : null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected?.id, selected?.name]);
+
   const readOnly = Boolean(selected && paperIds.has(selected.id));
   // Asset sizes of a scenario linked to a twin come from the design (kept in sync by the backend)
   const linked = Boolean(draft.twinId);
   const twinById = useMemo(() => new Map(twins.map((t) => [t.id, t])), [twins]);
   const draftTwin = draft.twinId ? twinById.get(draft.twinId) ?? null : null;
   const designChanges = (draft.overrides.component_overrides ?? {}) as ComponentChanges;
+
+  // The selected scenario as the editor shows it (incl. unsaved edits)
+  const selectedInfo = useMemo<ScenarioInfo | null>(() => {
+    if (!selected) return null;
+    const o = draft.overrides;
+    const n = (k: string) => (Number.isFinite(Number(o[k])) ? Number(o[k]) : 0);
+    return {
+      id: selected.id,
+      name: selected.name,
+      isPaper: readOnly,
+      twinName: draftTwin?.name ?? null,
+      summary: draftTwin
+        ? twinSummary(draftTwin)
+        : { ...twinSummary(null), pvKwp: n('owned_solar_capacity_mw') * 1000, windKw: n('owned_wind_capacity_mw') * 1000, batteryKwh: n('owned_battery_capacity_mwh') * 1000, loadKw: n('owned_load_peak_mw') * 1000 },
+      flexiblePct: Math.round(n('flexible_load_share') * 100),
+      dirty,
+    };
+  }, [selected, readOnly, draftTwin, draft.overrides, dirty]);
+  useEffect(() => {
+    onSelectScenario?.({ selected: selectedInfo, customCount: custom.length });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedInfo, custom.length]);
 
   // Picking a twin shows its sizes right away; the backend derives the exact
   // settings (battery power, efficiency, flexibility) when the scenario is saved

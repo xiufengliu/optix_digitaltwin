@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { apiFetch, apiUrl } from '../lib/api';
-import { formatTwinSummary, twinSummary } from '../lib/twin';
+import { formatTwinSummary, twinSummary, type TwinSummary } from '../lib/twin';
 import type { DigitalTwinConfig } from './DigitalTwinBuilder';
 
 export interface CopilotContext {
@@ -21,6 +21,38 @@ export interface CopilotContext {
     components: { id: string; type: string; name: string; params: Record<string, unknown> }[];
     connections: { from: string; to: string; type: string }[];
   } | null;
+}
+
+/** A scenario as the Scenarios page shows it */
+export interface ScenarioInfo {
+  id: string;
+  name: string;
+  isPaper: boolean;
+  /** Name of the linked twin (full design), null for electricity-only sizes */
+  twinName: string | null;
+  summary: TwinSummary;
+  flexiblePct: number;
+  /** Unsaved edits in the scenario editor */
+  dirty: boolean;
+}
+
+/** Page state behind the suggested prompts (not sent to the backend) */
+export interface CopilotStatus {
+  console?: {
+    runCount: number;
+    /** Most recent other run, for comparisons */
+    otherRunName: string | null;
+    live: boolean;
+    done: boolean;
+    progress: number;
+    simulatedHours: number;
+    pedRatio: number | null;
+    importing: boolean;
+    workspace: 'twin' | 'energy' | 'dispatch';
+    design: TwinSummary | null;
+    hasHeat: boolean;
+  };
+  scenarios?: { selected: ScenarioInfo | null; customCount: number };
 }
 
 /** A twin design the copilot generated (propose_twin_design) */
@@ -104,9 +136,11 @@ interface Props {
   onTwinChanged: (kind: 'run' | 'scenario' | 'twin') => void;
   /** Open a proposed design on the Twin Builder canvas */
   onApplyDesign: (design: Proposal['design']) => void;
+  /** What the page currently shows; only used to pick the suggested prompts */
+  status?: CopilotStatus;
 }
 
-export function Copilot({ apiBase, open, onClose, context, request, onTwinChanged, onApplyDesign }: Props) {
+export function Copilot({ apiBase, open, onClose, context, request, onTwinChanged, onApplyDesign, status }: Props) {
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState('');
@@ -225,40 +259,7 @@ export function Copilot({ apiBase, open, onClose, context, request, onTwinChange
 
   const page = PAGE[context.view] ?? PAGE.console;
   const canvasCount = context.design?.components.length ?? 0;
-  const suggestions = context.view === 'builder'
-    ? (canvasCount > 0
-      ? [
-          'How does this design perform over a year, and what limits it?',
-          'Improve this design so it becomes a positive energy district.',
-          'Replace district heating with heat pumps and thermal storage — what changes?',
-          'What measured data should I upload for the most accurate results?',
-        ]
-      : [
-          'Generate a twin: 3 residential blocks (6,000 m²), 400 kWp PV, heat pumps and 20 EV chargers.',
-          'Generate an office campus that reaches PED, with a battery and smart EV charging.',
-          'Generate a small industrial site with CHP, PV and thermal storage.',
-          'Which components does the simulation model, and what data do they need?',
-        ])
-    : context.view === 'scenarios'
-      ? [
-          'Rank all scenarios by PED ratio and self-sufficiency over 2015–2024.',
-          context.scenario_name ? `What would most improve “${context.scenario_name}”?` : 'Which paper scenario gives the best self-sufficiency per kWh of battery?',
-          'Create scenarios for S2 with batteries of 160, 320 and 640 kWh.',
-          'Create a scenario with S3 plus a 100 kW heat pump replacing district heating, and run it.',
-        ]
-      : context.run_id
-        ? [
-            `Explain how “${context.run_name ?? 'this run'}” is performing so far.`,
-            'Why is the PED ratio of this run below 1, and what would fix it?',
-            'Which month is hardest for this design, and why?',
-            'Where does the heat come from in this run, and what does it cost in electricity?',
-          ]
-        : [
-            'Which runs exist, and how do they compare?',
-            'What is the smallest PV size that makes the reference building a PED over a full year?',
-            'Compare the five paper scenarios over 2019.',
-            'How robust is a 716 kWp design across 2015–2024?',
-          ];
+  const suggestions = buildSuggestions(context, status);
 
   const apply = (p: Proposal) => {
     if (context.view === 'builder' && canvasCount > 0
@@ -385,4 +386,116 @@ function ProposalCard({ proposal, inBuilder, onApply }: { proposal: Proposal; in
       <button className="btn btn-primary btn-sm" onClick={onApply}>{inBuilder ? 'Apply to canvas' : 'Open in Twin Builder'}</button>
     </div>
   );
+}
+
+const quote = (name: string | null | undefined, fallback: string) => (name ? `“${name}”` : fallback);
+const kw = (v: number) => Math.round(v).toLocaleString();
+
+/** Up to four prompts that fit what the user is looking at right now. */
+function buildSuggestions(context: CopilotContext, status: CopilotStatus | undefined): string[] {
+  const pick = (list: (string | false | null | undefined)[]) => list.filter((s): s is string => Boolean(s)).slice(0, 4);
+
+  if (context.view === 'builder') {
+    const d = context.design;
+    if (!d || d.components.length === 0) {
+      return [
+        'Generate a twin: 3 residential blocks (6,000 m²), 400 kWp PV, heat pumps and 20 EV chargers.',
+        'Generate an office campus that reaches PED, with a battery and smart EV charging.',
+        'Generate a small industrial site with CHP, PV and thermal storage.',
+        'Which components does the simulation model, and what data do they need?',
+      ];
+    }
+    const s = twinSummary(d);
+    const has = (type: string) => d.components.some((c) => c.type === type);
+    const selected = d.selected_component ? d.components.find((c) => c.id === d.selected_component || c.name === d.selected_component) : null;
+    const name = quote(d.name, 'this design');
+    const hasBuilding = has('smart_building') || has('load_center');
+    const heatSource = has('heat_pump') || has('district_heating') || has('chp_unit');
+    return pick([
+      selected && `How does “${selected.name}” affect the results, and what size would be best for it?`,
+      `How does ${name} perform over 2015–2024, and what limits it?`,
+      d.is_reference
+        ? 'This is the read-only paper reference — propose an improved copy that reaches PED.'
+        : `Improve ${name} so it becomes a positive energy district.`,
+      !hasBuilding && 'This design has no building or load yet — add a realistic demand for it.',
+      hasBuilding && !heatSource && 'The buildings have no heat source — add heat pumps or district heating and compare.',
+      s.pvKwp === 0 && 'Add rooftop PV sized for this design — how much can it cover?',
+      s.pvKwp > 0 && s.batteryKwh === 0 && `Would a battery help with ${kw(s.pvKwp)} kWp of PV? Find the size where it stops paying off.`,
+      s.batteryKwh > 0 && `Is the ${kw(s.batteryKwh)} kWh battery well sized for this design?`,
+      has('district_heating') && !has('heat_pump') && 'Replace district heating with heat pumps and thermal storage — what changes?',
+      has('heat_pump') && !has('thermal_storage') && 'Would thermal storage let the heat pumps use more on-site PV?',
+      has('ev_charger') && 'How much do the EV chargers add to peak import, and would smart charging help?',
+      'What measured data should I upload for the most accurate results?',
+    ]);
+  }
+
+  if (context.view === 'scenarios') {
+    const info = status?.scenarios;
+    const sel = info?.selected;
+    if (!sel) {
+      return pick([
+        'Rank all scenarios by PED ratio and self-sufficiency over 2015–2024.',
+        info && info.customCount > 0 ? 'How do my own scenarios compare with the five paper scenarios?' : 'Which paper scenario gives the best self-sufficiency per kWh of battery?',
+        'Create scenarios for S2 with batteries of 160, 320 and 640 kWh.',
+        'Create a scenario with S3 plus a 100 kW heat pump replacing district heating, and run it.',
+      ]);
+    }
+    const name = quote(sel.name, 'this scenario');
+    const s = sel.summary;
+    return pick([
+      sel.dirty && `I have unsaved edits to ${name} — what should I check before saving and running it?`,
+      `What would most improve ${name}?`,
+      `How does ${name} compare with the other scenarios over 2015–2024?`,
+      s.batteryKwh > 0
+        ? `Create variants of ${name} with half and double the ${kw(s.batteryKwh)} kWh battery and compare them.`
+        : `Would adding a battery to ${name} pay off? Try 160, 320 and 640 kWh.`,
+      sel.flexiblePct === 0 && !sel.twinName && `How much would 20 % flexible demand (DSM) help ${name}?`,
+      !sel.twinName && `${name} is electricity only — what would a full design with heat and EV charging change?`,
+      sel.isPaper && `Run ${name} so I can follow it in the Console.`,
+      sel.twinName && `Which components of “${sel.twinName}” matter most for ${name}?`,
+    ]);
+  }
+
+  const c = status?.console;
+  const run = quote(context.run_name, 'this run');
+  if (!context.run_id || !c) {
+    return [
+      'Which scenario should I run first, and why?',
+      'What is the smallest PV size that makes the reference building a PED over a full year?',
+      'Compare the five paper scenarios over 2019.',
+      'How robust is a 716 kWp design across 2015–2024?',
+    ];
+  }
+  if (!c.live) {
+    return pick([
+      `${run} has no live session — what did its design achieve over 2015–2024?`,
+      c.otherRunName && `Compare ${run} with “${c.otherRunName}”.`,
+      'Which runs exist, and how do they compare?',
+      'What would most improve this design?',
+    ]);
+  }
+  if (c.simulatedHours < 24) {
+    return pick([
+      `Simulate ${run} for one week and summarise what happens.`,
+      'Which scenario does this run come from, and what does its design contain?',
+      `What PED ratio should I expect from ${run} over a full year?`,
+      c.runCount > 1 && c.otherRunName && `How is this run set up differently from “${c.otherRunName}”?`,
+    ]);
+  }
+  const ped = c.pedRatio;
+  return pick([
+    c.done ? `Summarise the full results of ${run}.` : `Explain how ${run} is performing so far.`,
+    ped != null && (ped < 1
+      ? `Why is the PED ratio ${ped.toFixed(2)} so far, and what would bring it above 1?`
+      : `The PED ratio is ${ped.toFixed(2)} — is this design oversized, and where is the surplus lost?`),
+    c.workspace === 'dispatch'
+      ? 'Explain the dispatch: when does the battery charge and discharge, and is it used well?'
+      : c.workspace === 'energy'
+        ? 'Which month is hardest for this design, and why?'
+        : c.importing ? 'Why is the district importing from the grid right now?' : 'Where does the surplus go right now — battery, export or curtailment?',
+    c.hasHeat && 'Where does the heat come from in this run, and what does it cost in electricity?',
+    !c.done && c.progress < 0.5 && c.simulatedHours < 24 * 60 && `Simulate ${run} one more month and tell me what changed.`,
+    c.otherRunName && `Compare ${run} with “${c.otherRunName}” over the same period.`,
+    c.design && c.design.batteryKwh > 0 && `Is the ${kw(c.design.batteryKwh)} kWh battery the right size for this run?`,
+  ]);
 }

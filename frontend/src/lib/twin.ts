@@ -55,7 +55,7 @@ export interface TwinSummary {
 }
 
 /** Key sizes of a design, counted the way the simulation counts them. */
-export function twinSummary(config: Pick<DigitalTwinConfig, 'components'> | null | undefined): TwinSummary {
+export function twinSummary(config: { components: { type: string; params?: unknown }[] } | null | undefined): TwinSummary {
   const out: TwinSummary = { pvKwp: 0, windKw: 0, batteryKwh: 0, loadKw: 0, components: 0, heatPumpKw: 0, chpKw: 0, thermalKwh: 0, evKw: 0 };
   for (const c of config?.components ?? []) {
     const p = (c.params ?? {}) as Record<string, unknown>;
