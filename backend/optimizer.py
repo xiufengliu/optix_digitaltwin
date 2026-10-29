@@ -28,21 +28,44 @@ class MeritOrderConfig:
     # DSM virtual store (lossless) parameters
     flexible_load_share: float = 0.0
     max_shift_hours: float = 3.0
+    # Grid connection limits on the grid side (MW); None = unlimited. Export
+    # above the limit is curtailed; import above it is reported, not cut.
+    import_limit_mw: Optional[float] = None
+    export_limit_mw: Optional[float] = None
+
+
+@dataclass
+class HeatSystem:
+    """Heat side of a site (MW / MWh per step on the same timeline)."""
+
+    heat_mw: np.ndarray               # heat demand
+    hp_cap_mw: float = 0.0            # heat pump thermal output capacity
+    hp_inv_cop: Optional[np.ndarray] = None  # electricity per unit heat (1 / COP)
+    chp_el_mw: float = 0.0
+    chp_th_mw: float = 0.0
+    chp_eff_e: float = 0.38           # electricity per unit fuel
+    ts_cap_mwh: float = 0.0           # thermal storage
+    ts_loss_per_day: float = 0.0      # share of stored heat lost per day
+    dh_cap_mw: float = 0.0            # district heating connection
 
 
 class MeritOrderOptimizer:
     """Deterministic PV‑first dispatcher consistent with paper.txt scenarios.
 
-    PV routing:  PV -> Load  >  PV -> DSM (pull flexible demand forward)  >  PV -> Battery  >  PV -> Export
+    PV routing:  PV -> Load  >  PV -> DSM (pull flexible demand forward)  >  PV -> Battery
+                 >  PV -> heat pump into thermal storage  >  PV -> Export (up to the export limit; rest curtailed)
     Release:     DSM dispatch  >  Battery -> Load  >  Grid Import
-    Battery discharge is never exported and the battery never charges from the
-    grid (export only from PV, no arbitrage).
+    Heat:        thermal storage  >  heat pump  >  CHP (heat-led)  >  district heating  >  external (not modelled)
+    Heat pump electricity is demand of the step; CHP electricity is on-site
+    generation. Battery discharge is never exported and the battery never
+    charges from the grid (export only from on-site generation, no arbitrage).
     """
 
     def __init__(self, cfg: MeritOrderConfig):
         self.cfg = cfg
 
-    def run(self, pv_mw: np.ndarray, load_mw: np.ndarray) -> Dict[str, Any]:
+    def run(self, pv_mw: np.ndarray, load_mw: np.ndarray, flex_mw: Optional[np.ndarray] = None,
+            heat: Optional[HeatSystem] = None) -> Dict[str, Any]:
         if pv_mw.shape != load_mw.shape:
             raise ValueError("pv and load must have same length")
 
@@ -65,28 +88,101 @@ class MeritOrderOptimizer:
         dsm_charge = np.zeros(n)    # increase demand now
         dsm_discharge = np.zeros(n) # reduce demand later
         soc_trace = np.zeros(n)     # battery state of charge at end of step (MWh)
+        curtailed = np.zeros(n)
+
+        pv_list = np.maximum(0.0, np.asarray(pv_mw, dtype=float) * dt).tolist()
+        load_list = np.maximum(0.0, np.asarray(load_mw, dtype=float) * dt).tolist()
 
         # DSM as a lossless virtual demand store (paper, Scenario 5): PV surplus
         # pulls flexible demand forward from the next `max_shift_hours`. Only the
-        # flexible share of a future step's load can be pulled, and only the part
+        # flexible part of a future step's load can be pulled, and only the part
         # PV would not cover then, so every shifted MWh is released inside the
-        # window and charge == dispatch overall. The power limit is the flexible
-        # share of peak load; outstanding energy therefore stays below
+        # window and charge == dispatch overall. The power limit is the peak of
+        # the flexible load; outstanding energy therefore stays below
         # E_DSM = P_flex_peak * max_shift_hours.
-        flex = max(0.0, min(1.0, self.cfg.flexible_load_share))
-        max_power_mw = float(np.max(load_mw) * flex) if flex > 0 and n else 0.0
+        if flex_mw is None:
+            flex = max(0.0, min(1.0, self.cfg.flexible_load_share))
+            flex_e_all = np.asarray(load_mw, dtype=float) * flex * dt if flex > 0 else None
+        else:
+            flex_e_all = np.clip(np.asarray(flex_mw, dtype=float), 0.0, None) * dt
+        max_power_mw = float(np.max(flex_e_all)) / dt if flex_e_all is not None and n else 0.0
         window = int(round(max(0.0, self.cfg.max_shift_hours) / dt)) if dt > 0 else 0
         dsm_on = max_power_mw > 1e-9 and window > 0
         if dsm_on:
             load_e_all = np.maximum(0.0, np.asarray(load_mw, dtype=float) * dt)
             pv_e_all = np.maximum(0.0, np.asarray(pv_mw, dtype=float) * dt)
             # Flexible demand at each step that PV would not serve directly
-            dsm_room = np.minimum(flex * load_e_all, np.maximum(0.0, load_e_all - pv_e_all))
+            dsm_room = np.minimum(np.minimum(flex_e_all, load_e_all), np.maximum(0.0, load_e_all - pv_e_all))
         dsm_soc = 0.0
 
+        exp_cap = None
+        if self.cfg.export_limit_mw is not None:
+            # Limit applies to what reaches the grid (after export losses)
+            exp_cap = max(0.0, float(self.cfg.export_limit_mw)) * dt / max(float(self.cfg.eta_export), 1e-9)
+
+        # Heat side
+        has_heat = heat is not None
+        if has_heat:
+            heat_list = np.maximum(0.0, np.asarray(heat.heat_mw, dtype=float) * dt).tolist()
+            hp_cap_e = max(0.0, heat.hp_cap_mw) * dt
+            inv_cop = (np.asarray(heat.hp_inv_cop, dtype=float).tolist() if heat.hp_inv_cop is not None and hp_cap_e > 0 else None)
+            chp_th_e = max(0.0, heat.chp_th_mw) * dt
+            chp_ratio = heat.chp_el_mw / heat.chp_th_mw if heat.chp_th_mw > 1e-12 else 0.0
+            dh_cap_e = max(0.0, heat.dh_cap_mw) * dt
+            ts_cap = max(0.0, heat.ts_cap_mwh)
+            ts_keep = (1.0 - min(1.0, max(0.0, heat.ts_loss_per_day))) ** (dt / 24.0)
+            ts_soc = 0.0
+            ts_loss_total = 0.0
+            hp_heat = np.zeros(n)
+            hp_el = np.zeros(n)
+            ts_charge = np.zeros(n)
+            ts_discharge = np.zeros(n)
+            ts_soc_trace = np.zeros(n)
+            chp_heat = np.zeros(n)
+            chp_el = np.zeros(n)
+            dh_heat = np.zeros(n)
+            ext_heat = np.zeros(n)
+
         for t in range(n):
-            pv_e = max(0.0, float(pv_mw[t]) * dt)
-            load_e = max(0.0, float(load_mw[t]) * dt)
+            pv_e = pv_list[t]
+            load_e = load_list[t]
+
+            if has_heat:
+                hd = heat_list[t]
+                if ts_cap > 0:
+                    lost = ts_soc * (1.0 - ts_keep)
+                    ts_soc -= lost
+                    ts_loss_total += lost
+                    d = min(hd, ts_soc)
+                    if d > 0:
+                        ts_soc -= d
+                        hd -= d
+                        ts_discharge[t] = d
+                if inv_cop is not None and hd > 0:
+                    h = min(hd, hp_cap_e)
+                    hp_heat[t] = h
+                    hp_el[t] = h * inv_cop[t]
+                    load_e += hp_el[t]
+                    hd -= h
+                if chp_th_e > 0 and hd > 0:
+                    h = min(hd, chp_th_e)
+                    chp_heat[t] = h
+                    chp_el[t] = h * chp_ratio
+                    pv_e += chp_el[t]
+                    hd -= h
+                if dh_cap_e > 0 and hd > 0:
+                    h = min(hd, dh_cap_e)
+                    dh_heat[t] = h
+                    hd -= h
+                ext_heat[t] = hd
+
+            # DSM dispatch: demand already served earlier is removed now. It
+            # never exceeds load - PV (see dsm_room), so releasing it before PV
+            # serves the load equals the paper's order and stays correct when
+            # CHP electricity adds to on-site generation.
+            if dsm_discharge[t] > 0.0:
+                load_e -= dsm_discharge[t]
+                dsm_soc -= dsm_discharge[t]
 
             # 1) PV -> Load
             use = min(pv_e, load_e)
@@ -120,17 +216,26 @@ class MeritOrderOptimizer:
                     pv_to_batt[t] = charge_input
                     pv_e -= charge_input
 
-            # 3) PV -> Export (remaining)
+            # 2b) PV -> heat pump spare capacity -> thermal storage
+            if has_heat and ts_cap > 0 and inv_cop is not None and pv_e > 1e-12:
+                h = min(hp_cap_e - hp_heat[t], ts_cap - ts_soc, pv_e / max(inv_cop[t], 1e-9))
+                if h > 1e-12:
+                    el = h * inv_cop[t]
+                    ts_soc += h
+                    ts_charge[t] = h
+                    hp_heat[t] += h
+                    hp_el[t] += el
+                    pv_e -= el
+
+            # 3) PV -> Export (remaining, up to the export limit)
             if pv_e > 1e-12:
+                if exp_cap is not None and pv_e > exp_cap:
+                    curtailed[t] = pv_e - exp_cap
+                    pv_e = exp_cap
                 pv_export[t] = pv_e
                 pv_e = 0.0
 
-            # 4) DSM dispatch: demand already served earlier is removed now
-            if dsm_discharge[t] > 0.0:
-                load_e -= dsm_discharge[t]
-                dsm_soc -= dsm_discharge[t]
-
-            # 5) Battery -> Load
+            # 4) Battery -> Load
             if load_e > 1e-12 and soc - soc_lo > 1e-12 and p_cap > 1e-9:
                 # output limited by power and energy above the SoC floor, after efficiency
                 max_output = min(load_e, p_cap * dt, (soc - soc_lo) * eta_d)
@@ -139,53 +244,113 @@ class MeritOrderOptimizer:
                     soc -= max_output / max(eta_d, 1e-9)
                     load_e -= max_output
 
-            # 6) Grid Import for any residual load
+            # 5) Grid Import for any residual load
             if load_e > 1e-12:
                 grid_import[t] = load_e
 
             soc_trace[t] = soc
+            if has_heat:
+                ts_soc_trace[t] = ts_soc
 
         eta_tr = min(max(float(self.cfg.eta_transformer), 1e-9), 1.0)
         eta_ex = min(max(float(self.cfg.eta_export), 0.0), 1.0)
         grid_purchase = grid_import / eta_tr
         export_delivered = pv_export * eta_ex
 
-        total_gen_mwh = float(np.sum(pv_mw) * dt)
-        total_demand_mwh = float(np.sum(load_mw) * dt)
+        dt_sum = lambda a: float(np.sum(a) * dt)  # noqa: E731
+        total_gen_mwh = dt_sum(pv_mw)  # renewable on-site generation
+        hp_el_mwh = float(np.sum(hp_el)) if has_heat else 0.0
+        chp_el_mwh = float(np.sum(chp_el)) if has_heat else 0.0
+        total_demand_mwh = dt_sum(load_mw) + hp_el_mwh
         ped_abs = total_gen_mwh - total_demand_mwh
         ped_ratio = float(total_gen_mwh / (total_demand_mwh + 1e-9))
+        onsite_mwh = total_gen_mwh + chp_el_mwh
+
+        import_over = np.zeros(n)
+        if self.cfg.import_limit_mw is not None:
+            import_over = np.maximum(0.0, grid_purchase - max(0.0, float(self.cfg.import_limit_mw)) * dt)
+
+        series = {
+            'pv_to_load_mwh': pv_to_load,
+            'pv_to_batt_mwh': pv_to_batt,
+            'pv_export_mwh': pv_export,
+            'batt_to_load_mwh': batt_to_load,
+            'grid_import_mwh': grid_import,
+            'dsm_charge_mwh': dsm_charge,
+            'dsm_discharge_mwh': dsm_discharge,
+            'grid_purchase_mwh': grid_purchase,
+            'export_delivered_mwh': export_delivered,
+        }
+        if self.cfg.export_limit_mw is not None:
+            series['curtailed_mwh'] = curtailed
+        kpis = {
+            'total_gen_mwh': total_gen_mwh,
+            'total_demand_mwh': total_demand_mwh,
+            'ped_absolute_mwh': ped_abs,
+            'ped_ratio': ped_ratio,
+            'self_consumption_mwh': float(np.sum(pv_to_load)),
+            'export_mwh': float(np.sum(pv_export)),
+            'battery_throughput_mwh': float(np.sum(pv_to_batt) + np.sum(batt_to_load)),
+            'grid_import_mwh': float(np.sum(grid_import)),
+            'grid_purchase_mwh': float(np.sum(grid_purchase)),
+            'export_delivered_mwh': float(np.sum(export_delivered)),
+            'grid_losses_mwh': float(np.sum(grid_purchase - grid_import) + np.sum(pv_export - export_delivered)),
+            'battery_losses_mwh': float(np.sum(pv_to_batt) - np.sum(batt_to_load) - (soc - soc0)),
+            # Share of on-site generation used locally (directly, via battery, DSM or thermal storage)
+            'self_consumption_ratio': float((np.sum(pv_to_load) + np.sum(pv_to_batt) + np.sum(dsm_charge)
+                                             + (float(np.sum(ts_charge * np.asarray(heat.hp_inv_cop))) if has_heat and inv_cop is not None else 0.0))
+                                            / (onsite_mwh + 1e-9)),
+            # Share of demand covered without grid import
+            'self_sufficiency_ratio': float(1.0 - np.sum(grid_import) / (total_demand_mwh + 1e-9)),
+            'curtailed_mwh': float(np.sum(curtailed)),
+            'import_over_limit_mwh': float(np.sum(import_over)),
+            'import_over_limit_hours': float(np.count_nonzero(import_over > 1e-9) * dt),
+            'peak_grid_purchase_kw': float(np.max(grid_purchase) / dt * 1000) if n else 0.0,
+        }
+
+        dh_mwh = ext_mwh = chp_fuel_mwh = 0.0
+        if has_heat:
+            series.update({
+                'heat_demand_mwh': np.asarray(heat_list),
+                'hp_heat_mwh': hp_heat,
+                'hp_el_mwh': hp_el,
+                'ts_charge_mwh': ts_charge,
+                'ts_discharge_mwh': ts_discharge,
+                'chp_heat_mwh': chp_heat,
+                'chp_el_mwh': chp_el,
+                'dh_heat_mwh': dh_heat,
+                'external_heat_mwh': ext_heat,
+            })
+            dh_mwh = float(np.sum(dh_heat))
+            ext_mwh = float(np.sum(ext_heat))
+            chp_fuel_mwh = chp_el_mwh / max(heat.chp_eff_e, 1e-9)
+            kpis.update({
+                'heat_demand_mwh': float(np.sum(heat_list)),
+                'hp_heat_mwh': float(np.sum(hp_heat)),
+                'hp_el_mwh': hp_el_mwh,
+                'hp_spf': float(np.sum(hp_heat) / hp_el_mwh) if hp_el_mwh > 1e-9 else None,
+                'ts_charge_mwh': float(np.sum(ts_charge)),
+                'ts_discharge_mwh': float(np.sum(ts_discharge)),
+                'ts_losses_mwh': ts_loss_total,
+                'chp_heat_mwh': float(np.sum(chp_heat)),
+                'chp_el_mwh': chp_el_mwh,
+                'chp_fuel_mwh': chp_fuel_mwh,
+                'dh_heat_mwh': dh_mwh,
+                'external_heat_mwh': ext_mwh,
+            })
+        # Energy crossing the site boundary, all carriers (electricity, heat, fuel)
+        imports = float(np.sum(grid_purchase)) + dh_mwh + ext_mwh + chp_fuel_mwh
+        net_import = imports - float(np.sum(export_delivered))
+        kpis['energy_import_mwh'] = imports
+        kpis['net_energy_import_mwh'] = net_import
+        kpis['total_energy_ped_ratio'] = float(total_gen_mwh / (total_gen_mwh + net_import)) if total_gen_mwh + net_import > 1e-9 else None
 
         return {
-            'series_mwh': {
-                'pv_to_load_mwh': pv_to_load,
-                'pv_to_batt_mwh': pv_to_batt,
-                'pv_export_mwh': pv_export,
-                'batt_to_load_mwh': batt_to_load,
-                'grid_import_mwh': grid_import,
-                'dsm_charge_mwh': dsm_charge,
-                'dsm_discharge_mwh': dsm_discharge,
-                'grid_purchase_mwh': grid_purchase,
-                'export_delivered_mwh': export_delivered,
-            },
-            'kpis': {
-                'total_gen_mwh': total_gen_mwh,
-                'total_demand_mwh': total_demand_mwh,
-                'ped_absolute_mwh': ped_abs,
-                'ped_ratio': ped_ratio,
-                'self_consumption_mwh': float(np.sum(pv_to_load)),
-                'export_mwh': float(np.sum(pv_export)),
-                'battery_throughput_mwh': float(np.sum(pv_to_batt) + np.sum(batt_to_load)),
-                'grid_import_mwh': float(np.sum(grid_import)),
-                'grid_purchase_mwh': float(np.sum(grid_purchase)),
-                'export_delivered_mwh': float(np.sum(export_delivered)),
-                'grid_losses_mwh': float(np.sum(grid_purchase - grid_import) + np.sum(pv_export - export_delivered)),
-                'battery_losses_mwh': float(np.sum(pv_to_batt) - np.sum(batt_to_load) - (soc - soc0)),
-                # Share of on-site generation used locally (directly, via battery or DSM)
-                'self_consumption_ratio': float((np.sum(pv_to_load) + np.sum(pv_to_batt) + np.sum(dsm_charge)) / (np.sum(pv_mw) * dt + 1e-9)),
-                # Share of demand covered without grid import
-                'self_sufficiency_ratio': float(1.0 - np.sum(grid_import) / (np.sum(load_mw) * dt + 1e-9)),
-            },
+            'series_mwh': series,
+            'kpis': kpis,
             'soc_mwh': soc_trace,
+            'soc0_mwh': soc0,
+            'ts_soc_mwh': ts_soc_trace if has_heat else None,
             'dt_hours': dt,
         }
 
@@ -209,4 +374,7 @@ def build_config_from_overrides(overrides: Optional[Dict[str, Any]], default_dt_
         cfg.flexible_load_share = float(overrides['flexible_load_share'])
     if 'max_shift_hours' in overrides:
         cfg.max_shift_hours = float(overrides['max_shift_hours'])
+    for key, attr in (('grid_import_limit_mw', 'import_limit_mw'), ('grid_export_limit_mw', 'export_limit_mw')):
+        if overrides.get(key) is not None:
+            setattr(cfg, attr, float(overrides[key]))
     return cfg

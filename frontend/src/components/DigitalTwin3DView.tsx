@@ -14,7 +14,26 @@ export interface TwinLive {
   solarMw?: number;
   windMw?: number;
   hydroMw?: number;
+  /** All electricity demand, incl. heat pumps and EV charging */
   loadMw?: number;
+  // Merit-order dispatch of the current step (grid side for import/export)
+  chpMw?: number;
+  heatPumpMw?: number;
+  gridImportMw?: number;
+  gridExportMw?: number;
+  batteryChargeMw?: number;
+  batteryDischargeMw?: number;
+  curtailedMw?: number;
+}
+
+/** Grid exchange of the step (MW, + = import), from the dispatch when available. */
+function gridNet(live: TwinLive): number {
+  if (live.gridImportMw != null || live.gridExportMw != null) return (live.gridImportMw ?? 0) - (live.gridExportMw ?? 0);
+  return (live.loadMw ?? 0) - ((live.solarMw ?? 0) + (live.windMw ?? 0) + (live.hydroMw ?? 0));
+}
+
+function generation(live: TwinLive | null | undefined): number {
+  return (live?.solarMw ?? 0) + (live?.windMw ?? 0) + (live?.hydroMw ?? 0) + (live?.chpMw ?? 0);
 }
 
 interface Props {
@@ -249,17 +268,22 @@ function componentPowers(components: DTComponent[], live: TwinLive | null | unde
   };
   share('solar_pv', c => num(c.params?.capacity_kwp, 1), live.solarMw ?? 0);
   share('wind_turbine', c => num(c.params?.capacity_kw, 1), live.windMw ?? 0);
-  // Same split as the simulation: one demand profile scaled to the summed peak
-  // of buildings and load centres (EV chargers and heat pumps are not simulated)
+  share('chp_unit', c => num(c.params?.electrical_kw, 1), live.chpMw ?? 0);
+  share('heat_pump', c => num(c.params?.capacity_kw, 1), live.heatPumpMw ?? 0);
+  // Battery: + = discharging to the district, - = charging
+  share('battery_storage', c => num(c.params?.capacity_kwh, 1), (live.batteryDischargeMw ?? 0) - (live.batteryChargeMw ?? 0));
+  // Building and load-centre demand (the rest of the load) split by peak; the
+  // simulation models each one's own profile, this is an approximation for labels
   const loadWeight = (c: DTComponent) => {
     const p = c.params ?? {};
     return c.type === 'smart_building' ? num(p.load_kw, 0) : num(p.peak_load_kw, num(p.base_load_kw, 0));
   };
   const consumers = components.filter(c => c.type === 'smart_building' || c.type === 'load_center');
   const loadSum = consumers.reduce((s, c) => s + loadWeight(c), 0) || 1;
-  consumers.forEach(c => out.set(c.id, (live.loadMw ?? 0) * loadWeight(c) / loadSum));
+  const otherLoad = Math.max(0, (live.loadMw ?? 0) - (live.heatPumpMw ?? 0));
+  consumers.forEach(c => out.set(c.id, otherLoad * loadWeight(c) / loadSum));
   const grids = components.filter(c => c.type === 'smart_grid');
-  const net = (live.loadMw ?? 0) - ((live.solarMw ?? 0) + (live.windMw ?? 0) + (live.hydroMw ?? 0));
+  const net = gridNet(live);
   grids.forEach(c => out.set(c.id, net / grids.length));
   components.forEach(c => { if (!out.has(c.id)) out.set(c.id, null); });
   return out;
@@ -855,9 +879,10 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove, liv
     : 'Midsummer day (preview)';
   const skyText = sun.elevationDeg > 8 ? `Daylight · sun ${Math.round(sun.elevationDeg)}° high`
     : sun.elevationDeg > -6 ? (clock.hour < 12 ? 'Dawn' : 'Dusk') : 'Night';
-  const gen = (live?.solarMw ?? 0) + (live?.windMw ?? 0) + (live?.hydroMw ?? 0);
+  const gen = generation(live);
   const load = live?.loadMw ?? 0;
-  const net = load - gen;
+  const net = live ? gridNet(live) : 0;
+  const battery = (live?.batteryDischargeMw ?? 0) - (live?.batteryChargeMw ?? 0);
   const barMax = Math.max(gen, load, 1e-6);
   const selectedPower = selected ? powers.get(selected.id) : undefined;
 
@@ -895,6 +920,12 @@ export function DigitalTwin3DView({ config, animate = true, onComponentMove, liv
             </span>
             <strong>{formatPower(Math.abs(net))}</strong>
           </div>
+          {Math.abs(battery) > IDLE_MW && (
+            <div className="tw-net"><span>{battery > 0 ? 'Battery discharging' : 'Battery charging'}</span><strong>{formatPower(Math.abs(battery))}</strong></div>
+          )}
+          {(live.curtailedMw ?? 0) > IDLE_MW && (
+            <div className="tw-net"><span className="tw-net-import">Curtailed (export limit)</span><strong>{formatPower(live.curtailedMw)}</strong></div>
+          )}
         </div>
       )}
 

@@ -30,6 +30,16 @@ export interface ObservationValues {
   load?: number;
   price?: number;
   timestamp?: string | null;
+  // Merit-order dispatch of the step (MW; grid side for import/export)
+  grid_import?: number;
+  grid_export?: number;
+  battery_charge?: number;
+  battery_discharge?: number;
+  battery_soc?: number;
+  curtailed?: number;
+  chp?: number;
+  heat_pump?: number;
+  heat_demand?: number;
 }
 
 export interface SimulationStatePayload {
@@ -91,6 +101,11 @@ export interface CompareRunRow {
   total_demand_mwh?: number | null;
   ped_absolute_mwh?: number | null;
   ped_ratio?: number | null;
+  total_energy_ped_ratio?: number | null;
+  self_sufficiency_ratio?: number | null;
+  grid_purchase_mwh?: number | null;
+  export_delivered_mwh?: number | null;
+  heat_demand_mwh?: number | null;
 }
 
 export interface CompareRunsResponse {
@@ -110,6 +125,10 @@ export interface EnergySeries {
   solar_mw?: number[];
   wind_mw?: number[];
   hydro_mw?: number[];
+  chp_mw?: number[];
+  heat_pump_mw?: number[];
+  ev_mw?: number[];
+  heat_demand_mw?: number[];
 }
 
 export interface DispatchKpis {
@@ -123,6 +142,24 @@ export interface DispatchKpis {
   grid_import_mwh: number;
   self_consumption_ratio?: number;
   self_sufficiency_ratio?: number;
+  curtailed_mwh?: number;
+  import_over_limit_mwh?: number;
+  import_over_limit_hours?: number;
+  peak_grid_purchase_kw?: number;
+  net_energy_import_mwh?: number;
+  total_energy_ped_ratio?: number | null;
+  heat_demand_mwh?: number;
+  hp_heat_mwh?: number;
+  hp_el_mwh?: number;
+  hp_spf?: number | null;
+  ts_charge_mwh?: number;
+  ts_discharge_mwh?: number;
+  ts_losses_mwh?: number;
+  chp_heat_mwh?: number;
+  chp_el_mwh?: number;
+  chp_fuel_mwh?: number;
+  dh_heat_mwh?: number;
+  external_heat_mwh?: number;
 }
 
 export interface DispatchResult {
@@ -134,7 +171,11 @@ export interface DispatchResult {
   series_mw: Record<string, number[]>;
   series_mwh: Record<string, number[]>;
   soc_mwh: number[];
+  thermal_soc_mwh?: number[];
   dt_hours: number;
+  /** "<component id>/<channel>" -> "uploaded" | "synthetic" */
+  data_sources?: Record<string, string>;
+  data_source_details?: { component: string; type: string; channel: string; label: string; source: 'uploaded' | 'synthetic' }[];
 }
 
 // Digital Twin Builder Types

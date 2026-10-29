@@ -1,4 +1,6 @@
 import { formatRelative } from '../lib/format';
+import { formatTwinSummary, twinFromOverrides, twinSummary } from '../lib/twin';
+import type { DigitalTwinConfig } from './DigitalTwinBuilder';
 import type { SimulationRun } from '../types';
 
 interface RunListProps {
@@ -17,6 +19,14 @@ export function runSource(run: SimulationRun): string {
   if (run.scenario_id) return 'Scenario';
   if (run.digital_twin_id) return 'Digital twin';
   return 'Custom';
+}
+
+/** What the run simulated: the design's key sizes and which model was used. */
+export function runDesign(run: SimulationRun): { summary: string; full: boolean } {
+  const overrides = (run.config?.config_overrides ?? {}) as Record<string, unknown>;
+  const components = overrides.twin_components as DigitalTwinConfig['components'] | undefined;
+  if (Array.isArray(components)) return { summary: formatTwinSummary(twinSummary({ components })), full: true };
+  return { summary: formatTwinSummary(twinSummary(twinFromOverrides('', '', overrides))), full: false };
 }
 
 export function RunStatusBadge({ run }: { run: SimulationRun }) {
@@ -51,6 +61,7 @@ export function RunList({ runs, selectedId, onSelect, onRefresh, onDelete, onRes
         )}
         {runs.map((run) => {
           const live = Boolean(run.session_id);
+          const design = runDesign(run);
           return (
             <div
               key={run.id}
@@ -65,9 +76,14 @@ export function RunList({ runs, selectedId, onSelect, onRefresh, onDelete, onRes
                 <strong className="run-item-name" title={run.name ?? run.id}>{run.name ?? 'Untitled run'}</strong>
                 <RunStatusBadge run={run} />
               </div>
+              <div className="run-item-design muted small" title={design.full ? 'Every component simulated (heat, EV, CHP, measured data)' : 'Hand-entered sizes: electricity only'}>
+                {design.summary}{design.full ? '' : ' · electricity only'}
+              </div>
               <div className="run-item-meta">
                 <span className="tag">{runSource(run)}</span>
-                <span>Updated {formatRelative(run.updated_at)}</span>
+                <span title={new Date(run.created_at).toLocaleString()}>
+                  Started {new Date(run.created_at).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}
+                </span>
                 <div className="run-item-actions">
                 {!live && onRestart && (
                   <button

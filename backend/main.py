@@ -21,6 +21,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     SimulationManager.initialize_global()
     create_all()
     _seed_predefined_scenarios()
+    from .reference_designs import ensure_reference_designs
+
+    ensure_reference_designs()
     # Parse the default CSV in the background so the first run starts quickly
     warmup = asyncio.create_task(asyncio.to_thread(_warm_data_cache))
     try:
@@ -86,7 +89,6 @@ def _seed_predefined_scenarios() -> None:
                 "owned_hydro_capacity_mw": 0.0,
                 "owned_load_peak_mw": 0.15,
                 "owned_battery_capacity_mwh": 0.0,
-                "investment_freq": 12,
             },
         },
         {
@@ -104,7 +106,6 @@ def _seed_predefined_scenarios() -> None:
                 "owned_hydro_capacity_mw": 0.0,
                 "owned_load_peak_mw": 0.15,
                 "owned_battery_capacity_mwh": 0.0,
-                "investment_freq": 12,
             },
         },
         {
@@ -123,7 +124,6 @@ def _seed_predefined_scenarios() -> None:
                 "owned_load_peak_mw": 0.15,
                 "owned_battery_capacity_mwh": 0.32,
                 "batt_power_c_rate": 0.25,  # 4h
-                "investment_freq": 12,
             },
         },
         {
@@ -141,17 +141,16 @@ def _seed_predefined_scenarios() -> None:
                 "owned_load_peak_mw": 0.15,
                 "owned_battery_capacity_mwh": 0.64,
                 "batt_power_c_rate": 0.25,
-                "investment_freq": 12,
             },
         },
         {
             "name": "Scenario 5: DSM (Flexible Demand)",
-            "description": "Demand‑side management (DSM) with PV + battery; faster decisions.",
+            "description": "Demand‑side management (DSM): 30 % of demand can move to PV surplus, with PV + battery.",
             "details": (
-                "Purpose: emulate flexible loads (≈30% share, 3‑hour shifting window) that "
-                "align demand to PV or price signals. We approximate responsiveness by a "
-                "higher decision frequency. Expected effects: higher self‑consumption, "
-                "lower imports/exports, no annual energy change."
+                "Purpose: flexible loads (30 % of the building's demand) are pulled forward "
+                "by up to 3 hours to use PV surplus before it charges the battery or is "
+                "exported; every shifted kWh is served within the window. Expected effects: "
+                "higher self‑consumption, lower imports/exports, no change in annual demand."
             ),
             "config_overrides": {
                 "owned_solar_capacity_mw": 0.171,
@@ -162,8 +161,6 @@ def _seed_predefined_scenarios() -> None:
                 "batt_power_c_rate": 0.25,
                 "flexible_load_share": 0.30,
                 "max_shift_hours": 3.0,
-                # Use tighter investment frequency to emulate DSM reactivity
-                "investment_freq": 6,
             },
         },
     ]
@@ -176,14 +173,6 @@ def _seed_predefined_scenarios() -> None:
             rows_by_name.setdefault(existing.name, []).append(existing)
 
         from uuid import uuid4
-        # Known short descriptions from earlier seed (to be upgraded)
-        old_shorts = {
-            "Scenario 1: Baseline": "Baseline building: existing PV only, no battery; DH as-is.",
-            "Scenario 2: High PV Deployment": "Rooftop maximised per regulatory constraints (~171 kWp).",
-            "Scenario 3: High PV + Battery (4h)": "PV as Scenario 2, battery 0.32 MWh (4h autonomy), export-only-from-PV.",
-            "Scenario 4: High PV + Large Battery": "PV as Scenario 2, larger battery 0.64 MWh to enhance self-consumption.",
-            "Scenario 5: DSM (Flexible Demand)": "Demand-side management: higher decision frequency as proxy for flexibility.",
-        }
 
         for p in predefined:
             rows = rows_by_name.get(p["name"]) or []
@@ -191,17 +180,11 @@ def _seed_predefined_scenarios() -> None:
                 db.add(Scenario(id=str(uuid4()), name=p["name"], description=p["description"], details=p.get("details"), config_overrides=p["config_overrides"]))
             for row in rows:
                 updated = False
-                # Upgrade details if missing
-                if not getattr(row, 'details', None):
+                # Presets are read-only: their texts follow the code
+                if row.details != p.get("details") or row.description != p["description"]:
                     row.details = p.get("details")
+                    row.description = p["description"]
                     updated = True
-                # Upgrade description if it matches an older short string
-                try:
-                    if row.description and old_shorts.get(p["name"]) and row.description.strip() == old_shorts[p["name"]]:
-                        row.description = p["description"]
-                        updated = True
-                except Exception:
-                    pass
                 if updated:
                     db.add(row)
                 canonical_overrides = p["config_overrides"]

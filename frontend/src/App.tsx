@@ -266,18 +266,42 @@ export default function App() {
     setCopilotOpen(true);
   };
 
+  // What each page shows decides the copilot's role (see backend/assistant.py)
+  const [builderMeta, setBuilderMeta] = useState<{ isReference: boolean; selected: string | null }>({ isReference: false, selected: null });
+  const [selectedScenario, setSelectedScenario] = useState<{ id: string; name: string } | null>(null);
+  const [dataNonce, setDataNonce] = useState(0);
   const copilotContext = useMemo<CopilotContext>(() => ({
     view,
     run_id: view === 'console' ? selectedRun?.id : null,
     run_name: view === 'console' ? selectedRun?.name : null,
     simulated_time: view === 'console' && live ? (obs.timestamp ?? null) : null,
-  }), [view, selectedRun?.id, selectedRun?.name, live, obs.timestamp]);
+    scenario_id: view === 'scenarios' ? selectedScenario?.id ?? null : null,
+    scenario_name: view === 'scenarios' ? selectedScenario?.name ?? null : null,
+    design: view === 'builder' && builderConfig ? {
+      name: builderConfig.name,
+      twin_id: builderConfig.id && !String(builderConfig.id).startsWith('dt-') ? String(builderConfig.id) : null,
+      is_reference: builderMeta.isReference,
+      selected_component: builderMeta.selected,
+      components: builderConfig.components.map((c) => ({ id: c.id, type: c.type, name: c.name, params: c.params })),
+      connections: builderConfig.connections.map((c) => ({ from: c.from, to: c.to, type: c.type })),
+    } : null,
+  }), [view, selectedRun?.id, selectedRun?.name, live, obs.timestamp, selectedScenario, builderConfig, builderMeta]);
 
-  const onTwinChanged = useCallback((kind: 'run' | 'scenario') => {
-    log(kind === 'run' ? 'Copilot advanced a simulation.' : 'Copilot saved a scenario.');
+  const onTwinChanged = useCallback((kind: 'run' | 'scenario' | 'twin') => {
+    log(kind === 'run' ? 'Copilot started or advanced a simulation.' : 'Copilot saved a scenario.');
     loadRuns();
+    setDataNonce((n) => n + 1);
     if (kind === 'run') setStateNonce((n) => n + 1);
   }, [log, loadRuns]);
+
+  // A design the copilot proposed: open it on the builder canvas as a new, unsaved design
+  const applyDesign = useCallback((design: Pick<DigitalTwinConfig, 'name' | 'components' | 'connections'>) => {
+    setBuilderConfig({ id: `dt-ai-${Date.now()}`, name: design.name, components: design.components, connections: design.connections, created_at: '' });
+    setBuilderKey((k) => k + 1);
+    setBuilderMode('2d');
+    setView('builder');
+    log(`Copilot design “${design.name}” opened in Twin Builder (not saved yet).`);
+  }, [log]);
 
   // Open a saved twin (e.g. the one linked to a scenario) in the builder
   const openTwin = async (twinId: string) => {
@@ -302,12 +326,20 @@ export default function App() {
   const totalSteps = metrics.total_steps ?? 0;
   const timestep = metrics.timestep ?? 0;
   const progress = totalSteps ? Math.min(1, timestep / totalSteps) : 0;
-  const genNow = (obs.solar ?? 0) + (obs.wind ?? 0) + (obs.hydro ?? 0);
-  const netNow = genNow - (obs.load ?? 0);
+  const genNow = (obs.solar ?? 0) + (obs.wind ?? 0) + (obs.hydro ?? 0) + (obs.chp ?? 0);
+  // Grid exchange from the dispatch (battery, DSM, export limit), + = export
+  const netNow = obs.grid_import != null || obs.grid_export != null
+    ? (obs.grid_export ?? 0) - (obs.grid_import ?? 0)
+    : genNow - (obs.load ?? 0);
   const controlsDisabled = !live || done || stepping || playing;
   const twinLive = useMemo(
-    () => (live && state ? { timestamp: obs.timestamp, solarMw: obs.solar, windMw: obs.wind, hydroMw: obs.hydro, loadMw: obs.load } : null),
-    [live, state, obs.timestamp, obs.solar, obs.wind, obs.hydro, obs.load],
+    () => (live && state ? {
+      timestamp: obs.timestamp, solarMw: obs.solar, windMw: obs.wind, hydroMw: obs.hydro, loadMw: obs.load,
+      chpMw: obs.chp, heatPumpMw: obs.heat_pump, gridImportMw: obs.grid_import, gridExportMw: obs.grid_export,
+      batteryChargeMw: obs.battery_charge, batteryDischargeMw: obs.battery_discharge, curtailedMw: obs.curtailed,
+    } : null),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [live, state],
   );
 
   return (
@@ -430,9 +462,9 @@ export default function App() {
                 </section>
 
                 <section className="kpis">
-                  <Kpi label="Generation now" value={live ? formatPower(genNow) : '—'} color="var(--c-gen)" hint="solar + wind on site" />
-                  <Kpi label="Load now" value={live ? formatPower(obs.load) : '—'} color="var(--c-load)" hint="district consumption" />
-                  <Kpi label={netNow >= 0 ? 'Exporting' : 'Importing'} value={live ? formatPower(Math.abs(netNow)) : '—'} color={netNow >= 0 ? 'var(--c-export)' : 'var(--c-grid)'} hint={netNow >= 0 ? 'surplus sold to the grid' : 'shortfall bought from the grid'} />
+                  <Kpi label="Generation now" value={live ? formatPower(genNow) : '—'} color="var(--c-gen)" hint={obs.chp ? 'solar + wind + CHP on site' : 'solar + wind on site'} />
+                  <Kpi label="Load now" value={live ? formatPower(obs.load) : '—'} color="var(--c-load)" hint={obs.heat_pump ? 'incl. heat pumps and EV charging' : 'district consumption'} />
+                  <Kpi label={netNow >= 0 ? 'Exporting' : 'Importing'} value={live ? formatPower(Math.abs(netNow)) : '—'} color={netNow >= 0 ? 'var(--c-export)' : 'var(--c-grid)'} hint={netNow >= 0 ? 'after battery and export limit' : 'after battery and flexible demand'} />
                   <Kpi label="Spot price" value={live && obs.price != null ? `${obs.price.toFixed(0)} DKK/MWh` : '—'} color="var(--c-price)" hint="electricity market price" />
                   <Kpi
                     label="PED ratio (so far)"
@@ -524,7 +556,7 @@ export default function App() {
 
       {view === 'scenarios' && (
         <main className="page">
-          <ScenarioList apiBase={apiBase} onRun={openRun} onOpenTwin={openTwin} />
+          <ScenarioList apiBase={apiBase} onRun={openRun} onOpenTwin={openTwin} refreshKey={dataNonce} onSelectScenario={setSelectedScenario} />
         </main>
       )}
 
@@ -545,6 +577,7 @@ export default function App() {
               <DigitalTwinBuilder
                 key={builderKey}
                 onConfigChange={setBuilderConfig}
+                onCopilotState={setBuilderMeta}
                 initialConfig={builderConfig}
                 apiBase={apiBase}
                 onRunSimulation={openRun}
@@ -569,6 +602,7 @@ export default function App() {
         context={copilotContext}
         request={copilotRequest}
         onTwinChanged={onTwinChanged}
+        onApplyDesign={applyDesign}
       />
     </div>
   );

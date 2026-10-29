@@ -1,9 +1,11 @@
 """AI copilot for the digital twin: a Claude agent that reasons over twin data.
 
 The agent loop runs server-side. Claude calls the tools in
-``assistant_tools`` (live run KPIs, energy profiles, fast design what-ifs and
-sweeps, simulation stepping, saving scenarios); every text delta, tool call
-and tool result is streamed to the browser as server-sent events.
+``assistant_tools`` (run KPIs and profiles, scenario comparisons, design
+what-ifs, generating twin designs, creating and running scenarios); every
+text delta, tool call and tool result is streamed to the browser as
+server-sent events. The page the user is on (Console, Scenarios, Twin
+Builder) is sent as context and decides the copilot's role.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 
-from .assistant_tools import TOOLS, TOOLS_BY_NAME
+from .assistant_tools import TOOLS, TOOLS_BY_NAME, UI_CONTEXT
 
 log = logging.getLogger(__name__)
 
@@ -66,7 +68,15 @@ SYSTEM_PROMPT = """You are the copilot of the OptiX digital twin, a simulator fo
 
 The twin models a Danish building (district) with on-site renewables, a battery, optional demand-side management (DSM) and a grid connection. Time series are real Energinet data for price area DK2 (eastern Denmark), 2015-2024, hourly values held over 10-minute steps, timestamps in Danish standard time (CET, no daylight saving): solar and onshore-wind output per installed MW (capacity factors from the DK2 capacity register), DK2 gross electricity demand and DK2 day-ahead spot prices in DKK/MWh. A design multiplies the capacity factors by its PV kWp and wind kW (decade averages: about 1,020 kWh per kWp and 2,235 kWh per kW of wind per year; 2015 solar is low at about 720 because Energinet's 2015 solar figures are estimates) and scales the regional demand curve to its peak demand (mean/peak 0.60, flatter than a single building). DK2 has no hydro. Battery in kWh. Dispatch is PV-first merit order: on-site generation serves load, then pulls flexible demand forward (DSM, released within the shift window, default 3 h), then charges the battery, then is exported; DSM and the battery then serve load and the grid covers the rest. As in the paper, the battery uses a 15-85 % state-of-charge window of its nominal capacity with 90 % round-trip efficiency, imports pass a 0.94-efficient transformer and exports a 0.95-efficient link; costs use spot prices only (no tariffs or taxes). A PED produces at least as much renewable energy on site as it consumes over a year (PED ratio = generation / demand >= 1).
 
-Five reference scenarios from the project paper exist (baseline 30 kWp; high PV 171 kWp; + 320 kWh battery; + 640 kWh battery; + 30% DSM), all with a 150 kW peak load. Users also create their own scenarios and digital twins, and step simulation runs forward in time.
+Runs of digital twins (and scenarios linked to one) simulate every component of the design. Each input series comes from data the user uploaded for that component in Twin Builder (meter, inverter or price data) or, without an upload, from a synthetic profile. Building electricity uses a selectable shape (DK2 regional, office, residential, commercial, industrial) scaled to the peak load. Building heat demand is area x specific heat demand (default 70 kWh/m2 per year), spread by outdoor temperature (Copenhagen ERA5, base 17 C) plus 15 % hot water. Load centres run between base and peak load. EV charging follows typical arrival times x energy per port; with smart charging it is shiftable like DSM. The grid price is DK2 spot shaped by the tariff. Heat is served in the order thermal storage, heat pumps (COP from the rated value, varying with outdoor temperature for air-source units), heat-led CHP (its electricity serves the site's load or is exported, but it is not renewable generation, so it is left out of the electricity PED ratio; its fuel counts as imported energy in the all-energy ratio), district heating, then "not covered on site". Thermal storage is filled only by heat pumps using on-site electricity surplus (after the battery); without a heat pump it stays empty, and CHP never charges it. Grid export above the connection limit is curtailed; imports above it are reported. The "PED ratio, all energy" counts imports of electricity, district heat, CHP fuel and uncovered heat against exports. Vehicle-to-grid, PV tilt/azimuth, wind hub height and heat supply temperatures are not modelled. evaluate_design and sweep_designs cover electricity only (PV, wind, battery, building load, DSM).
+
+Five reference scenarios from the project paper exist (baseline 30 kWp; high PV 171 kWp; + 320 kWh battery; + 640 kWh battery; + 30% DSM), all with a 150 kW peak load. Each is linked to a read-only reference twin ("S1 · Paper reference ...") that also holds the 2,000 m2 building's heat demand, supplied by district heating; their electricity results equal the paper set-up. Scenarios without a linked twin are electricity only. Users also create their own scenarios and digital twins, and step simulation runs forward in time.
+
+The copilot opens on three pages; the [UI context] line says which one. Act as the assistant for that page:
+- Console (view=console): explain the selected run's results and what drives them (get_run_details, get_energy_profile), step it forward when asked, compare runs.
+- Scenarios (view=scenarios): help set up studies. Compare scenarios over the whole period with compare_scenarios (no runs needed), create scenarios with create_scenario (linked to an existing twin or to a new design - never electricity-only), and start runs with run_scenario when asked.
+- Twin Builder (view=builder): help design the twin on the canvas. Read it with get_current_design, explain components and their data (each component's Data panel accepts measured CSV data or shows the synthetic profile), and generate or improve designs with propose_twin_design - the user applies a proposal to the canvas with one click. When asked to change the current design, propose the complete modified design. Paper reference designs are read-only; applying a proposal makes an unsaved new design.
+Tools from other pages remain available when the user asks for them.
 
 How to help:
 - Ground every number in tool results; never invent figures. Say which period a number covers - a run simulated for two winter weeks says little about a year.
@@ -241,6 +251,8 @@ async def _agent_turn(conv: Conversation, user_text: str) -> AsyncIterator[dict]
             tool = TOOLS_BY_NAME.get(block.name)
             if tool and tool.mutates and not is_error:
                 yield {"type": "twin_changed", "kind": tool.mutates, "result": result}
+            if tool and tool.client_event and not is_error:
+                yield {"type": tool.client_event, "id": block.id, "result": result}
         conv.messages.append({"role": "user", "content": results})
 
     yield {"type": "error", "message": "Stopped after too many tool calls. Try a more specific question."}
@@ -258,6 +270,10 @@ class ChatContext(BaseModel):
     run_id: Optional[str] = Field(None, max_length=64)
     run_name: Optional[str] = Field(None, max_length=200)
     simulated_time: Optional[str] = Field(None, max_length=40)
+    scenario_id: Optional[str] = Field(None, max_length=64)
+    scenario_name: Optional[str] = Field(None, max_length=200)
+    # Twin Builder canvas: {name, twin_id, is_reference, selected_component, components, connections}
+    design: Optional[dict] = None
 
 
 class ChatRequest(BaseModel):
@@ -281,6 +297,15 @@ def _context_line(ctx: Optional[ChatContext]) -> str:
         parts.append(f"selected run '{ctx.run_name or ''}' (run_id={ctx.run_id})")
     if ctx.simulated_time:
         parts.append(f"simulated time {ctx.simulated_time}")
+    if ctx.scenario_id:
+        parts.append(f"selected scenario '{ctx.scenario_name or ''}' (scenario_id={ctx.scenario_id})")
+    if ctx.design is not None:
+        d = ctx.design
+        n = len(d.get("components") or [])
+        state = "read-only paper reference" if d.get("is_reference") else ("saved twin" if d.get("twin_id") else "unsaved")
+        parts.append(f"canvas design '{d.get('name') or ''}' with {n} components ({state}; read it with get_current_design)")
+        if d.get("selected_component"):
+            parts.append(f"selected component '{d['selected_component']}'")
     return f"[UI context: {'; '.join(parts)}]\n\n" if parts else ""
 
 
@@ -302,8 +327,13 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
     if conv.lock.locked():
         raise HTTPException(status_code=409, detail="The copilot is still answering the previous message.")
 
+    if payload.context and payload.context.design is not None and len(json.dumps(payload.context.design, default=str)) > 200_000:
+        raise HTTPException(status_code=413, detail="The design on the canvas is too large to send to the copilot.")
+
     async def events() -> AsyncIterator[str]:
         async with conv.lock:
+            # Tools of this turn see what the user's page shows (e.g. the canvas)
+            UI_CONTEXT.set(payload.context.model_dump() if payload.context else {})
             yield _sse({"type": "start", "conversation_id": conv.id})
             history_len = len(conv.messages)
             try:

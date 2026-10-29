@@ -8,6 +8,7 @@ sees exactly the numbers the UI shows.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Literal, Optional
 
@@ -17,15 +18,69 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import routes
 from .db import session_scope
-from .models import Scenario, SimulationRun
+from .models import DigitalTwin, Scenario, SimulationRun
+from .design_catalog import DesignError, build_design, catalog_text
 from .optimizer import MeritOrderConfig, MeritOrderOptimizer, build_config_from_overrides
 from .profiles import scale_profiles
-from .schemas import RunCompareRequest, ScenarioCreate, SimulationStepRequest
+from .schemas import DigitalTwinCreate, RunCompareRequest, ScenarioCreate, SimulationStepRequest
 from .simulation_manager import SimulationManager
 
 
 class _Input(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+# What the user's page shows, set by the agent loop for the current turn
+# (e.g. the design on the Twin Builder canvas)
+UI_CONTEXT: contextvars.ContextVar[dict] = contextvars.ContextVar("copilot_ui_context", default={})
+
+
+def _annual(site, years: float) -> dict:
+    """Yearly averages of a whole-period simulation (all components)."""
+    k = site.kpis
+    per_year = lambda key: _r((k.get(key) or 0.0) / years * 1000, 0)  # noqa: E731  MWh -> kWh/year
+    out = {
+        "generation_kwh_per_year": per_year("total_gen_mwh"),
+        "electricity_demand_kwh_per_year": per_year("total_demand_mwh"),
+        "grid_import_kwh_per_year": per_year("grid_purchase_mwh"),
+        "export_kwh_per_year": per_year("export_delivered_mwh"),
+        "curtailed_kwh_per_year": per_year("curtailed_mwh"),
+        "ped_ratio_electricity": _r(k.get("ped_ratio"), 3),
+        "ped_ratio_all_energy": _r(k.get("total_energy_ped_ratio"), 3),
+        "self_sufficiency": _r(k.get("self_sufficiency_ratio"), 3),
+        "self_consumption": _r(k.get("self_consumption_ratio"), 3),
+        "peak_grid_import_kw": _r(k.get("peak_grid_purchase_kw"), 1),
+        "hours_above_import_limit_per_year": _r((k.get("import_over_limit_hours") or 0) / years, 1),
+    }
+    if site.has_heat:
+        out.update({
+            "heat_demand_kwh_per_year": per_year("heat_demand_mwh"),
+            "heat_pump_heat_kwh_per_year": per_year("hp_heat_mwh"),
+            "heat_pump_electricity_kwh_per_year": per_year("hp_el_mwh"),
+            "heat_pump_spf": _r(k.get("hp_spf"), 2),
+            "chp_heat_kwh_per_year": per_year("chp_heat_mwh"),
+            "chp_electricity_kwh_per_year": per_year("chp_el_mwh"),
+            "chp_fuel_kwh_per_year": per_year("chp_fuel_mwh"),
+            "district_heat_kwh_per_year": per_year("dh_heat_mwh"),
+            "heat_not_covered_kwh_per_year": per_year("external_heat_mwh"),
+        })
+    return out
+
+
+def _simulate_components(components: list, twin_id: Optional[str] = None) -> dict:
+    """Simulate a component design over the whole dataset; yearly averages."""
+    from .site_sim import simulate
+
+    overrides = routes._dt_to_config_overrides(components, [])
+    for key in ("owned_solar_capacity_mw", "owned_wind_capacity_mw", "owned_hydro_capacity_mw", "owned_load_peak_mw"):
+        overrides.setdefault(key, 0.0)
+    if twin_id:
+        overrides["twin_id"] = twin_id
+    df = _dataset()
+    site = simulate(df, overrides)
+    years = max(1e-9, len(df) * site.dt_hours / 8760)
+    uploaded = sorted(k for k, v in site.sources.items() if v == "uploaded")
+    return {"period": "2015-2024, yearly averages", "results": _annual(site, years), "measured_data_series": uploaded}
 
 
 @dataclass
@@ -35,7 +90,9 @@ class Tool:
     input_model: type[_Input]
     handler: Callable[[Any], Awaitable[dict]]
     # Tools that change persisted twin state; the UI refreshes after these
-    mutates: Optional[Literal["run", "scenario"]] = None
+    mutates: Optional[Literal["run", "scenario", "twin"]] = None
+    # Event sent to the browser with the tool result (e.g. a design to apply)
+    client_event: Optional[str] = None
 
     def definition(self) -> dict:
         schema = _inline_refs(self.input_model.model_json_schema())
@@ -273,11 +330,26 @@ async def get_twin_overview(_: NoInput) -> dict:
                 if ts is not None and t < len(ts):
                     entry["simulated_time"] = str(ts.iloc[t])
             runs_out.append(entry)
+        twins = db.query(DigitalTwin).order_by(DigitalTwin.created_at.asc()).all()
+        twin_names = {t.id: t.name for t in twins}
         scenarios_out = [
-            {"scenario_id": s.id, "name": s.name, "description": s.description, "assets": _overrides_in_kw(s.config_overrides)}
+            {
+                "scenario_id": s.id, "name": s.name, "description": s.description,
+                "linked_twin": twin_names.get(s.digital_twin_id) if s.digital_twin_id else None,
+                "model": "full design" if s.digital_twin_id else "electricity only",
+                "assets": _overrides_in_kw(s.config_overrides),
+            }
             for s in scenarios
         ]
-    return {"dataset": _dataset_info(df), "runs": runs_out, "scenarios": scenarios_out}
+        twins_out = [
+            {
+                "twin_id": t.id, "name": t.name,
+                "read_only_paper_reference": t.description == routes.REFERENCE_MARKER,
+                "components": [f"{c.get('type')}: {c.get('name')}" for c in (t.components or [])],
+            }
+            for t in twins
+        ]
+    return {"dataset": _dataset_info(df), "runs": runs_out, "scenarios": scenarios_out, "digital_twins": twins_out}
 
 
 class RunInput(_Input):
@@ -304,15 +376,15 @@ async def get_run_details(inp: RunInput) -> dict:
 
     def compute() -> dict:
         ped = routes._compute_ped_metrics(env, overrides=overrides)
-        series = routes._extract_metric_series(env, overrides=overrides)
-        gen = np.asarray(series["solar_mw"]) + np.asarray(series["wind_mw"]) + np.asarray(series["hydro_mw"])
-        cfg = build_config_from_overrides(overrides, float(series["dt_hours"]))
-        k = MeritOrderOptimizer(cfg).run(pv_mw=gen, load_mw=np.asarray(series["load_mw"], dtype=float))["kpis"]
+        site = routes._site_of(env, overrides)
+        # Dispatch of every component over the steps simulated so far
+        k = site.kpis_upto(max(1, int(getattr(env, "t", 0) or 0)))
         t = int(getattr(env, "t", 0))
         ts = getattr(env, "_timestamps", None)
         return {
             "name": name,
             "assets": _overrides_in_kw(overrides),
+            "components": [f"{c.get('type')}: {c.get('name') or c.get('id')}" for c in overrides.get("twin_components") or []],
             "simulated_steps": t,
             "simulated_until": str(ts.iloc[min(t, len(ts) - 1)]) if ts is not None and len(ts) else None,
             "simulated_hours": _r(ped["period_hours"], 1),
@@ -326,8 +398,14 @@ async def get_run_details(inp: RunInput) -> dict:
             "battery_losses": _r(k["battery_losses_mwh"]),
             },
             "ped_ratio": _r(ped["ped_ratio"], 3),
+            "ped_ratio_all_energy": _r(k.get("total_energy_ped_ratio"), 3),
             "self_sufficiency": _r(k.get("self_sufficiency_ratio"), 3),
             "self_consumption": _r(k.get("self_consumption_ratio"), 3),
+            "curtailed_mwh": _r(k.get("curtailed_mwh")),
+            "hours_above_import_limit": _r(k.get("import_over_limit_hours"), 1),
+            "heat_mwh": {key: _r(k.get(f"{key}_mwh")) for key in ("heat_demand", "hp_heat", "hp_el", "chp_heat", "chp_el", "chp_fuel", "dh_heat", "external_heat")} if site.has_heat else None,
+            "model": "full design" if site.sources else "electricity only",
+            "input_data": routes._data_source_details(site.sources, overrides),
             "net_grid_value_dkk": _r(getattr(env, "cumulative_revenue", None), 0),
         }
 
@@ -415,47 +493,178 @@ async def step_simulation(inp: StepInput) -> dict:
     }
 
 
-class SaveScenarioInput(_Input):
+class DesignComponent(_Input):
+    type: Literal["smart_building", "solar_pv", "battery_storage", "wind_turbine", "district_heating", "smart_grid",
+                  "ev_charger", "heat_pump", "chp_unit", "thermal_storage", "load_center"]
+    name: str = Field("", max_length=80, description="Short display name, unique within the design")
+    params: dict[str, Any] = Field(default_factory=dict, description="Parameters to set; unset ones take the defaults")
+
+
+class DesignLink(_Input):
+    from_: str = Field(alias="from", description="Component name")
+    to: str = Field(description="Component name")
+    carrier: Literal["electricity", "heat", "both"] = "electricity"
+
+
+class ProposeDesignInput(_Input):
+    name: str = Field(min_length=1, max_length=120, description="Design name, e.g. 'Campus · 600 kWp PV + heat pumps'")
+    summary: str = Field("", max_length=600, description="One or two sentences: what the design is and why")
+    components: list[DesignComponent] = Field(min_length=1, max_length=40)
+    links: list[DesignLink] = Field(default_factory=list, description="Optional; omitted links are drawn automatically")
+
+
+async def propose_twin_design(inp: ProposeDesignInput) -> dict:
+    try:
+        components, links = build_design(
+            [c.model_dump() for c in inp.components],
+            [{"from": l.from_, "to": l.to, "carrier": l.carrier} for l in inp.links] or None,
+        )
+    except DesignError as exc:
+        raise ValueError(str(exc))
+    sim = await asyncio.to_thread(_simulate_components, components)
+    return {
+        "design": {"name": inp.name, "summary": inp.summary, "components": components, "connections": links},
+        **sim,
+        "note": "Shown to the user as a proposal card with 'Apply to canvas'. Nothing is saved until the user applies and saves it.",
+    }
+
+
+async def get_current_design(_: "NoInput") -> dict:
+    ui = UI_CONTEXT.get()
+    design = ui.get("design") or {}
+    components = design.get("components") or []
+    if ui.get("view") != "builder":
+        raise ValueError("The user is not in Twin Builder; ask them to open it, or use get_twin_overview for saved twins.")
+    if not components:
+        return {"design": {"name": design.get("name"), "components": []}, "note": "The canvas is empty."}
+    sim = await asyncio.to_thread(_simulate_components, components, design.get("twin_id"))
+    return {
+        "design": {
+            "name": design.get("name"),
+            "saved_twin_id": design.get("twin_id"),
+            "read_only_paper_reference": bool(design.get("is_reference")),
+            "selected_component": design.get("selected_component"),
+            "components": [{"name": c.get("name"), "type": c.get("type"), "params": c.get("params")} for c in components],
+            "links": len(design.get("connections") or []),
+        },
+        **sim,
+    }
+
+
+class CreateScenarioInput(_Input):
     name: str = Field(min_length=1, max_length=120)
     description: str = Field("", max_length=300, description="One-line summary")
     details: str = Field("", max_length=4000, description="Rationale, assumptions and expected effects")
-    pv_kwp: float = Field(ge=0, le=100000)
-    wind_kw: float = Field(0.0, ge=0, le=100000)
-    battery_kwh: float = Field(0.0, ge=0, le=500000)
-    battery_c_rate: float = Field(0.25, gt=0, le=4)
-    load_peak_kw: float = Field(150.0, gt=0, le=100000)
-    flexible_load_share: float = Field(0.0, ge=0, le=1)
-    max_shift_hours: float = Field(3.0, ge=0, le=24)
+    twin_id: Optional[str] = Field(None, description="Existing digital twin to link (from get_twin_overview)")
+    design: Optional[ProposeDesignInput] = Field(None, description="Or a new design: it is saved as a twin and linked")
+    component_changes: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        description="With twin_id: this scenario's own parameter values, {component name or id: {param: value}}, "
+                    "e.g. {'Rooftop PV (171 kWp)': {'capacity_kwp': 300}}. The twin itself is not changed - use this for what-if variants of one twin.",
+    )
 
 
-async def save_scenario(inp: SaveScenarioInput) -> dict:
-    overrides = {
-        "owned_solar_capacity_mw": inp.pv_kwp / 1000,
-        "owned_wind_capacity_mw": inp.wind_kw / 1000,
-        "owned_hydro_capacity_mw": 0.0,
-        "owned_load_peak_mw": inp.load_peak_kw / 1000,
-        "owned_battery_capacity_mwh": inp.battery_kwh / 1000,
-        "batt_power_c_rate": inp.battery_c_rate,
-        "investment_freq": 12,
-    }
-    if inp.flexible_load_share > 0:
-        overrides["flexible_load_share"] = inp.flexible_load_share
-        overrides["max_shift_hours"] = inp.max_shift_hours
-    created = await routes.create_scenario(ScenarioCreate(
-        name=inp.name, description=inp.description or None, details=inp.details or None, config_overrides=overrides,
-    ))
-    return {"scenario_id": created.id, "name": created.name, "note": "Saved. The user can run it from the Scenarios page."}
+async def create_scenario(inp: CreateScenarioInput) -> dict:
+    if bool(inp.twin_id) == bool(inp.design):
+        raise ValueError("Give either twin_id or design")
+    twin_id = inp.twin_id
+    twin_name = None
+    if inp.design:
+        try:
+            components, links = build_design(
+                [c.model_dump() for c in inp.design.components],
+                [{"from": l.from_, "to": l.to, "carrier": l.carrier} for l in inp.design.links] or None,
+            )
+        except DesignError as exc:
+            raise ValueError(str(exc))
+        created = await routes.create_digital_twin(DigitalTwinCreate(
+            name=inp.design.name, description=f"Digital twin with {len(components)} components",
+            components=components, connections=links,
+        ))
+        twin_id, twin_name = created.id, created.name
+    changes: dict = {}
+    if inp.design is None:
+        with session_scope() as db:
+            twin = db.get(DigitalTwin, twin_id)
+            if twin is None:
+                raise ValueError(f"Twin {twin_id} not found")
+            twin_name = twin.name
+            comps = list(twin.components or [])
+        for key, values in inp.component_changes.items():
+            comp = next((c for c in comps if c.get("id") == key or c.get("name") == key), None)
+            if comp is None:
+                raise ValueError(f"No component {key!r} in twin '{twin_name}'; components: {[c.get('name') for c in comps]}")
+            changes[str(comp["id"])] = values
+    elif inp.component_changes:
+        raise ValueError("component_changes only applies with twin_id; put the values into the design instead")
+    try:
+        sc = await routes.create_scenario(ScenarioCreate(
+            name=inp.name, description=inp.description or None, details=inp.details or None,
+            config_overrides={"component_overrides": changes} if changes else {}, digital_twin_id=twin_id,
+        ))
+    except routes.HTTPException as exc:
+        raise ValueError(exc.detail)
+    return {"scenario_id": sc.id, "name": sc.name, "linked_twin": twin_name, "twin_id": twin_id,
+            "parameter_changes_vs_twin": changes or None,
+            "note": "Saved as a full-design scenario; it appears on the Scenarios page."}
+
+
+class CompareScenariosInput(_Input):
+    scenario_ids: list[str] = Field(default_factory=list, max_length=10, description="Scenario ids; empty = all scenarios")
+
+
+async def compare_scenarios(inp: CompareScenariosInput) -> dict:
+    """Whole-period results of each scenario's design, without creating runs."""
+    from .site_sim import simulate
+
+    with session_scope() as db:
+        q = db.query(Scenario).order_by(Scenario.created_at.asc())
+        rows = [s for s in q.all() if not inp.scenario_ids or s.id in inp.scenario_ids]
+        items = [(s.id, s.name, "full design" if s.digital_twin_id else "electricity only", dict(s.config_overrides or {})) for s in rows]
+    if not items:
+        raise ValueError("No matching scenarios")
+
+    def work() -> list:
+        df = _dataset()
+        out = []
+        for sid, name, model, overrides in items:
+            site = simulate(df, overrides)
+            years = max(1e-9, len(df) * site.dt_hours / 8760)
+            out.append({"scenario_id": sid, "name": name, "model": model, "results": _annual(site, years)})
+        return out
+
+    return {"period": "2015-2024, yearly averages", "scenarios": await asyncio.to_thread(work)}
+
+
+class RunScenarioInput(_Input):
+    scenario_id: str
+
+
+async def run_scenario(inp: RunScenarioInput) -> dict:
+    run = await routes.run_scenario(inp.scenario_id)
+    return {"run_id": run.id, "name": run.name, "note": "Started at 2015-01-01; it appears in the Console run list."}
 
 
 TOOLS: list[Tool] = [
-    Tool("get_twin_overview", "List the dataset coverage, all simulation runs (live or not, how far simulated) and all saved scenarios with their assets in kW/kWh. Call this first when you need ids or an overview.", NoInput, get_twin_overview),
-    Tool("get_run_details", "Current KPIs of a live run over what has been simulated so far: generation, demand, PED ratio, self-sufficiency, grid import/export, net grid value.", RunInput, get_run_details),
+    Tool("get_twin_overview", "List the dataset coverage, all simulation runs (live or not, how far simulated), all scenarios (with their linked twin and whether they are full designs or electricity only) and all saved digital twins. Call this first when you need ids or an overview.", NoInput, get_twin_overview),
+    Tool("get_run_details", "Current KPIs of a live run over what has been simulated so far, from the full component dispatch: generation, demand, PED ratios, self-sufficiency, grid import/export, curtailment, heat supply and which inputs are measured or synthetic.", RunInput, get_run_details),
     Tool("get_energy_profile", "Aggregated generation/demand/peaks/prices of a live run by hour, day, week or month over the most recent simulated days. Use to explain patterns (e.g. winter deficit, midday surplus).", ProfileInput, get_energy_profile),
-    Tool("compare_runs", "Compare PED metrics of several runs on a common horizon.", CompareInput, compare_runs),
-    Tool("evaluate_design", "Fast what-if: simulate a building design (PV, wind, battery, load, DSM) over any period of the dataset with the PV-first merit-order dispatch, without creating a run. Returns energy, PED ratio, self-sufficiency, peak import, DKK costs and a monthly breakdown. Takes well under a second for a year.", DesignInput, evaluate_design),
-    Tool("sweep_designs", "Evaluate a grid of PV and/or battery sizes (up to 60 combinations) for sizing questions, e.g. the smallest PV that reaches PED or the battery size where extra storage stops paying off.", SweepInput, sweep_designs),
+    Tool("compare_runs", "Compare PED metrics of several runs on a common simulated horizon.", CompareInput, compare_runs),
+    Tool("compare_scenarios", "Simulate scenarios' designs over the whole dataset (2015-2024) without creating runs and return yearly averages: energy, PED ratios, self-sufficiency, grid exchange, heat. Best for comparing or ranking scenarios.", CompareScenariosInput, compare_scenarios),
+    Tool("evaluate_design", "Fast electricity-only what-if (PV, wind, battery, building load, DSM) over any period of the dataset, without creating a run. Returns energy, PED ratio, self-sufficiency, peak import, DKK costs and a monthly breakdown. For designs with heat pumps, EV, CHP or heat use propose_twin_design instead.", DesignInput, evaluate_design),
+    Tool("sweep_designs", "Electricity-only grid of PV and/or battery sizes (up to 60 combinations) for sizing questions, e.g. the smallest PV that reaches PED or the battery size where extra storage stops paying off.", SweepInput, sweep_designs),
+    Tool("get_current_design", "Read the design on the user's Twin Builder canvas (components and parameters, incl. unsaved edits) and simulate it over 2015-2024 (yearly averages, every component). Only works while the user is in Twin Builder.", NoInput, get_current_design),
+    Tool("propose_twin_design",
+         "Build a complete digital twin design from components and simulate it over 2015-2024 (yearly averages). "
+         "The user sees it as a card with an 'Apply to canvas' button - nothing is saved. Use it to generate a twin from a description "
+         "or to propose a modified version of the current design (then include all components, changed and unchanged). "
+         "Sizes are in kW / kWp / kWh / m2. Parameters per type (defaults shown):\n" + catalog_text() +
+         "\nNotes: smart_building load_kw is the peak electricity demand excluding heating; heat demand = area_m2 x heat_demand_kwh_m2. "
+         "heat_pump capacity_kw is heat output. Grid limits 0 = no limit. A building needs a heat source (heat_pump, district_heating or chp_unit) or its heat is reported as not covered. thermal_storage is charged only by heat pumps from on-site surplus electricity (useless without a heat pump). CHP electricity is not counted as renewable generation in the electricity PED ratio.",
+         ProposeDesignInput, propose_twin_design, client_event="design_proposal"),
+    Tool("create_scenario", "Save a scenario linked to an existing twin (twin_id, optionally with its own parameter values in component_changes - the twin stays unchanged) or to a new design (saved as a twin first). Every scenario created this way simulates all components. Only when the user asks to save or create a scenario.", CreateScenarioInput, create_scenario, mutates="scenario"),
+    Tool("run_scenario", "Start a new simulation run of a scenario. Only when the user asks to run it.", RunScenarioInput, run_scenario, mutates="run"),
     Tool("step_simulation", "Advance a live run by a number of simulated hours. Changes the run the user is looking at - only do this when the user asks to simulate further.", StepInput, step_simulation, mutates="run"),
-    Tool("save_scenario", "Save a design as a new user scenario so it can be run from the Scenarios page. Only when the user asks to save or create a scenario.", SaveScenarioInput, save_scenario, mutates="scenario"),
 ]
 
 TOOLS_BY_NAME = {t.name: t for t in TOOLS}

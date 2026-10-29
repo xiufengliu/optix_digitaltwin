@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import List
 from uuid import uuid4
@@ -25,6 +26,10 @@ from .schemas import (
     DigitalTwinCreate,
     DigitalTwinRead,
     DigitalTwinUpdate,
+    ProfileSettings,
+    ProfileUpload,
+    SyntheticPreviewRequest,
+    TwinEvaluateRequest,
 )
 from .simulation_manager import SimulationManager
 
@@ -440,6 +445,9 @@ async def compare_runs(payload: RunCompareRequest) -> RunCompareResponse:
             runs.append(run)
             overrides_by_run_id[run.id] = _resolve_run_overrides(db, run)
 
+    if payload.full_period:
+        return await _compare_full_period(runs, overrides_by_run_id)
+
     session_envs: dict[str, tuple[object, int, dict]] = {}
     common_steps: int | None = None
 
@@ -502,6 +510,87 @@ async def compare_runs(payload: RunCompareRequest) -> RunCompareResponse:
     )
 
 
+async def _compare_full_period(runs: list, overrides_by_run_id: dict) -> RunCompareResponse:
+    """Whole-period KPIs of each run's design; the dispatch is deterministic, so
+    no live session is needed (inactive runs compare too)."""
+    import asyncio
+
+    from .site_sim import simulate
+
+    def work():
+        df = _dataset_frame()
+        rows: list[RunCompareRow] = []
+        hours = None
+        for run in runs:
+            overrides = overrides_by_run_id.get(run.id) or {}
+            site = simulate(df, overrides)
+            k = site.kpis
+            n = len(site.soc_mwh)
+            hours = n * site.dt_hours
+            rows.append(RunCompareRow(
+                run_id=run.id,
+                name=run.name,
+                status=getattr(getattr(run, "status", None), "value", None) or str(getattr(run, "status", None) or ""),
+                comparable=True,
+                available_steps=n,
+                compared_steps=n,
+                period_hours=hours,
+                total_gen_mwh=k["total_gen_mwh"],
+                total_demand_mwh=k["total_demand_mwh"],
+                ped_absolute_mwh=k["ped_absolute_mwh"],
+                ped_ratio=k["ped_ratio"],
+                total_energy_ped_ratio=k.get("total_energy_ped_ratio"),
+                self_sufficiency_ratio=k.get("self_sufficiency_ratio"),
+                grid_purchase_mwh=k.get("grid_purchase_mwh"),
+                export_delivered_mwh=k.get("export_delivered_mwh"),
+                heat_demand_mwh=k.get("heat_demand_mwh"),
+            ))
+        return RunCompareResponse(common_steps=None, common_period_hours=hours, rows=rows)
+
+    return await asyncio.to_thread(work)
+
+
+def _site_of(env, overrides: dict | None):
+    """Simulation result of a session (computed once per design, see backend.site_sim)."""
+    site = getattr(env, "site", None)
+    if site is None:
+        from .site_sim import simulate
+
+        site = simulate(env.data, overrides)
+    return site
+
+
+def _data_source_details(sources: dict, overrides: dict | None) -> list[dict]:
+    """``[{component, type, channel, label, source}]`` for the run's input series."""
+    from .components import CHANNELS
+
+    comps = {c.get('id'): c for c in (overrides or {}).get('twin_components') or []}
+    out = []
+    for key, source in sources.items():
+        cid, _, channel = key.rpartition('/')
+        comp = comps.get(cid) or {}
+        ctype = comp.get('type', '')
+        label = next((ch.label for ch in CHANNELS.get(ctype, []) if ch.key == channel), channel)
+        out.append({'component': comp.get('name') or cid, 'type': ctype, 'channel': channel, 'label': label, 'source': source})
+    return out
+
+
+def _session_env_or_error(run_id: str):
+    manager = SimulationManager.get_global()
+    with session_scope() as db:
+        run = _get_run_or_404(db, run_id)
+        run = _refresh_run_status_if_needed(db, run)
+        session_id = run.session_id
+        overrides = _resolve_run_overrides(db, run)
+    if not session_id:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run has no active session")
+    try:
+        session = manager.get_session(session_id)
+    except KeyError:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail="Simulation session expired")
+    return session.wrapper or session.env, overrides
+
+
 @router.get("/runs/{run_id}/energy_series", tags=["runs"])
 async def get_energy_series(run_id: str, limit: int = 2000, max_points: int = 0) -> dict:
     """Return generation and load series for the last ``limit`` steps.
@@ -509,25 +598,14 @@ async def get_energy_series(run_id: str, limit: int = 2000, max_points: int = 0)
     Values are in MW per step; include optional timestamps if present in env.data.
     With ``max_points`` > 0 the window is bucket-averaged to at most that many
     points (``/optimize`` accepts the same parameters and stays aligned).
+    ``load_mw`` is all electricity demand including heat pumps and EV charging.
     """
-    manager = SimulationManager.get_global()
-    with session_scope() as db:
-        run = _get_run_or_404(db, run_id)
-        if not run.session_id:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run has no active session")
-        session_id = run.session_id
-        scenario_overrides = _resolve_run_overrides(db, run)
-
-    try:
-        session = manager.get_session(session_id)
-    except KeyError:
-        raise HTTPException(status_code=status.HTTP_410_GONE, detail="Simulation session expired")
-
-    env = session.wrapper or session.env
+    env, scenario_overrides = _session_env_or_error(run_id)
     try:
         import numpy as np
 
         series = _extract_metric_series(env, overrides=scenario_overrides)
+        site = _site_of(env, scenario_overrides)
         start, upto = _window_bounds(series['steps'], limit)
         upto = min(upto, series['steps'])
         start = min(start, upto)
@@ -538,6 +616,14 @@ async def get_energy_series(run_id: str, limit: int = 2000, max_points: int = 0)
         _, solar = _downsample(series['solar_mw'], start, upto, max_points)
         _, wind = _downsample(series['wind_mw'], start, upto, max_points)
         _, hydro = _downsample(series['hydro_mw'], start, upto, max_points)
+        extra: dict[str, list] = {}
+        dt_h = float(series['dt_hours'])
+        if site.has_heat:
+            for key, name in (('chp_el_mwh', 'chp_mw'), ('hp_el_mwh', 'heat_pump_mw'), ('heat_demand_mwh', 'heat_demand_mw')):
+                _, vals = _downsample(np.asarray(site.series_mwh[key], dtype=float) / dt_h, start, upto, max_points)
+                extra[name] = vals
+        if site.ev_mw is not None:
+            _, extra['ev_mw'] = _downsample(site.ev_mw, start, upto, max_points)
 
         timestamps = None
         try:
@@ -553,12 +639,13 @@ async def get_energy_series(run_id: str, limit: int = 2000, max_points: int = 0)
             'end': upto,
             'steps': steps,
             'timestamps': timestamps,
-            'dt_hours': float(series['dt_hours']),
+            'dt_hours': dt_h,
             'gen_mw': gen,
             'load_mw': demand,
             'solar_mw': solar,
             'wind_mw': wind,
             'hydro_mw': hydro,
+            **extra,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Series calculation failed: {exc}")
@@ -566,60 +653,42 @@ async def get_energy_series(run_id: str, limit: int = 2000, max_points: int = 0)
 
 @router.get("/runs/{run_id}/optimize", tags=["runs"])
 async def optimize_run_merit_order(run_id: str, limit: int = 0, max_points: int = 0, persist: bool = False) -> dict:
-    """Run a deterministic merit‑order dispatcher consistent with paper.txt.
+    """Merit-order dispatch of the run's design (consistent with paper.txt).
 
-    Dispatch is always simulated from step 0 (battery state carries over), and
-    KPIs cover the whole horizon. With ``limit`` > 0 the returned series are
+    Dispatch is simulated from step 0 over the whole horizon when the session
+    starts (battery and storage states carry over); series and KPIs cover the
+    steps simulated so far. With ``limit`` > 0 the returned series are
     restricted to the same window/buckets as ``/energy_series``.
     """
-    manager = SimulationManager.get_global()
-    with session_scope() as db:
-        run = _get_run_or_404(db, run_id)
-        run = _refresh_run_status_if_needed(db, run)
-        session_id = run.session_id
-        scenario_overrides = _resolve_run_overrides(db, run)
     try:
-        session = manager.get_session(session_id) if session_id else None
-    except KeyError:
-        session = None
-
-    if session is None:
-        raise HTTPException(status_code=410, detail="Simulation session expired")
-
-    env = session.wrapper or session.env
+        env, scenario_overrides = _session_env_or_error(run_id)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_409_CONFLICT:
+            raise HTTPException(status_code=410, detail="Simulation session expired")
+        raise
     try:
         import numpy as np
-        series = _extract_metric_series(env, overrides=scenario_overrides)
-        # Wind/hydro are on-site generation too; the dispatcher treats all of it as "PV bus"
-        pv = np.asarray(series['solar_mw'], dtype=float) + np.asarray(series['wind_mw'], dtype=float) + np.asarray(series['hydro_mw'], dtype=float)
-        load = np.asarray(series['load_mw'], dtype=float)
 
-        # timestep inference: prefer timestamp spacing, else assume 10‑min
-        dt_hours = float(series['dt_hours'])
-
-        cfg = build_config_from_overrides(scenario_overrides, dt_hours)
-        opt = MeritOrderOptimizer(cfg)
-        out = opt.run(pv_mw=pv, load_mw=load)
+        site = _site_of(env, scenario_overrides)
+        cfg = site.config
+        config = {**cfg.__dict__, 'has_dsm': site.has_dsm, 'has_heat': site.has_heat}
 
         # Persist a snapshot only on explicit request; the UI polls this endpoint
         if persist:
             try:
                 with session_scope() as db:
-                    row = SimulationSnapshot(
+                    db.add(SimulationSnapshot(
                         run_id=run_id,
                         timestep=int(getattr(env, 't', 0)),
-                        payload={
-                            'type': 'optimizer_merit_order',
-                            'config': cfg.__dict__,
-                            'kpis': out['kpis'],
-                        },
-                    )
-                    db.add(row)
+                        payload={'type': 'optimizer_merit_order', 'config': config, 'kpis': site.kpis_upto(int(getattr(env, 't', 0) or 0) or None)},
+                    ))
             except Exception:
                 pass
 
-        dt_h = float(out.get('dt_hours', dt_hours))
-        n = len(pv)
+        dt_h = float(site.dt_hours)
+        # Like the other run endpoints: the steps simulated so far
+        n = max(1, min(int(getattr(env, 't', 0) or 0), len(site.soc_mwh)))
+        kpis = site.kpis_upto(n)
         if limit and limit > 0:
             start, end = _window_bounds(n, limit)
             end = min(end, n)
@@ -628,14 +697,14 @@ async def optimize_run_merit_order(run_id: str, limit: int = 0, max_points: int 
         series_mwh: dict[str, list] = {}
         series_mw: dict[str, list] = {}
         steps: list[int] = []
-        for k, v in out['series_mwh'].items():
+        for k, v in site.series_mwh.items():
             steps, windowed = _downsample(v, start, end, max_points)
             series_mwh[k] = windowed
             series_mw[k.replace('_mwh', '_mw')] = (np.asarray(windowed) / max(dt_h, 1e-9)).tolist()
-        _, soc = _downsample(out['soc_mwh'], start, end, max_points)
-        return {
-            'config': cfg.__dict__,
-            'kpis': out['kpis'],
+        _, soc = _downsample(site.soc_mwh, start, end, max_points)
+        result = {
+            'config': config,
+            'kpis': kpis,
             'start': start,
             'end': end,
             'steps': steps,
@@ -643,7 +712,12 @@ async def optimize_run_merit_order(run_id: str, limit: int = 0, max_points: int 
             'series_mw': series_mw,
             'soc_mwh': soc,
             'dt_hours': dt_h,
+            'data_sources': site.sources,
+            'data_source_details': _data_source_details(site.sources, scenario_overrides),
         }
+        if site.ts_soc_mwh is not None:
+            _, result['thermal_soc_mwh'] = _downsample(site.ts_soc_mwh, start, end, max_points)
+        return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Optimization failed: {exc}")
 
@@ -660,6 +734,8 @@ async def create_scenario(payload: ScenarioCreate) -> ScenarioRead:
             if dt is None:
                 raise HTTPException(status_code=404, detail='Digital twin not found')
             config = _overrides_with_twin(config, dt)
+        else:
+            config = _without_twin_design(config)
 
         scenario = Scenario(
             id=str(uuid4()),
@@ -713,6 +789,8 @@ async def update_scenario(scenario_id: str, payload: ScenarioUpdate) -> Scenario
             dt = db.get(DigitalTwin, sc.digital_twin_id)
             if dt is not None:
                 sc.config_overrides = _overrides_with_twin(sc.config_overrides, dt)
+        else:
+            sc.config_overrides = _without_twin_design(sc.config_overrides)
         db.add(sc); db.flush(); db.refresh(sc)
         return ScenarioRead.from_orm(sc)
 
@@ -734,7 +812,7 @@ async def run_scenario(scenario_id: str) -> SimulationRunRead:
 
         run = SimulationRun(
             id=str(uuid4()),
-            name=f"Run of {sc.name}",
+            name=_run_name(sc.name),
             notes=None,
             config={
                 'data_path': str(manager.settings.data_path),
@@ -743,7 +821,7 @@ async def run_scenario(scenario_id: str) -> SimulationRunRead:
                 'model_dir': str(manager.settings.model_dir),
                 'scaler_dir': str(manager.settings.scaler_dir),
                 'config_overrides': sc.config_overrides or {},
-                **({'digital_twin_config': {'name': twin.name, 'components': twin.components, 'connections': twin.connections}} if twin else {}),
+                **({'digital_twin_config': {'name': twin.name, 'components': _scenario_components(twin, sc.config_overrides), 'connections': twin.connections}} if twin else {}),
             },
             status=SimulationStatus.RUNNING,
             session_id=sim_session.session_id,
@@ -761,6 +839,10 @@ async def delete_scenario(scenario_id: str) -> dict:
         sc = db.get(Scenario, scenario_id)
         if sc is None:
             raise HTTPException(status_code=404, detail='Scenario not found')
+        # SQLite does not enforce ON DELETE SET NULL; runs keep their own copy of the settings
+        for run in db.query(SimulationRun).filter(SimulationRun.scenario_id == scenario_id).all():
+            run.scenario_id = None
+            db.add(run)
         db.delete(sc)
         return {"status": "deleted", "id": scenario_id}
 
@@ -866,6 +948,231 @@ async def list_digital_twins() -> List[DigitalTwinRead]:
         return [DigitalTwinRead.model_validate(_dt_to_read_dict(r)) for r in rows]
 
 
+# ------------------ Component data (uploads / synthetic profiles) ------------------
+
+def _dataset_frame():
+    manager = SimulationManager.get_global()
+    return manager._load_data(manager.settings.resolve(Path.cwd()).data_path)
+
+
+def _channel_or_400(ctype: str, channel: str):
+    from .components import CHANNELS
+
+    for ch in CHANNELS.get(ctype, []):
+        if ch.key == channel:
+            return ch
+    raise HTTPException(status_code=400, detail=f"A {ctype or 'component'} has no '{channel}' data channel")
+
+
+def _profile_preview(df, values, channel, year: int | None) -> dict:
+    """Hourly values of one year plus whole-horizon statistics of a channel series."""
+    import numpy as np
+    import pandas as pd
+
+    ts = df['timestamp']
+    years = sorted(int(y) for y in ts.dt.year.unique())
+    year = year if year in years else years[-1]
+    frame = pd.DataFrame({'v': np.asarray(values, dtype=float)}, index=pd.DatetimeIndex(ts))
+    hourly = frame.loc[str(year)].resample('h').mean()['v']
+    step_h = (ts.iloc[1] - ts.iloc[0]).total_seconds() / 3600 if len(ts) > 1 else 1 / 6
+    n_years = max(1e-9, len(ts) * step_h / 8760)
+    arr = np.asarray(values, dtype=float)
+    if channel.unit == 'DKK/MWh':
+        stats = {'mean': float(arr.mean()), 'min': float(arr.min()), 'max': float(arr.max())}
+    else:
+        year_vals = hourly.to_numpy()
+        stats = {
+            'annual_kwh': float(arr.sum() * step_h / n_years),
+            'year_kwh': float(np.nansum(year_vals)),
+            'peak_kw': float(arr.max()),
+            'mean_kw': float(arr.mean()),
+        }
+    return {
+        'year': year,
+        'years': years,
+        'unit': channel.unit,
+        'start': str(hourly.index[0]) if len(hourly) else None,
+        'hourly': [round(float(v), 4) for v in hourly.to_numpy()],
+        'stats': stats,
+    }
+
+
+@router.post('/digital-twins/synthetic-preview', tags=['digital-twins'])
+async def synthetic_profile_preview(payload: SyntheticPreviewRequest) -> dict:
+    """Synthetic (model) series of a component channel: one year hourly + statistics."""
+    import asyncio
+
+    from .components import synthetic
+
+    ch = _channel_or_400(payload.component.type, payload.channel)
+
+    def work():
+        df = _dataset_frame()
+        values = synthetic(df, payload.component.type, payload.channel, payload.component.params)
+        return _profile_preview(df, values, ch, payload.year)
+
+    return await asyncio.to_thread(work)
+
+
+@router.post('/digital-twins/evaluate', tags=['digital-twins'])
+async def evaluate_twin_design(payload: TwinEvaluateRequest) -> dict:
+    """Annual averages of a design simulated over the whole dataset (same model
+    and data as a run), for the live summary while a twin is being edited."""
+    import asyncio
+
+    from .site_sim import simulate
+
+    components = [c for c in payload.components if isinstance(c, dict) and c.get('type')]
+    overrides = _dt_to_config_overrides(components, [])
+    for key in ('owned_solar_capacity_mw', 'owned_wind_capacity_mw', 'owned_hydro_capacity_mw', 'owned_load_peak_mw'):
+        overrides.setdefault(key, 0.0)
+    if payload.twin_id:
+        overrides['twin_id'] = payload.twin_id
+
+    def work():
+        df = _dataset_frame()
+        site = simulate(df, overrides)
+        years = max(1e-9, len(df) * site.dt_hours / 8760)
+        k = site.kpis
+        per_year = {key: v / years for key, v in k.items() if key.endswith('_mwh') and isinstance(v, (int, float))}
+        flh = _dataset_full_load_hours()
+        return {
+            'years': years,
+            'annual_mwh': per_year,
+            'ped_ratio': k['ped_ratio'],
+            'total_energy_ped_ratio': k.get('total_energy_ped_ratio'),
+            'self_sufficiency_ratio': k.get('self_sufficiency_ratio'),
+            'self_consumption_ratio': k.get('self_consumption_ratio'),
+            'import_over_limit_hours_per_year': k.get('import_over_limit_hours', 0.0) / years,
+            'solar_kwh_per_kwp': flh['solar'],
+            'uploaded_series': sum(1 for v in site.sources.values() if v == 'uploaded'),
+        }
+
+    return await asyncio.to_thread(work)
+
+
+def _twin_component(db, dt_id: str, component_id: str) -> dict | None:
+    dt = db.get(DigitalTwin, dt_id)
+    if dt is None:
+        raise HTTPException(status_code=404, detail='Digital twin not found')
+    _refuse_reference(dt)
+    return next((c for c in (dt.components or []) if c.get('id') == component_id), None)
+
+
+@router.get('/digital-twins/{dt_id}/data', tags=['digital-twins'])
+async def list_component_data(dt_id: str) -> dict:
+    """Uploaded data of a twin: ``{component id: {channel: metadata}}``."""
+    from . import profile_store
+
+    with session_scope() as db:
+        if db.get(DigitalTwin, dt_id) is None:
+            raise HTTPException(status_code=404, detail='Digital twin not found')
+    return profile_store.list_twin(dt_id)
+
+
+@router.post('/digital-twins/{dt_id}/components/{component_id}/data/{channel}', tags=['digital-twins'])
+async def upload_component_data(dt_id: str, component_id: str, channel: str, payload: ProfileUpload) -> dict:
+    """Upload measured data (CSV: time + value) for one channel of a component."""
+    import asyncio
+    import base64
+    import gzip
+
+    from . import profile_store
+    from .components import params_of
+
+    with session_scope() as db:
+        saved = _twin_component(db, dt_id, component_id)
+    comp = payload.component.model_dump() if payload.component else saved
+    if comp is None:
+        raise HTTPException(status_code=400, detail='Unknown component; send its type and parameters')
+    ch = _channel_or_400(comp.get('type', ''), channel)
+
+    if payload.csv_gzip_b64:
+        try:
+            text = gzip.decompress(base64.b64decode(payload.csv_gzip_b64)).decode('utf-8-sig', errors='replace')
+        except Exception:
+            raise HTTPException(status_code=400, detail='Could not decompress the upload')
+    elif payload.csv_text:
+        text = payload.csv_text.lstrip('\ufeff')
+    else:
+        raise HTTPException(status_code=400, detail='The upload is empty')
+
+    def work():
+        series, info = profile_store.parse_upload(
+            text, time_column=payload.time_column, value_column=payload.value_column,
+            unit=payload.unit, tz=payload.timezone, is_price=ch.unit == 'DKK/MWh',
+        )
+        if ch.unit != 'DKK/MWh' and float(series.min()) < -1e-6:
+            raise profile_store.UploadError('Values must not be negative (power in kW)')
+        ref = ch.size(params_of(comp)) if ch.size else None
+        meta = {
+            **info,
+            'channel': channel,
+            'component_type': comp.get('type'),
+            'filename': payload.filename,
+            'unit_uploaded': payload.unit,
+            'unit': ch.unit,
+            'timezone': payload.timezone,
+            'ref_size': ref if ref and ref > 0 else None,
+            'size_label': ch.size_label,
+            'scale': bool(payload.scale),
+            'mean': float(series.mean()),
+            'max': float(series.max()),
+        }
+        df = _dataset_frame()
+        values, covered = profile_store.align(series, df['timestamp'])
+        meta['coverage'] = covered
+        meta = profile_store.save(dt_id, component_id, channel, series, meta)
+        return {'meta': meta, 'preview': _profile_preview(df, values, ch, None)}
+
+    try:
+        return await asyncio.to_thread(work)
+    except profile_store.UploadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get('/digital-twins/{dt_id}/components/{component_id}/data/{channel}', tags=['digital-twins'])
+async def get_component_data(dt_id: str, component_id: str, channel: str, year: int | None = None) -> dict:
+    """Uploaded series of a channel on the simulation timeline (before size scaling)."""
+    import asyncio
+
+    from . import profile_store
+
+    meta = profile_store.load_meta(dt_id, component_id, channel)
+    if meta is None:
+        raise HTTPException(status_code=404, detail='No uploaded data for this channel')
+    ch = _channel_or_400(meta.get('component_type', ''), channel)
+
+    def work():
+        df = _dataset_frame()
+        hit = profile_store.aligned(dt_id, component_id, channel, df['timestamp'])
+        if hit is None:
+            raise HTTPException(status_code=404, detail='No uploaded data for this channel')
+        return {'meta': meta, 'preview': _profile_preview(df, hit[0], ch, year)}
+
+    return await asyncio.to_thread(work)
+
+
+@router.patch('/digital-twins/{dt_id}/components/{component_id}/data/{channel}', tags=['digital-twins'])
+async def update_component_data(dt_id: str, component_id: str, channel: str, payload: ProfileSettings) -> dict:
+    from . import profile_store
+
+    changes = {k: v for k, v in payload.model_dump().items() if v is not None}
+    meta = profile_store.update_meta(dt_id, component_id, channel, **changes)
+    if meta is None:
+        raise HTTPException(status_code=404, detail='No uploaded data for this channel')
+    return {'meta': meta}
+
+
+@router.delete('/digital-twins/{dt_id}/components/{component_id}/data/{channel}', tags=['digital-twins'])
+async def delete_component_data(dt_id: str, component_id: str, channel: str) -> dict:
+    from . import profile_store
+
+    if not profile_store.delete(dt_id, component_id, channel):
+        raise HTTPException(status_code=404, detail='No uploaded data for this channel')
+    return {'status': 'deleted'}
+
+
 @router.get('/digital-twins/{dt_id}', response_model=DigitalTwinRead, tags=['digital-twins'])
 async def get_digital_twin(dt_id: str) -> DigitalTwinRead:
     """Get a specific digital twin configuration."""
@@ -883,12 +1190,21 @@ async def update_digital_twin(dt_id: str, payload: DigitalTwinUpdate) -> Digital
         dt = db.get(DigitalTwin, dt_id)
         if dt is None:
             raise HTTPException(status_code=404, detail='Digital twin not found')
+        _refuse_reference(dt)
         if payload.name is not None:
             dt.name = payload.name
         if payload.description is not None:
             dt.description = payload.description
         if payload.components is not None:
             dt.components = [c.model_dump() for c in payload.components]
+            # Drop uploads of removed components
+            from . import profile_store
+
+            keep = {c.get('id') for c in dt.components}
+            for component_id, channels in profile_store.list_twin(dt.id).items():
+                if component_id not in keep:
+                    for channel in channels:
+                        profile_store.delete(dt.id, component_id, channel)
         if payload.connections is not None:
             dt.connections = [c.model_dump(by_alias=True) for c in payload.connections]
         db.add(dt)
@@ -908,19 +1224,24 @@ async def delete_digital_twin(dt_id: str) -> dict:
         dt = db.get(DigitalTwin, dt_id)
         if dt is None:
             raise HTTPException(status_code=404, detail='Digital twin not found')
+        _refuse_reference(dt)
         # SQLite does not enforce the ON DELETE SET NULL foreign keys: unlink by
         # hand. Scenarios keep their current sizes as manual values; runs keep the
         # design copy stored in their config.
         unlinked = 0
         for sc in db.query(Scenario).filter(Scenario.digital_twin_id == dt_id).all():
             sc.digital_twin_id = None
+            sc.config_overrides = _without_twin_design(sc.config_overrides)
             db.add(sc)
             unlinked += 1
         for run in db.query(SimulationRun).filter(SimulationRun.digital_twin_id == dt_id).all():
             run.digital_twin_id = None
             db.add(run)
         db.delete(dt)
-        return {"status": "deleted", "id": dt_id, "unlinked_scenarios": unlinked}
+    from . import profile_store
+
+    profile_store.delete_twin(dt_id)
+    return {"status": "deleted", "id": dt_id, "unlinked_scenarios": unlinked}
 
 
 @router.post('/digital-twins/{dt_id}/run', response_model=SimulationRunRead, tags=['digital-twins'])
@@ -942,7 +1263,7 @@ async def run_digital_twin(dt_id: str) -> SimulationRunRead:
 
         run = SimulationRun(
             id=str(uuid4()),
-            name=f"Run of {dt.name}",
+            name=_run_name(dt.name),
             notes=None,
             config={
                 'data_path': str(manager.settings.data_path),
@@ -1001,34 +1322,34 @@ async def analyze_digital_twin_ped(dt_id: str) -> dict:
             elif ctype == 'district_heating':
                 heat_kw += float(params.get('capacity_kw', 0))
 
-        # PED is an annual *energy* balance. Convert capacities with the dataset's
-        # full-load hours (the same peak scaling simulation runs use).
-        flh = _dataset_full_load_hours()
-        sim_gen_kw = sum(
-            float((c.get('params') or {}).get(key, 0) or 0)
-            for c in components
-            for t, key in (('solar_pv', 'capacity_kwp'), ('wind_turbine', 'capacity_kw'))
-            if c.get('type') == t
-        )
-        pv_kw = sum(float((c.get('params') or {}).get('capacity_kwp', 0) or 0) for c in components if c.get('type') == 'solar_pv')
-        wind_kw = sim_gen_kw - pv_kw
-        peak_load_kw = _dt_to_config_overrides(components, []).get('owned_load_peak_mw', 0.0) * 1000
-        gen_mwh = (pv_kw * flh['solar'] + wind_kw * flh['wind']) / 1000
-        load_mwh = peak_load_kw * flh['load'] / 1000
-        ratio = gen_mwh / load_mwh if load_mwh > 0 else 0
-        is_ped = load_mwh > 0 and ratio >= 1.0
+        # PED is an annual *energy* balance: simulate the design (all components,
+        # uploaded data where present) and average over the dataset years
+        from .site_sim import simulate
 
-        return {
-            'generation_kw': gen_kw,
-            'load_kw': load_kw,
-            'storage_kwh': storage_kwh,
-            'heat_capacity_kw': heat_kw,
-            'annual_generation_mwh': gen_mwh,
-            'annual_demand_mwh': load_mwh,
-            'ped_ratio': ratio,
-            'is_ped_achievable': is_ped,
-            'recommendations': _get_ped_recommendations(gen_mwh, load_mwh, storage_kwh, peak_load_kw, flh['solar']),
-        }
+        overrides = _overrides_with_twin(None, dt)
+    df = _dataset_frame()
+    site = simulate(df, overrides)
+    years = max(1e-9, len(df) * site.dt_hours / 8760)
+    k = site.kpis
+    flh = _dataset_full_load_hours()
+    peak_load_kw = float(overrides.get('owned_load_peak_mw', 0.0)) * 1000
+    gen_mwh = k['total_gen_mwh'] / years
+    load_mwh = k['total_demand_mwh'] / years
+    ratio = gen_mwh / load_mwh if load_mwh > 0 else 0
+    is_ped = load_mwh > 0 and ratio >= 1.0
+    return {
+        'generation_kw': gen_kw,
+        'load_kw': load_kw,
+        'storage_kwh': storage_kwh,
+        'heat_capacity_kw': heat_kw,
+        'annual_generation_mwh': gen_mwh,
+        'annual_demand_mwh': load_mwh,
+        'ped_ratio': ratio,
+        'is_ped_achievable': is_ped,
+        'recommendations': _get_ped_recommendations(gen_mwh, load_mwh, storage_kwh, peak_load_kw, flh['solar']),
+        'annual_heat_demand_mwh': k.get('heat_demand_mwh', 0.0) / years,
+        'total_energy_ped_ratio': k.get('total_energy_ped_ratio'),
+    }
 
 
 def _dataset_full_load_hours() -> dict:
@@ -1041,18 +1362,72 @@ def _dataset_full_load_hours() -> dict:
     return full_load_hours(df, step_h)
 
 
+from .reference_designs import REFERENCE_MARKER  # noqa: E402  (read-only paper reference designs)
+
+
+def _refuse_reference(dt: DigitalTwin) -> None:
+    if dt.description == REFERENCE_MARKER:
+        raise HTTPException(status_code=409, detail='This is a read-only paper reference design; save a copy to change it.')
+
+
 # Settings that a linked digital twin owns; everything else (e.g. investment_freq) is kept
 TWIN_ASSET_KEYS = (
     'owned_solar_capacity_mw', 'owned_wind_capacity_mw', 'owned_hydro_capacity_mw', 'owned_load_peak_mw',
     'owned_battery_capacity_mwh', 'batt_power_c_rate', 'batt_eta_charge', 'batt_eta_discharge',
-    'flexible_load_share', 'max_shift_hours',
+    'flexible_load_share', 'max_shift_hours', 'twin_id', 'twin_components',
 )
 
 
+def _run_name(source: str | None) -> str:
+    base = re.sub(r'^(Run of\s+)+', '', (source or '').strip()) or 'design'
+    return f"Run of {base}"
+
+
+def _without_twin_design(overrides: dict | None) -> dict:
+    """Drop the component list (and its per-scenario changes) of a former twin
+    link so the manual sizes are simulated."""
+    return {k: v for k, v in (overrides or {}).items() if k not in ('twin_id', 'twin_components', 'component_overrides')}
+
+
+def _clean_component_overrides(overrides: dict | None, dt: DigitalTwin) -> dict:
+    """Validate a scenario's parameter changes ({component id: {param: value}})
+    against the twin; changes of components the twin no longer has are dropped."""
+    from .design_catalog import DesignError, clean_values
+
+    changes = (overrides or {}).get('component_overrides') or {}
+    if not isinstance(changes, dict):
+        raise HTTPException(status_code=400, detail='component_overrides must map component ids to parameter values')
+    by_id = {str(c.get('id')): c for c in (dt.components or [])}
+    cleaned = {}
+    for cid, values in changes.items():
+        comp = by_id.get(str(cid))
+        if comp is None or not isinstance(values, dict) or not values:
+            continue
+        try:
+            cleaned[str(cid)] = clean_values(comp.get('type', ''), values)
+        except DesignError as exc:
+            raise HTTPException(status_code=400, detail=f"{comp.get('name') or cid}: {exc}")
+    return cleaned
+
+
+def _scenario_components(dt: DigitalTwin, overrides: dict | None) -> list:
+    """The twin's components with the scenario's parameter changes applied."""
+    from .design_catalog import apply_overrides
+
+    return apply_overrides(dt.components or [], (overrides or {}).get('component_overrides'))
+
+
 def _overrides_with_twin(overrides: dict | None, dt: DigitalTwin) -> dict:
-    """Replace the asset settings in ``overrides`` with those derived from the twin."""
+    """Replace the asset settings in ``overrides`` with those derived from the
+    twin, with the scenario's own parameter changes (``component_overrides``) applied."""
     kept = {k: v for k, v in (overrides or {}).items() if k not in TWIN_ASSET_KEYS}
-    twin = _dt_to_config_overrides(dt.components or [], dt.connections or [])
+    if kept.get('component_overrides'):
+        kept['component_overrides'] = _clean_component_overrides(kept, dt)
+        if not kept['component_overrides']:
+            del kept['component_overrides']
+    twin = _dt_to_config_overrides(_scenario_components(dt, kept), dt.connections or [])
+    # Uploaded component data is stored under the twin's id
+    twin['twin_id'] = dt.id
     # Local-asset mode needs explicit zeros, otherwise a design without PV would fall
     # back to the regional DK2 series
     for key in ('owned_solar_capacity_mw', 'owned_wind_capacity_mw', 'owned_hydro_capacity_mw', 'owned_load_peak_mw'):
@@ -1063,9 +1438,9 @@ def _overrides_with_twin(overrides: dict | None, dt: DigitalTwin) -> dict:
 def _dt_to_config_overrides(components: list, connections: list) -> dict:
     """Convert digital twin components to simulation config overrides.
 
-    The simulation scales one demand profile to ``owned_load_peak_mw``, so loads
-    contribute their *peak* demand. EV chargers, heat pumps and CHP have no
-    profile in the dataset and are not simulated.
+    ``twin_components`` carries every component to the simulation. The
+    aggregate sizes (PV, wind, battery, peak load as the sum of building and
+    load-centre peaks, DSM share) summarise the design for scenario forms.
     """
     def num(params: dict, key: str, default: float = 0.0) -> float:
         try:
@@ -1120,6 +1495,11 @@ def _dt_to_config_overrides(components: list, connections: list) -> dict:
             overrides['flexible_load_share'] = flexible_load / total_load
             overrides['max_shift_hours'] = 3.0
 
+    # The simulation models every component from this list (backend/components.py);
+    # the aggregate keys above are summaries for scenario forms and older code paths
+    overrides['twin_components'] = [
+        {'id': c.get('id'), 'type': c.get('type'), 'name': c.get('name'), 'params': dict(c.get('params') or {})} for c in components
+    ]
     return overrides
 
 

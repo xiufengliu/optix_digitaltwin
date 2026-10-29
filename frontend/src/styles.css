@@ -117,6 +117,7 @@ textarea { resize: vertical; }
 }
 .badge-live { color: var(--good); background: rgba(52, 211, 153, 0.12); }
 .badge-live::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: pulse 1.8s ease-in-out infinite; }
+.badge-good { color: var(--good); background: rgba(52, 211, 153, 0.12); }
 .badge-idle { color: var(--text-muted); background: rgba(148, 163, 184, 0.12); }
 .badge-bad { color: var(--bad); background: rgba(248, 113, 113, 0.12); }
 .badge-accent { color: #9cc4ff; background: var(--accent-soft); }
@@ -955,3 +956,52 @@ kbd { font-family: inherit; font-size: 0.72rem; background: var(--surface-2); bo
   .bn-twin-row { flex-direction: column; align-items: stretch; }
   .bn-twin-actions { justify-content: flex-end; }
 }
+
+/* Component data (uploads / synthetic profiles) in the builder inspector */
+.bn-data-card { display: flex; flex-direction: column; gap: 8px; border: 1px solid var(--border); border-radius: 10px; padding: 10px; background: var(--surface); }
+.bn-data-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.bn-data-head select { font: inherit; font-size: 0.78rem; padding: 2px 6px; }
+.bn-data-meta { display: flex; flex-direction: column; gap: 4px; }
+.bn-data-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.bn-data-actions label.btn { cursor: pointer; }
+.bn-data-actions .is-disabled { opacity: 0.5; pointer-events: none; }
+.bn-data-form { display: flex; flex-direction: column; gap: 8px; border-top: 1px dashed var(--border); padding-top: 8px; }
+.bn-data-preview { display: flex; flex-direction: column; gap: 6px; border-top: 1px dashed var(--border); padding-top: 8px; }
+.bn-data-error { color: var(--bad); margin: 0; }
+.run-item-design { margin: 2px 0 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.compare-kv { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; }
+.compare-kv b { color: var(--text); font-weight: 600; }
+.data-sources summary { cursor: pointer; }
+.data-sources ul { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; font-size: 0.8rem; }
+.data-sources li { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+
+/* Copilot design proposals */
+.proposal-card { border: 1px solid var(--accent); border-radius: 10px; padding: 10px; margin: 8px 0; display: flex; flex-direction: column; gap: 6px; background: var(--surface); }
+.proposal-card p { margin: 0; }
+.proposal-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.proposal-kv { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--text-muted); }
+.proposal-kv b { color: var(--text); font-weight: 600; }
+.proposal-card .btn { align-self: flex-start; }
+.bn-menu-note { padding: 4px 10px 8px; }
+.bn-group-title-strong { color: var(--text-muted); }
+.bn-menu-item .badge { margin-left: 6px; }
+
+/* Scenario editor: actions pinned to the bottom of the panel */
+.editor-actions {
+  position: sticky; bottom: -1rem; z-index: 5; margin: 12px -1.1rem -1rem; padding: 10px 1.1rem;
+  display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+  background: var(--bg-elev); border-top: 1px solid var(--border-strong); border-radius: 0 0 var(--radius) var(--radius);
+  /* covers the form scrolling underneath, below the bar */
+  box-shadow: 0 2rem 0 0 var(--bg-elev);
+}
+
+/* Scenario form: the linked twin's components */
+.scenario-design { display: flex; flex-direction: column; gap: 10px; }
+.sd-component { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: var(--surface-2, transparent); }
+.sd-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.sd-head .bn-icon-tile { color: var(--tc); }
+.sd-fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px 12px; }
+.sd-fields .field.is-changed input, .sd-fields .field.is-changed select { border-color: var(--accent); }
+.sd-changed { margin-left: 6px; font-weight: 500; text-transform: none; letter-spacing: 0; color: var(--accent); font-size: 0.72rem; }
+.sd-reset { margin-left: 4px; border: none; background: none; color: var(--accent); cursor: pointer; font-size: 0.85rem; padding: 0 2px; }
+.section-title .badge { margin-left: 8px; vertical-align: middle; }

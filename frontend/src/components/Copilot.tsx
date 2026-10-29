@@ -2,12 +2,32 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { apiFetch, apiUrl } from '../lib/api';
+import { formatTwinSummary, twinSummary } from '../lib/twin';
+import type { DigitalTwinConfig } from './DigitalTwinBuilder';
 
 export interface CopilotContext {
   view: string;
   run_id?: string | null;
   run_name?: string | null;
   simulated_time?: string | null;
+  scenario_id?: string | null;
+  scenario_name?: string | null;
+  /** Twin Builder canvas */
+  design?: {
+    name: string;
+    twin_id: string | null;
+    is_reference: boolean;
+    selected_component: string | null;
+    components: { id: string; type: string; name: string; params: Record<string, unknown> }[];
+    connections: { from: string; to: string; type: string }[];
+  } | null;
+}
+
+/** A twin design the copilot generated (propose_twin_design) */
+interface Proposal {
+  id: string;
+  design: Pick<DigitalTwinConfig, 'name' | 'components' | 'connections'> & { summary?: string };
+  results: Record<string, number | null>;
 }
 
 interface ToolCall {
@@ -23,6 +43,7 @@ interface Turn {
   text: string;
   thinking?: string;
   tools?: ToolCall[];
+  proposals?: Proposal[];
   error?: string;
   streaming?: boolean;
 }
@@ -32,7 +53,8 @@ type StreamEvent =
   | { type: 'text' | 'thinking'; text: string }
   | { type: 'tool_start'; id: string; name: string }
   | { type: 'tool_result'; id: string; name: string; input: unknown; is_error: boolean; summary: string }
-  | { type: 'twin_changed'; kind: 'run' | 'scenario'; result: unknown }
+  | { type: 'twin_changed'; kind: 'run' | 'scenario' | 'twin'; result: unknown }
+  | { type: 'design_proposal'; id: string; result: { design: Proposal['design']; results: Proposal['results'] } }
   | { type: 'error'; message: string };
 
 const TOOL_LABELS: Record<string, string> = {
@@ -43,7 +65,33 @@ const TOOL_LABELS: Record<string, string> = {
   evaluate_design: 'Simulating design',
   sweep_designs: 'Sweeping design options',
   step_simulation: 'Advancing simulation',
-  save_scenario: 'Saving scenario',
+  compare_scenarios: 'Comparing scenarios (2015–2024)',
+  get_current_design: 'Reading the canvas design',
+  propose_twin_design: 'Designing and simulating a twin',
+  create_scenario: 'Creating scenario',
+  run_scenario: 'Starting a run',
+};
+
+// The copilot's role on each page
+const PAGE: Record<string, { title: string; subtitle: string; intro: string; placeholder: string }> = {
+  console: {
+    title: 'Run copilot',
+    subtitle: 'Explains the selected run and simulates further on request',
+    intro: 'Ask why a run performs as it does, what drives imports or heat, or how two runs differ.',
+    placeholder: 'Ask about this run…',
+  },
+  scenarios: {
+    title: 'Scenario copilot',
+    subtitle: 'Compares scenarios over 2015–2024, creates and runs them',
+    intro: 'Ask it to rank scenarios, set up a study (e.g. a series of battery sizes) or start runs.',
+    placeholder: 'Compare, create or run scenarios…',
+  },
+  builder: {
+    title: 'Design copilot',
+    subtitle: 'Reads your canvas, generates and improves twin designs',
+    intro: 'Describe a district and it generates a twin you can apply to the canvas, or ask it to improve the current design.',
+    placeholder: 'Describe a twin to generate, or ask about this design…',
+  },
 };
 
 interface Props {
@@ -53,10 +101,12 @@ interface Props {
   context: CopilotContext;
   /** A prompt to send immediately (e.g. from "Ask AI about this run"); nonce re-triggers. */
   request?: { prompt: string; nonce: number } | null;
-  onTwinChanged: (kind: 'run' | 'scenario') => void;
+  onTwinChanged: (kind: 'run' | 'scenario' | 'twin') => void;
+  /** Open a proposed design on the Twin Builder canvas */
+  onApplyDesign: (design: Proposal['design']) => void;
 }
 
-export function Copilot({ apiBase, open, onClose, context, request, onTwinChanged }: Props) {
+export function Copilot({ apiBase, open, onClose, context, request, onTwinChanged, onApplyDesign }: Props) {
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState('');
@@ -141,6 +191,9 @@ export function Copilot({ apiBase, open, onClose, context, request, onTwinChange
             case 'twin_changed':
               onTwinChanged(event.kind);
               break;
+            case 'design_proposal':
+              patchLast((t) => ({ ...t, proposals: [...(t.proposals ?? []), { id: event.id, design: event.result.design, results: event.result.results }] }));
+              break;
             case 'error':
               patchLast((t) => ({ ...t, error: event.message }));
               break;
@@ -170,19 +223,48 @@ export function Copilot({ apiBase, open, onClose, context, request, onTwinChange
     setTurns([]);
   };
 
-  const suggestions = context.run_id
-    ? [
-        `Explain how “${context.run_name ?? 'this run'}” is performing so far.`,
-        'Why is the PED ratio of this run below 1, and what would fix it?',
-        'Which month is hardest for this design, and why?',
-        'Is adding a bigger battery worth it for this design?',
-      ]
-    : [
-        'What is the smallest PV size that makes the reference building a PED over a full year?',
-        'Compare the five reference scenarios over 2019.',
-        'How much does a battery improve self-sufficiency at 400 kWp PV?',
-        'How robust is a 716 kWp design across 2015–2024?',
-      ];
+  const page = PAGE[context.view] ?? PAGE.console;
+  const canvasCount = context.design?.components.length ?? 0;
+  const suggestions = context.view === 'builder'
+    ? (canvasCount > 0
+      ? [
+          'How does this design perform over a year, and what limits it?',
+          'Improve this design so it becomes a positive energy district.',
+          'Replace district heating with heat pumps and thermal storage — what changes?',
+          'What measured data should I upload for the most accurate results?',
+        ]
+      : [
+          'Generate a twin: 3 residential blocks (6,000 m²), 400 kWp PV, heat pumps and 20 EV chargers.',
+          'Generate an office campus that reaches PED, with a battery and smart EV charging.',
+          'Generate a small industrial site with CHP, PV and thermal storage.',
+          'Which components does the simulation model, and what data do they need?',
+        ])
+    : context.view === 'scenarios'
+      ? [
+          'Rank all scenarios by PED ratio and self-sufficiency over 2015–2024.',
+          context.scenario_name ? `What would most improve “${context.scenario_name}”?` : 'Which paper scenario gives the best self-sufficiency per kWh of battery?',
+          'Create scenarios for S2 with batteries of 160, 320 and 640 kWh.',
+          'Create a scenario with S3 plus a 100 kW heat pump replacing district heating, and run it.',
+        ]
+      : context.run_id
+        ? [
+            `Explain how “${context.run_name ?? 'this run'}” is performing so far.`,
+            'Why is the PED ratio of this run below 1, and what would fix it?',
+            'Which month is hardest for this design, and why?',
+            'Where does the heat come from in this run, and what does it cost in electricity?',
+          ]
+        : [
+            'Which runs exist, and how do they compare?',
+            'What is the smallest PV size that makes the reference building a PED over a full year?',
+            'Compare the five paper scenarios over 2019.',
+            'How robust is a 716 kWp design across 2015–2024?',
+          ];
+
+  const apply = (p: Proposal) => {
+    if (context.view === 'builder' && canvasCount > 0
+      && !confirm(`Open “${p.design.name}” on the canvas? The current design stays saved if you saved it; unsaved changes are lost.`)) return;
+    onApplyDesign(p.design);
+  };
 
   if (!open) return null;
 
@@ -190,8 +272,8 @@ export function Copilot({ apiBase, open, onClose, context, request, onTwinChange
     <aside className="copilot" aria-label="AI copilot">
       <div className="copilot-header">
         <div>
-          <div className="copilot-title"><span className="copilot-spark" aria-hidden>✦</span> Twin Copilot</div>
-          <div className="muted small">Claude reasons over your twin's data and runs what-if simulations</div>
+          <div className="copilot-title"><span className="copilot-spark" aria-hidden>✦</span> {page.title}</div>
+          <div className="muted small">{page.subtitle}</div>
         </div>
         <div className="row gap-xs">
           <button className="btn btn-ghost btn-sm" onClick={newChat} disabled={turns.length === 0}>New chat</button>
@@ -204,7 +286,7 @@ export function Copilot({ apiBase, open, onClose, context, request, onTwinChange
           <div className="notice notice-warn">The AI copilot is not configured on the server (missing <code>CLAUDE_API_KEY</code>).</div>
         ) : turns.length === 0 ? (
           <div className="copilot-empty">
-            <p className="muted">Ask about performance, sizing, or what-if designs. Answers are grounded in the twin's simulations.</p>
+            <p className="muted">{page.intro} Answers are grounded in the twin's simulations.</p>
             <div className="copilot-suggestions">
               {suggestions.map((s) => (
                 <button key={s} className="suggestion" onClick={() => send(s)} disabled={busy || !enabled}>{s}</button>
@@ -237,6 +319,9 @@ export function Copilot({ apiBase, open, onClose, context, request, onTwinChange
                     ))}
                   </div>
                 )}
+                {(turn.proposals ?? []).map((p) => (
+                  <ProposalCard key={p.id} proposal={p} inBuilder={context.view === 'builder'} onApply={() => apply(p)} />
+                ))}
                 {turn.text ? (
                   <div className="markdown">
                     <ReactMarkdown remarkPlugins={[remarkGfm]}>{turn.text}</ReactMarkdown>
@@ -259,7 +344,7 @@ export function Copilot({ apiBase, open, onClose, context, request, onTwinChange
           ref={inputRef}
           rows={2}
           value={input}
-          placeholder={context.run_id ? `Ask about “${context.run_name ?? 'this run'}” or any design…` : 'Ask the twin…'}
+          placeholder={context.view === 'console' && context.run_id ? `Ask about “${context.run_name ?? 'this run'}”…` : page.placeholder}
           disabled={enabled === false}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {
@@ -273,5 +358,31 @@ export function Copilot({ apiBase, open, onClose, context, request, onTwinChange
         )}
       </form>
     </aside>
+  );
+}
+
+function ProposalCard({ proposal, inBuilder, onApply }: { proposal: Proposal; inBuilder: boolean; onApply: () => void }) {
+  const r = proposal.results;
+  const pct = (v: number | null | undefined) => (v == null ? '–' : `${Math.round(v * 100)}%`);
+  const mwh = (v: number | null | undefined) => (v == null ? '–' : `${Math.round(v / 1000).toLocaleString()} MWh/y`);
+  const ratio = r.ped_ratio_electricity;
+  return (
+    <div className="proposal-card">
+      <div className="proposal-head">
+        <strong>{proposal.design.name}</strong>
+        <span className="badge">Proposal · not saved</span>
+      </div>
+      {proposal.design.summary && <p className="muted small">{proposal.design.summary}</p>}
+      <p className="small">{proposal.design.components.length} components · {formatTwinSummary(twinSummary(proposal.design))}</p>
+      <div className="proposal-kv small">
+        <span>PED ratio <b className={(ratio ?? 0) >= 1 ? 'tone-good' : 'tone-bad'}>{ratio?.toFixed(2) ?? '–'}</b></span>
+        <span>All energy <b>{r.ped_ratio_all_energy?.toFixed(2) ?? '–'}</b></span>
+        <span>Self-sufficiency <b>{pct(r.self_sufficiency)}</b></span>
+        <span>Generation <b>{mwh(r.generation_kwh_per_year)}</b></span>
+        <span>Demand <b>{mwh(r.electricity_demand_kwh_per_year)}</b></span>
+        {r.heat_demand_kwh_per_year != null && <span>Heat <b>{mwh(r.heat_demand_kwh_per_year)}</b></span>}
+      </div>
+      <button className="btn btn-primary btn-sm" onClick={onApply}>{inBuilder ? 'Apply to canvas' : 'Open in Twin Builder'}</button>
+    </div>
   );
 }

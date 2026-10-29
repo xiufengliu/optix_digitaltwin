@@ -77,7 +77,6 @@ python scripts/fetch_dk2_data.py RAW_DIR
 python scripts/build_dk2_dataset.py RAW_DIR trainingdata.csv
 ```
 
-The earlier synthetic dataset is kept as `trainingdata_synthetic_backup.csv` (not used).
 
 4) Create a run
 

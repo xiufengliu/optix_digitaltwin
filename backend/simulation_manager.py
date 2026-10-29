@@ -365,37 +365,25 @@ class _MinimalEnv:
         self.investment_freq = int(investment_freq)
         self.config_overrides = dict(config_overrides or {})
         self.agents = ["manager"]
-        n = len(data)
-        from .profiles import scale_profiles
+        from .site_sim import simulate
 
-        profiles = scale_profiles(data, self.config_overrides)
-        self._wind = profiles["wind"]
-        self._solar = profiles["solar"]
-        self._hydro = profiles["hydro"]
-        self._load = profiles["load"]
-        self._price = (data["price"].to_numpy() if "price" in data.columns else np.zeros(n))
+        # Every component of the design (uploaded data or synthetic profiles)
+        # and the merit-order dispatch the /optimize endpoint reports, so the
+        # live grid value includes battery, DSM, heat pumps and CHP. Dispatch is
+        # causal (DSM looks ahead only within its shift window), so precomputing
+        # the whole horizon equals stepping it. Results are shared between
+        # sessions of the same design.
+        self.site = simulate(data, self.config_overrides)
+        self._wind = self.site.wind_mw
+        self._solar = self.site.solar_mw
+        self._hydro = self.site.hydro_mw
+        self._load = self.site.load_mw
+        self._price = self.site.price
         # Shared (uncopied) column; formatted lazily per observation
         self._timestamps = data["timestamp"] if "timestamp" in data.columns else None
-        self.dt_hours = 1.0 / 6.0
-        try:
-            if self._timestamps is not None and len(self._timestamps) > 1:
-                delta = (self._timestamps.iloc[1] - self._timestamps.iloc[0]).total_seconds() / 3600.0
-                if delta > 0:
-                    self.dt_hours = float(delta)
-        except Exception:
-            pass
-        # Grid exchange per step from the same merit-order dispatch the
-        # /optimize endpoint reports, so the live grid value includes battery
-        # and DSM. Dispatch is causal (DSM looks ahead only within its shift
-        # window), so precomputing the whole horizon equals stepping it.
-        from .optimizer import MeritOrderOptimizer, build_config_from_overrides
-
-        dispatch = MeritOrderOptimizer(build_config_from_overrides(self.config_overrides, self.dt_hours)).run(
-            pv_mw=np.asarray(self._solar + self._wind + self._hydro, dtype=float),
-            load_mw=np.asarray(self._load, dtype=float),
-        )
+        self.dt_hours = self.site.dt_hours
         # Grid-side energy: what is actually sold and bought (after transformer/export losses)
-        self._grid_net_mwh = dispatch["series_mwh"]["export_delivered_mwh"] - dispatch["series_mwh"]["grid_purchase_mwh"]
+        self._grid_net_mwh = self.site.series_mwh["export_delivered_mwh"] - self.site.series_mwh["grid_purchase_mwh"]
 
         self.t = 0
         self.equity = None
@@ -434,6 +422,7 @@ class _MinimalEnv:
     def _build_obs(self, t):
         i = min(max(int(t), 0), len(self._load) - 1) if len(self._load) > 0 else 0
         return {
+            **self._dispatch_obs(i),
             "t": i,
             "wind": float(self._wind[i] if i < len(self._wind) else 0.0),
             "solar": float(self._solar[i] if i < len(self._solar) else 0.0),
@@ -442,6 +431,28 @@ class _MinimalEnv:
             "price": float(self._price[i] if i < len(self._price) else 0.0),
             "timestamp": str(self._timestamps.iloc[i]) if self._timestamps is not None and i < len(self._timestamps) else None,
         }
+
+    def _dispatch_obs(self, i: int) -> Dict[str, Any]:
+        """What the merit-order dispatch did in step ``i`` (MW; storage in MWh).
+        Grid values are on the grid side (after transformer/export losses)."""
+        s = self.site.series_mwh
+        dt = max(self.dt_hours, 1e-9)
+        val = lambda key: float(s[key][i]) / dt if key in s and i < len(s[key]) else 0.0  # noqa: E731
+        out = {
+            "grid_import": val("grid_purchase_mwh"),
+            "grid_export": val("export_delivered_mwh"),
+            "battery_charge": val("pv_to_batt_mwh"),
+            "battery_discharge": val("batt_to_load_mwh"),
+            "battery_soc": float(self.site.soc_mwh[i]) if i < len(self.site.soc_mwh) else 0.0,
+            "curtailed": val("curtailed_mwh"),
+        }
+        if self.site.has_heat:
+            out.update({
+                "chp": val("chp_el_mwh"),
+                "heat_pump": val("hp_el_mwh"),
+                "heat_demand": val("heat_demand_mwh"),
+            })
+        return out
 
     def close(self):
         return None

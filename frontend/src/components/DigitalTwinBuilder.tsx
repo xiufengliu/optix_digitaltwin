@@ -1,6 +1,8 @@
 import { Fragment, useState, useRef, useCallback, useEffect, useId, useMemo } from 'react';
 import { formatTwinSummary, twinSummary } from '../lib/twin';
 import { DeviceIcon, NumberField, PALETTE_GROUPS, paramMeta, specLine } from './builder/builderUi';
+import { ComponentData } from './builder/ComponentData';
+import { resolveApiBase } from '../lib/api';
 
 // Digital Twin component types for PED simulation
 export type DTComponentType = 
@@ -53,7 +55,7 @@ export const COMPONENT_DEFS: Record<DTComponentType, {
     label: 'Smart Building',
     icon: '🏢',
     color: '#6366f1',
-    defaultParams: { floors: 5, area_m2: 2000, load_kw: 150, flexible_load_pct: 30 },
+    defaultParams: { floors: 5, area_m2: 2000, load_kw: 150, flexible_load_pct: 30, load_profile: 'dk2', heat_demand_kwh_m2: 70 },
     description: 'Intelligent building with controllable loads'
   },
   solar_pv: {
@@ -67,7 +69,7 @@ export const COMPONENT_DEFS: Record<DTComponentType, {
     label: 'Battery Storage',
     icon: '🔋',
     color: '#22c55e',
-    defaultParams: { capacity_kwh: 200, power_kw: 50, efficiency: 0.92, initial_soc: 0.5 },
+    defaultParams: { capacity_kwh: 200, power_kw: 50, efficiency: 0.9, initial_soc: 0.5 },
     description: 'Lithium-ion battery energy storage system'
   },
   wind_turbine: {
@@ -95,7 +97,7 @@ export const COMPONENT_DEFS: Record<DTComponentType, {
     label: 'EV Charger',
     icon: '🚗',
     color: '#3b82f6',
-    defaultParams: { num_ports: 4, power_per_port_kw: 22, v2g_enabled: true },
+    defaultParams: { num_ports: 4, power_per_port_kw: 22, kwh_per_port_day: 20, usage_profile: 'workplace', smart_charging: false, v2g_enabled: false },
     description: 'Electric vehicle charging station with V2G'
   },
   heat_pump: {
@@ -109,7 +111,7 @@ export const COMPONENT_DEFS: Record<DTComponentType, {
     label: 'CHP Unit',
     icon: '⚙️',
     color: '#f97316',
-    defaultParams: { electrical_kw: 100, thermal_kw: 150, fuel: 'biogas' },
+    defaultParams: { electrical_kw: 100, thermal_kw: 150, efficiency_e: 0.38, fuel: 'biogas' },
     description: 'Combined heat and power generation'
   },
   thermal_storage: {
@@ -123,10 +125,50 @@ export const COMPONENT_DEFS: Record<DTComponentType, {
     label: 'Load Center',
     icon: '📊',
     color: '#64748b',
-    defaultParams: { base_load_kw: 100, peak_load_kw: 300, dsm_enabled: true },
+    defaultParams: { base_load_kw: 100, peak_load_kw: 300, load_profile: 'dk2', dsm_enabled: true, flexible_load_pct: 30 },
     description: 'Aggregated electrical load point'
   }
 };
+
+// Read-only designs of the paper scenarios (REFERENCE_MARKER in backend/routes.py)
+const REFERENCE_MARKER = 'paper-reference';
+
+/** Same components (incl. parameters and positions) and links, ignoring empty fields. */
+function isReference(t: { description?: string | null } | DigitalTwinConfig): boolean {
+  return (t as { description?: string | null }).description === REFERENCE_MARKER;
+}
+
+function sameDesign(a: Pick<DigitalTwinConfig, 'components' | 'connections'>, b: Pick<DigitalTwinConfig, 'components' | 'connections'>): boolean {
+  const norm = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(norm);
+    if (v && typeof v === 'object') {
+      return Object.fromEntries(Object.entries(v as Record<string, unknown>)
+        .filter(([, x]) => x !== null && x !== undefined)
+        .sort(([x], [y]) => x.localeCompare(y))
+        .map(([k, x]) => [k, typeof x === 'number' ? Number(x.toFixed(6)) : norm(x)]));
+    }
+    return v;
+  };
+  const key = (d: Pick<DigitalTwinConfig, 'components' | 'connections'>) => JSON.stringify([norm(d.components ?? []), norm(d.connections ?? [])]);
+  return key(a) === key(b);
+}
+
+interface SimulatedPed {
+  annual_mwh: Record<string, number>;
+  ped_ratio: number;
+  total_energy_ped_ratio: number | null;
+  self_sufficiency_ratio: number | null;
+  solar_kwh_per_kwp: number;
+  uploaded_series: number;
+}
+
+// Parameters added after designs were first saved. Older components lack them,
+// so the panel shows the value the simulation uses (backend/components.py DEFAULTS).
+const SIM_DEFAULTED = new Set(['load_profile', 'heat_demand_kwh_m2', 'kwh_per_port_day', 'usage_profile', 'smart_charging', 'efficiency_e']);
+function simDefaults(type: DTComponentType): Record<string, number | string | boolean> {
+  return Object.fromEntries(Object.entries(COMPONENT_DEFS[type].defaultParams)
+    .filter(([k]) => SIM_DEFAULTED.has(k) || (type === 'load_center' && k === 'flexible_load_pct')));
+}
 
 const COMPONENT_LIST = Object.entries(COMPONENT_DEFS).map(([type, def]) => ({
   type: type as DTComponentType,
@@ -363,11 +405,13 @@ function loadLocalConfig(): DigitalTwinConfig | null {
 interface Props {
   onConfigChange?: (config: DigitalTwinConfig) => void;
   initialConfig?: DigitalTwinConfig | null;
+  /** What the copilot needs beyond the config: read-only reference, selected component */
+  onCopilotState?: (state: { isReference: boolean; selected: string | null }) => void;
   apiBase?: string;
   onRunSimulation?: (runId: string) => void;
 }
 
-export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onRunSimulation }: Props) {
+export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onRunSimulation, onCopilotState }: Props) {
   // Start from initialConfig, else the config persisted in localStorage
   // (read synchronously so the save effect can't overwrite it with an empty design)
   const [startConfig] = useState<DigitalTwinConfig | null>(() => initialConfig || loadLocalConfig());
@@ -788,10 +832,9 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     // so this quick estimate matches what a simulation run reports
     const solarCF = 0.1163; // 1019 kWh/kWp/year
     const windCF = 0.255;   // onshore wind, 2235 kWh/kW/year
-    const chpCF = 0.6;      // not simulated; rough 60% capacity factor
     const loadFactor = 0.60; // DK2 demand profile: mean / peak
     
-    const annualGenMwh = (solarKwp * solarCF + windKw * windCF + chpKw * chpCF) * 8.76; // 8760h/1000
+    const annualGenMwh = (solarKwp * solarCF + windKw * windCF) * 8.76; // renewable only, like the simulation (8760h/1000)
     const annualLoadMwh = loadKw * loadFactor * 8.76;
     
     // Self-consumption estimate (simplified - depends on storage)
@@ -844,21 +887,93 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     };
   };
 
-  const ped = calcPedMetrics();
+  // The card shows the real simulation of the design (same model and data as a
+  // run, averaged over 2015-2024); the quick estimate above only fills the gap
+  // while it is computed and supplies the cost/CAPEX assumptions.
+  const [savedIsReference, setSavedIsReference] = useState(false);
+  useEffect(() => {
+    if (!savedId || !apiBase) { setSavedIsReference(false); return; }
+    let cancelled = false;
+    fetch(join(`/digital-twins/${encodeURIComponent(savedId)}`))
+      .then(r => (r.ok ? r.json() : null))
+      .then(t => { if (!cancelled) setSavedIsReference(Boolean(t && isReference(t))); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [savedId, apiBase]);
 
-  const clearAll = () => {
-    if (confirm('Clear all components?')) {
-      setComponents([]);
-      setConnections([]);
-      setSelectedId(null);
-      setConnectingFrom(null);
-      setSavedId(null);
-    }
+  const selectedName = components.find(c => c.id === selectedId)?.name ?? null;
+  useEffect(() => {
+    onCopilotState?.({ isReference: savedIsReference, selected: selectedName });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [savedIsReference, selectedName]);
+
+  const [simPed, setSimPed] = useState<SimulatedPed | null>(null);
+  const [simPedState, setSimPedState] = useState<'idle' | 'loading' | 'error'>('idle');
+  const designKey = useMemo(() => JSON.stringify(components.map(c => ({ id: c.id, type: c.type, params: c.params }))), [components]);
+  useEffect(() => {
+    if (components.length === 0) { setSimPed(null); setSimPedState('idle'); return; }
+    const ac = new AbortController();
+    setSimPedState('loading');
+    const timer = window.setTimeout(async () => {
+      try {
+        const r = await fetch(join('/digital-twins/evaluate'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ components: JSON.parse(designKey), twin_id: savedId }),
+          signal: ac.signal,
+        });
+        if (!r.ok) throw new Error(String(r.status));
+        setSimPed(await r.json());
+        setSimPedState('idle');
+      } catch (e) {
+        if ((e as Error).name !== 'AbortError') setSimPedState('error');
+      }
+    }, 900);
+    return () => { ac.abort(); window.clearTimeout(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [designKey, savedId, apiBase]);
+
+  const ped = useMemo(() => {
+    const est = calcPedMetrics();
+    if (!simPed || simPedState === 'loading') return { ...est, simulated: false, heatDemandMwh: 0, totalEnergyRatio: null as number | null };
+    const a = simPed.annual_mwh;
+    const annualGenMwh = a.total_gen_mwh ?? 0;
+    const annualLoadMwh = a.total_demand_mwh ?? 0;
+    const gridImportMwh = a.grid_purchase_mwh ?? 0;
+    const gridExportMwh = a.export_delivered_mwh ?? 0;
+    const netBalance = annualGenMwh - annualLoadMwh;
+    const gridEmissionFactor = 0.14; // kg CO2/kWh Denmark grid
+    return {
+      ...est,
+      annualGenMwh, annualLoadMwh, netBalance, gridImportMwh, gridExportMwh,
+      ratio: simPed.ped_ratio,
+      isPed: annualLoadMwh > 0 && netBalance >= 0,
+      selfSufficiencyRate: simPed.self_sufficiency_ratio ?? 0,
+      co2Savings: (annualLoadMwh - gridImportMwh) * 1000 * gridEmissionFactor,
+      shortfallKw: netBalance >= 0 ? 0 : -netBalance * 1000 / Math.max(simPed.solar_kwh_per_kwp, 1),
+      heatDemandMwh: a.heat_demand_mwh ?? 0,
+      totalEnergyRatio: simPed.total_energy_ped_ratio,
+      simulated: true,
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [components, simPed, simPedState]);
+
+  // Start an empty, unsaved design (the open twin stays saved as it was)
+  const newDesign = () => {
+    if (components.length > 0 && !confirm('Start a new design? Unsaved changes to the current design are lost (saved twins are kept).')) return;
+    setComponents([]);
+    setConnections([]);
+    setSelectedId(null);
+    setConnectingFrom(null);
+    setSavedId(null);
+    setConfigName('New design');
+    setMobilePanel('palette');
   };
 
   // Persist the current design: PATCH the saved twin, or POST a new one (also
   // when the saved twin no longer exists). Returns the backend id.
-  const persistTwin = async (): Promise<{ ok: true; id: string } | { ok: false; error: string }> => {
+  const persistTwin = async (): Promise<{ ok: true; id: string; copiedAs?: string } | { ok: false; error: string }> => {
     const payload = {
       name: configName,
       description: `Digital twin with ${components.length} components`,
@@ -873,7 +988,29 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
-    let r = savedId ? await send(join(`/digital-twins/${encodeURIComponent(savedId)}`), 'PATCH') : null;
+    const fetchTwins = async (): Promise<(DigitalTwinConfig & { description?: string | null })[]> => {
+      try { const res = await fetch(join('/digital-twins')); return res.ok ? await res.json() : []; } catch { return []; }
+    };
+    let targetId = savedId;
+    if (!targetId) {
+      // Running an unchanged template or design again reuses its saved twin instead of adding a duplicate
+      const same = (await fetchTwins()).find(t => t.name === payload.name && t.description !== REFERENCE_MARKER && sameDesign(t, payload));
+      if (same) targetId = same.id;
+    }
+    let r = targetId ? await send(join(`/digital-twins/${encodeURIComponent(targetId)}`), 'PATCH') : null;
+    if (r && r.status === 409 && targetId) {
+      // Read-only paper reference: unchanged → use it as is; changed → save a copy
+      const ref = (await fetchTwins()).find(t => t.id === targetId);
+      if (ref && sameDesign(ref, payload)) { setSavedId(targetId); return { ok: true, id: targetId }; }
+      const copyName = `${configName.replace(/ \(copy\)$/, '')} (copy)`;
+      r = await fetch(join('/digital-twins'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...payload, name: copyName }) });
+      if (r.ok) {
+        setConfigName(copyName);
+        const data = await r.json();
+        setSavedId(String(data.id));
+        return { ok: true, id: String(data.id), copiedAs: copyName };
+      }
+    }
     if (!r || r.status === 404) r = await send(join('/digital-twins'), 'POST');
     if (!r.ok) return { ok: false, error: await r.text() };
     const data = await r.json();
@@ -890,7 +1027,9 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
       const res = await persistTwin();
       if (res.ok) {
         const n = scenarios.filter(sc => sc.digital_twin_id === res.id).length;
-        notify(n ? `Digital twin saved — ${n} linked scenario${n > 1 ? 's' : ''} updated.` : 'Digital twin saved.');
+        notify(res.copiedAs
+          ? `Paper reference designs are read-only — your changes were saved as “${res.copiedAs}”.`
+          : n ? `Digital twin saved — ${n} linked scenario${n > 1 ? 's' : ''} updated.` : 'Digital twin saved — find it under Designs ▾ → My twins.');
       } else {
         notify('Save failed: ' + res.error, 'error');
       }
@@ -1029,7 +1168,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
   const TEMPLATES: Record<string, { name: string; components: DTComponent[]; connections: DTConnection[] }> = {
     // Paper Scenario 1: Baseline - existing rooftop PV only, no battery
     scenario_1_baseline: {
-      name: 'Scenario 1: Baseline',
+      name: 'Office · 30 kWp PV (S1 design)',
       components: [
         { id: 'bld-1', type: 'smart_building', name: 'Office Building', x: 300, y: 180, params: { floors: 5, area_m2: 2000, load_kw: 150, flexible_load_pct: 0 } },
         { id: 'pv-1', type: 'solar_pv', name: 'Existing Rooftop PV', x: 300, y: 60, params: { capacity_kwp: 30, tilt_deg: 15, azimuth_deg: 180, efficiency: 0.18 } },
@@ -1044,7 +1183,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     },
     // Paper Scenario 2: High PV Deployment - maximized rooftop PV (~171 kWp)
     scenario_2_high_pv: {
-      name: 'Scenario 2: High PV',
+      name: 'Office · 171 kWp PV (S2 design)',
       components: [
         { id: 'bld-1', type: 'smart_building', name: 'Office Building', x: 300, y: 180, params: { floors: 5, area_m2: 2000, load_kw: 150, flexible_load_pct: 0 } },
         { id: 'pv-1', type: 'solar_pv', name: 'Maximized Rooftop PV', x: 300, y: 60, params: { capacity_kwp: 171, tilt_deg: 15, azimuth_deg: 180, efficiency: 0.20 } },
@@ -1060,11 +1199,11 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     },
     // Paper Scenario 3: High PV + Battery (4h) - 171 kWp + 320 kWh battery
     scenario_3_pv_battery: {
-      name: 'Scenario 3: PV + Battery (4h)',
+      name: 'Office · PV + 320 kWh battery (S3 design)',
       components: [
         { id: 'bld-1', type: 'smart_building', name: 'Office Building', x: 300, y: 180, params: { floors: 5, area_m2: 2000, load_kw: 150, flexible_load_pct: 0 } },
         { id: 'pv-1', type: 'solar_pv', name: 'Rooftop PV (171 kWp)', x: 300, y: 60, params: { capacity_kwp: 171, tilt_deg: 15, azimuth_deg: 180, efficiency: 0.20 } },
-        { id: 'bat-1', type: 'battery_storage', name: 'Battery 4h (320 kWh)', x: 450, y: 100, params: { capacity_kwh: 320, power_kw: 80, efficiency: 0.92, initial_soc: 0.5 } },
+        { id: 'bat-1', type: 'battery_storage', name: 'Battery 4h (320 kWh)', x: 450, y: 100, params: { capacity_kwh: 320, power_kw: 80, efficiency: 0.9, initial_soc: 0.5 } },
         { id: 'dh-1', type: 'district_heating', name: 'District Heating', x: 150, y: 180, params: { supply_temp_c: 70, return_temp_c: 40, capacity_kw: 200 } },
         { id: 'grid-1', type: 'smart_grid', name: 'Grid (DK2)', x: 450, y: 260, params: { import_limit_kw: 500, export_limit_kw: 171, tariff_type: 'dynamic' } },
       ],
@@ -1078,11 +1217,11 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     },
     // Paper Scenario 4: High PV + Large Battery - 171 kWp + 640 kWh battery
     scenario_4_large_battery: {
-      name: 'Scenario 4: PV + Large Battery',
+      name: 'Office · PV + 640 kWh battery (S4 design)',
       components: [
         { id: 'bld-1', type: 'smart_building', name: 'Office Building', x: 300, y: 180, params: { floors: 5, area_m2: 2000, load_kw: 150, flexible_load_pct: 0 } },
         { id: 'pv-1', type: 'solar_pv', name: 'Rooftop PV (171 kWp)', x: 300, y: 60, params: { capacity_kwp: 171, tilt_deg: 15, azimuth_deg: 180, efficiency: 0.20 } },
-        { id: 'bat-1', type: 'battery_storage', name: 'Large Battery (640 kWh)', x: 450, y: 100, params: { capacity_kwh: 640, power_kw: 160, efficiency: 0.92, initial_soc: 0.5 } },
+        { id: 'bat-1', type: 'battery_storage', name: 'Large Battery (640 kWh)', x: 450, y: 100, params: { capacity_kwh: 640, power_kw: 160, efficiency: 0.9, initial_soc: 0.5 } },
         { id: 'dh-1', type: 'district_heating', name: 'District Heating', x: 150, y: 180, params: { supply_temp_c: 70, return_temp_c: 40, capacity_kw: 200 } },
         { id: 'grid-1', type: 'smart_grid', name: 'Grid (DK2)', x: 450, y: 260, params: { import_limit_kw: 500, export_limit_kw: 171, tariff_type: 'dynamic' } },
       ],
@@ -1096,21 +1235,18 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     },
     // Paper Scenario 5: DSM (Flexible Demand) - with demand-side management
     scenario_5_dsm: {
-      name: 'Scenario 5: DSM (Flexible)',
+      name: 'Office · PV + battery + DSM (S5 design)',
       components: [
         { id: 'bld-1', type: 'smart_building', name: 'Smart Office (DSM)', x: 300, y: 180, params: { floors: 5, area_m2: 2000, load_kw: 150, flexible_load_pct: 30 } },
         { id: 'pv-1', type: 'solar_pv', name: 'Rooftop PV (171 kWp)', x: 300, y: 60, params: { capacity_kwp: 171, tilt_deg: 15, azimuth_deg: 180, efficiency: 0.20 } },
-        { id: 'bat-1', type: 'battery_storage', name: 'Battery (320 kWh)', x: 450, y: 100, params: { capacity_kwh: 320, power_kw: 80, efficiency: 0.92, initial_soc: 0.5 } },
-        { id: 'load-1', type: 'load_center', name: 'Flexible Loads', x: 150, y: 100, params: { base_load_kw: 100, peak_load_kw: 150, dsm_enabled: true } },
+        { id: 'bat-1', type: 'battery_storage', name: 'Battery (320 kWh)', x: 450, y: 100, params: { capacity_kwh: 320, power_kw: 80, efficiency: 0.9, initial_soc: 0.5 } },
         { id: 'dh-1', type: 'district_heating', name: 'District Heating', x: 150, y: 260, params: { supply_temp_c: 70, return_temp_c: 40, capacity_kw: 200 } },
         { id: 'grid-1', type: 'smart_grid', name: 'Grid (DK2)', x: 450, y: 260, params: { import_limit_kw: 500, export_limit_kw: 171, tariff_type: 'dynamic' } },
       ],
       connections: [
         { id: 'c1', from: 'pv-1', to: 'bld-1', type: 'electricity', capacity_kw: 100 },
         { id: 'c2', from: 'pv-1', to: 'bat-1', type: 'electricity', capacity_kw: 80 },
-        { id: 'c3', from: 'pv-1', to: 'load-1', type: 'electricity', capacity_kw: 50 },
         { id: 'c4', from: 'bat-1', to: 'bld-1', type: 'electricity', capacity_kw: 80 },
-        { id: 'c5', from: 'load-1', to: 'bld-1', type: 'electricity', capacity_kw: 100 },
         { id: 'c6', from: 'grid-1', to: 'bld-1', type: 'electricity', capacity_kw: 500 },
         { id: 'c7', from: 'dh-1', to: 'bld-1', type: 'heat', capacity_kw: 200 },
       ]
@@ -1266,7 +1402,8 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
     const msg = users.length
       ? `Delete “${t.name}”? ${users.length} scenario${users.length > 1 ? 's' : ''} (${users.map(u => u.name).join(', ')}) will keep their current sizes but no longer follow this twin.`
       : `Delete “${t.name}”? This cannot be undone.`;
-    if (!confirm(msg)) return;
+    const withData = `${msg} Measured data uploaded for its components is deleted too.`;
+    if (!confirm(withData)) return;
     const r = await fetch(join(`/digital-twins/${encodeURIComponent(t.id)}`), { method: 'DELETE' });
     if (!r.ok) { notify('Delete failed: ' + (await r.text()), 'error'); return; }
     if (t.id === savedId) setSavedId(null); // the design stays on the canvas, unsaved
@@ -1433,7 +1570,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
 
           <div className="bn-ped">
             <div className="row between">
-              <span className="bn-ped-title">Quick PED estimate</span>
+              <span className="bn-ped-title">{ped.simulated ? 'PED (simulated)' : simPedState === 'loading' ? 'PED · simulating…' : 'Quick PED estimate'}</span>
               <span className={`badge ${ped.isPed ? 'badge-live' : ped.annualLoadMwh > 0 ? 'badge-bad' : 'badge-idle'}`}>
                 {ped.annualLoadMwh > 0 ? (ped.isPed ? 'PED' : `${(ped.ratio * 100).toFixed(0)}%`) : 'No load'}
               </span>
@@ -1453,13 +1590,19 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
                   <dt>Balance</dt><dd className={ped.netBalance >= 0 ? 'tone-good' : 'tone-bad'}>{ped.netBalance >= 0 ? '+' : ''}{ped.netBalance.toFixed(0)} MWh/y</dd>
                   <dt>Self-sufficiency</dt><dd>{(ped.selfSufficiencyRate * 100).toFixed(0)}%</dd>
                   <dt>Grid import / export</dt><dd>{ped.gridImportMwh.toFixed(0)} / {ped.gridExportMwh.toFixed(0)} MWh</dd>
+                  {ped.simulated && (ped.heatDemandMwh ?? 0) > 0 && <><dt>Heat demand</dt><dd>{(ped.heatDemandMwh ?? 0).toFixed(0)} MWh/y</dd></>}
+                  {ped.simulated && ped.totalEnergyRatio != null && <><dt>PED ratio, all energy</dt><dd className={ped.totalEnergyRatio >= 1 ? 'tone-good' : 'tone-bad'}>{ped.totalEnergyRatio.toFixed(2)}</dd></>}
                   <dt>Est. CAPEX</dt><dd>€{(ped.totalCapex / 1000).toFixed(0)}k</dd>
                   <dt>CO₂ avoided</dt><dd>{(ped.co2Savings / 1000).toFixed(1)} t/y</dd>
                 </dl>
                 {!ped.isPed && ped.shortfallKw > 0 && (
                   <div className="bn-tip">Roughly <b>{ped.shortfallKw.toFixed(0)} kWp</b> more PV would close the gap.</div>
                 )}
-                <p className="bn-fine">Rule-of-thumb figures. Run a simulation, or ask the Copilot, for results based on real 10-minute data.</p>
+                <p className="bn-fine">
+                  {ped.simulated
+                    ? `Every component simulated on 10-minute DK2 data, averaged over 2015–2024${simPed?.uploaded_series ? `, with ${simPed.uploaded_series} measured series` : ''}. Consumption includes heat pumps and EV charging; CAPEX is a rule of thumb.`
+                    : simPedState === 'error' ? 'Simulation unavailable; showing rule-of-thumb figures.' : 'Rule-of-thumb figures while the design is simulated…'}
+                </p>
               </>
             ) : (
               <p className="muted small">Add a building or load centre to estimate the annual energy balance.</p>
@@ -1472,25 +1615,50 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
           <div className="dt-toolbar bn-toolbar">
             <input className="bn-title" value={configName} onChange={e => setConfigName(e.target.value)} aria-label="Design name" />
             <span className="dt-toolbar-info bn-chip">{components.length} components · {connections.length} links</span>
+            {savedIsReference && (
+              <span className="bn-chip" title="Saving or running with changes creates a copy; the paper scenario keeps this design">Paper reference · read-only</span>
+            )}
             {apiBase && usedBy(savedId).length > 0 && (
               <span className="bn-chip bn-chip-accent" title={`Saving this twin updates: ${usedBy(savedId).map(sc => sc.name).join(', ')}`}>
                 Used by {usedBy(savedId).length === 1 ? usedBy(savedId)[0].name : `${usedBy(savedId).length} scenarios`}
               </span>
             )}
             <div className="bn-toolbar-right">
+              <button className="btn btn-secondary btn-sm" onClick={newDesign} title="Start an empty design">+ New</button>
               <div className="bn-menu">
-                <button className="btn btn-secondary btn-sm" onClick={() => setTemplatesOpen(o => !o)} aria-expanded={templatesOpen}>Designs ▾</button>
+                <button className="btn btn-secondary btn-sm" onClick={() => { if (!templatesOpen && apiBase) loadSavedTwins(); setTemplatesOpen(o => !o); }} aria-expanded={templatesOpen}>Designs ▾</button>
                 {templatesOpen && (
                   <div className="bn-menu-pop" role="menu">
-                    {apiBase && (
-                      <>
-                        <button role="menuitem" className="bn-menu-item" onClick={() => { setTemplatesOpen(false); showOpenDialog(); }}>
-                          <span>Open saved twin…</span>
-                          <span className="muted small">Continue editing a design you saved</span>
+                    <button role="menuitem" className="bn-menu-item" onClick={() => { setTemplatesOpen(false); newDesign(); }}>
+                      <span>New blank design</span>
+                      <span className="muted small">Start from an empty canvas</span>
+                    </button>
+                    {apiBase && (() => {
+                      const mine = (savedTwins ?? []).filter(t => !isReference(t));
+                      const refs = (savedTwins ?? []).filter(t => isReference(t)).sort((a, b) => a.name.localeCompare(b.name));
+                      const item = (t: DigitalTwinConfig & { updated_at?: string }) => (
+                        <button key={t.id} role="menuitem" className="bn-menu-item" onClick={() => { setTemplatesOpen(false); openSavedTwin(t); }}>
+                          <span>{t.name}{t.id === savedId && <span className="badge badge-accent">Open</span>}</span>
+                          <span className="muted small">{formatTwinSummary(twinSummary(t))}</span>
                         </button>
-                        <div className="bn-menu-sep" />
-                      </>
-                    )}
+                      );
+                      return (
+                        <>
+                          <div className="bn-group-title">My twins</div>
+                          {savedTwins === null ? <div className="bn-menu-note muted small">Loading…</div>
+                            : mine.length === 0 ? <div className="bn-menu-note muted small">None yet — design one and press Save twin.</div>
+                            : mine.slice(0, 8).map(item)}
+                          {refs.length > 0 && <div className="bn-group-title">Paper references (read-only)</div>}
+                          {refs.map(item)}
+                          <button role="menuitem" className="bn-menu-item" onClick={() => { setTemplatesOpen(false); showOpenDialog(); }}>
+                            <span>Manage saved twins…</span>
+                            <span className="muted small">{mine.length > 8 ? `All ${mine.length} twins · ` : ''}Rename, delete, see which scenarios use them</span>
+                          </button>
+                          <div className="bn-menu-sep" />
+                          <div className="bn-group-title bn-group-title-strong">Start from a template</div>
+                        </>
+                      );
+                    })()}
                     {TEMPLATE_MENU.map(g => (
                       <div key={g.group}>
                         <div className="bn-group-title">{g.group}</div>
@@ -1509,7 +1677,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
                       <input type="file" accept=".json" onChange={e => { setTemplatesOpen(false); importConfig(e); }} style={{ display: 'none' }} />
                     </label>
                     {apiBase && <button className="bn-menu-item" disabled={components.length === 0} onClick={() => { setTemplatesOpen(false); createScenarioFromDT(); }}><span>Create scenario from design</span></button>}
-                    <button className="bn-menu-item bn-danger" onClick={() => { setTemplatesOpen(false); clearAll(); }}><span>Clear canvas</span></button>
+
                   </div>
                 )}
               </div>
@@ -1702,7 +1870,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
                 </label>
                 <div className="bn-section">Parameters</div>
                 <div className="bn-fields">
-                  {Object.entries(selectedComp.params).map(([key, val]) => {
+                  {Object.entries({ ...simDefaults(selectedComp.type), ...selectedComp.params }).map(([key, val]) => {
                     const meta = paramMeta(key);
                     return (
                       <label key={key} className={`field ${typeof val === 'boolean' ? 'field-inline' : ''}`}>
@@ -1727,6 +1895,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
                     );
                   })}
                 </div>
+                <ComponentData apiBase={apiBase || resolveApiBase()} twinId={savedId} readOnly={savedIsReference} component={selectedComp} />
                 <div className="bn-section">Links ({links.length})</div>
                 {links.length === 0 ? (
                   <p className="muted small">Not connected yet. Use <b>Connect</b> or the <b>+</b> port on the card.</p>
@@ -1764,6 +1933,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
                   <span className="muted">→</span>
                   {toComp && <span className="bn-conn-end" style={{ ['--tc' as string]: COMPONENT_DEFS[toComp.type].color }}><DeviceIcon type={toComp.type} size={16} />{toComp.name}</span>}
                 </div>
+                <p className="muted small">Links document the layout. The simulation pools all electricity and all heat of the site (one bus each), so a link does not limit or route flows.</p>
                 <div className="field">
                   <span className="field-label">Carrier</span>
                   <div className="segmented">
@@ -1827,7 +1997,7 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
                 return (
                   <div key={t.id} className={`bn-twin-row ${t.id === savedId ? 'is-current' : ''}`}>
                     <div className="bn-twin-main">
-                      <strong>{t.name}{t.id === savedId && <span className="badge badge-accent">Open</span>}</strong>
+                      <strong>{t.name}{t.id === savedId && <span className="badge badge-accent">Open</span>}{isReference(t) && <span className="badge">Paper reference · read-only</span>}</strong>
                       <span className="muted small">{formatTwinSummary(twinSummary(t))}</span>
                       <span className="muted small">
                         Saved {new Date(t.updated_at || t.created_at).toLocaleString(undefined, { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
@@ -1836,8 +2006,10 @@ export function DigitalTwinBuilder({ onConfigChange, initialConfig, apiBase, onR
                     </div>
                     <div className="bn-twin-actions">
                       <button className="btn btn-primary btn-sm" onClick={() => openSavedTwin(t)}>Open</button>
-                      <button className="btn btn-ghost btn-sm" onClick={() => renameSavedTwin(t)}>Rename</button>
-                      <button className="btn btn-ghost btn-sm btn-danger" onClick={() => deleteSavedTwin(t)}>Delete</button>
+                      {!isReference(t) && <>
+                        <button className="btn btn-ghost btn-sm" onClick={() => renameSavedTwin(t)}>Rename</button>
+                        <button className="btn btn-ghost btn-sm btn-danger" onClick={() => deleteSavedTwin(t)}>Delete</button>
+                      </>}
                     </div>
                   </div>
                 );

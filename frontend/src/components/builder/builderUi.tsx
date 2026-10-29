@@ -115,38 +115,46 @@ export const PALETTE_GROUPS: { title: string; types: DTComponentType[] }[] = [
 type ParamMeta = { label: string; unit?: string; step?: number; min?: number; max?: number; hint?: string; options?: { value: string; label: string }[] };
 
 export const PARAM_META: Record<string, ParamMeta> = {
-  floors: { label: 'Floors', step: 1, min: 1, max: 30 },
-  area_m2: { label: 'Floor area', unit: 'm²', step: 50, min: 0 },
-  load_kw: { label: 'Peak electric load', unit: 'kW', step: 5, min: 0, hint: 'Used for the annual demand estimate' },
+  floors: { label: 'Floors', step: 1, min: 1, max: 30, hint: 'Informational (not used in the simulation)' },
+  area_m2: { label: 'Heated floor area', unit: 'm²', step: 50, min: 0, hint: 'Annual heat demand = area × specific heat demand' },
+  heat_demand_kwh_m2: { label: 'Specific heat demand', unit: 'kWh/m²·yr', step: 5, min: 0, hint: 'Space heating + hot water; follows outdoor temperature (degree hours, base 17 °C)' },
+  load_profile: { label: 'Demand profile', options: [{ value: 'dk2', label: 'DK2 regional shape' }, { value: 'office', label: 'Office' }, { value: 'residential', label: 'Residential' }, { value: 'commercial', label: 'Commercial / retail' }, { value: 'industrial', label: 'Industrial (two shifts)' }], hint: 'Shape of the synthetic profile when no meter data is uploaded' },
+  load_kw: { label: 'Peak electric load', unit: 'kW', step: 5, min: 0, hint: 'Electricity demand excluding heating; the profile is scaled to this peak' },
   flexible_load_pct: { label: 'Flexible load', unit: '%', step: 5, min: 0, max: 100, hint: 'Share of demand that can be shifted (DSM)' },
   capacity_kwp: { label: 'Capacity', unit: 'kWp', step: 5, min: 0 },
-  tilt_deg: { label: 'Tilt', unit: '°', step: 1, min: 0, max: 90 },
-  azimuth_deg: { label: 'Azimuth', unit: '°', step: 5, min: 0, max: 360, hint: '180° = facing south' },
-  efficiency: { label: 'Efficiency', unit: '0–1', step: 0.01, min: 0, max: 1 },
+  tilt_deg: { label: 'Tilt', unit: '°', step: 1, min: 0, max: 90, hint: 'Informational: synthetic output follows the measured DK2 PV fleet; upload inverter data for this exact array' },
+  azimuth_deg: { label: 'Azimuth', unit: '°', step: 5, min: 0, max: 360, hint: '180° = facing south (informational, like tilt)' },
+  efficiency: { label: 'Efficiency', unit: '0–1', step: 0.01, min: 0, max: 1, hint: 'Battery: round trip. PV: module efficiency (informational; output is set by kWp)' },
   capacity_kwh: { label: 'Energy capacity', unit: 'kWh', step: 10, min: 0 },
   power_kw: { label: 'Power rating', unit: 'kW', step: 5, min: 0 },
   initial_soc: { label: 'Initial state of charge', unit: '0–1', step: 0.05, min: 0, max: 1 },
-  capacity_kw: { label: 'Capacity', unit: 'kW', step: 5, min: 0 },
-  hub_height_m: { label: 'Hub height', unit: 'm', step: 1, min: 0 },
-  rotor_diameter_m: { label: 'Rotor diameter', unit: 'm', step: 1, min: 0 },
-  supply_temp_c: { label: 'Supply temperature', unit: '°C', step: 1 },
-  return_temp_c: { label: 'Return temperature', unit: '°C', step: 1 },
-  import_limit_kw: { label: 'Import limit', unit: 'kW', step: 10, min: 0 },
-  export_limit_kw: { label: 'Export limit', unit: 'kW', step: 10, min: 0 },
-  tariff_type: { label: 'Tariff', options: [{ value: 'dynamic', label: 'Dynamic (spot)' }, { value: 'time_of_use', label: 'Time of use' }, { value: 'fixed', label: 'Fixed' }] },
+  capacity_kw: { label: 'Capacity', unit: 'kW', step: 5, min: 0, hint: 'Heat pump / district heating: heat output. Wind: rated power' },
+  hub_height_m: { label: 'Hub height', unit: 'm', step: 1, min: 0, hint: 'Informational: synthetic output follows the measured DK2 onshore wind fleet' },
+  rotor_diameter_m: { label: 'Rotor diameter', unit: 'm', step: 1, min: 0, hint: 'Informational (like hub height)' },
+  cut_in_speed: { label: 'Cut-in speed', unit: 'm/s', step: 0.5, min: 0, hint: 'Informational (like hub height)' },
+  supply_temp_c: { label: 'Supply temperature', unit: '°C', step: 1, hint: 'Informational (not used in the simulation)' },
+  return_temp_c: { label: 'Return temperature', unit: '°C', step: 1, hint: 'Informational (not used in the simulation)' },
+  import_limit_kw: { label: 'Import limit', unit: 'kW', step: 10, min: 0, hint: '0 = no limit. Hours above the limit are reported' },
+  export_limit_kw: { label: 'Export limit', unit: 'kW', step: 10, min: 0, hint: '0 = no limit. Surplus above the limit is curtailed' },
+  tariff_type: { label: 'Tariff', options: [{ value: 'dynamic', label: 'Dynamic (spot)' }, { value: 'time_of_use', label: 'Time of use' }, { value: 'tou', label: 'Time of use' }, { value: 'fixed', label: 'Fixed' }], hint: 'Price of the synthetic profile: DK2 spot, yearly average, or average with a 17–21 h peak' },
   num_ports: { label: 'Charging ports', step: 1, min: 1 },
   power_per_port_kw: { label: 'Power per port', unit: 'kW', step: 1, min: 0 },
-  v2g_enabled: { label: 'Vehicle-to-grid' },
-  cop: { label: 'COP', step: 0.1, min: 1, hint: 'Coefficient of performance' },
+  kwh_per_port_day: { label: 'Energy per port', unit: 'kWh/day', step: 1, min: 0, hint: 'Average energy charged per port on a weekday' },
+  usage_profile: { label: 'Usage', options: [{ value: 'workplace', label: 'Workplace (morning arrivals)' }, { value: 'residential', label: 'Residential (evening arrivals)' }, { value: 'public', label: 'Public (all day)' }] },
+  smart_charging: { label: 'Smart charging', hint: 'Charging may move up to the DSM window to use on-site surplus' },
+  v2g_enabled: { label: 'Vehicle-to-grid', hint: 'Not simulated yet (cars do not discharge)' },
+  cop: { label: 'COP (rated)', step: 0.1, min: 1, hint: 'At A7/W35 (air), B0/W35 (ground), W10/W35 (water); air-source COP varies with outdoor temperature' },
   type: { label: 'Source', options: [{ value: 'air_source', label: 'Air source' }, { value: 'ground_source', label: 'Ground source' }, { value: 'water_source', label: 'Water source' }] },
   electrical_kw: { label: 'Electrical output', unit: 'kWe', step: 5, min: 0 },
-  thermal_kw: { label: 'Thermal output', unit: 'kWth', step: 5, min: 0 },
-  fuel: { label: 'Fuel', options: [{ value: 'biogas', label: 'Biogas' }, { value: 'natural_gas', label: 'Natural gas' }, { value: 'biomass', label: 'Biomass' }, { value: 'hydrogen', label: 'Hydrogen' }] },
-  max_temp_c: { label: 'Max temperature', unit: '°C', step: 1 },
+  thermal_kw: { label: 'Thermal output', unit: 'kWth', step: 5, min: 0, hint: 'Heat-led: runs to cover heat demand; electricity follows the kWe/kWth ratio' },
+  efficiency_e: { label: 'Electrical efficiency', unit: '0–1', step: 0.01, min: 0.05, max: 1, hint: 'Sets the fuel use (fuel = electricity ÷ efficiency)' },
+  efficiency_th: { label: 'Thermal efficiency', unit: '0–1', step: 0.01, min: 0, max: 1, hint: 'Informational; the heat/power ratio comes from the outputs' },
+  fuel: { label: 'Fuel', options: [{ value: 'biogas', label: 'Biogas' }, { value: 'natural_gas', label: 'Natural gas' }, { value: 'biomass', label: 'Biomass' }, { value: 'hydrogen', label: 'Hydrogen' }], hint: 'Fuel is counted as imported energy' },
+  max_temp_c: { label: 'Max temperature', unit: '°C', step: 1, hint: 'Informational; capacity is given in kWh' },
   loss_pct_day: { label: 'Standing loss', unit: '%/day', step: 0.1, min: 0 },
-  base_load_kw: { label: 'Base load', unit: 'kW', step: 5, min: 0 },
+  base_load_kw: { label: 'Base load', unit: 'kW', step: 5, min: 0, hint: 'Lowest demand; the profile runs between base and peak' },
   peak_load_kw: { label: 'Peak load', unit: 'kW', step: 5, min: 0 },
-  dsm_enabled: { label: 'Demand-side management' },
+  dsm_enabled: { label: 'Demand-side management', hint: 'Makes the flexible share shiftable' },
 };
 
 export function paramMeta(key: string): ParamMeta {
@@ -166,7 +174,10 @@ export function specLine(type: DTComponentType, p: Record<string, unknown>): str
     case 'battery_storage': return `${n(p.capacity_kwh)} kWh · ${n(p.power_kw)} kW`;
     case 'wind_turbine': return `${n(p.capacity_kw)} kW · ${n(p.hub_height_m)} m hub`;
     case 'district_heating': return `${n(p.capacity_kw)} kW · ${n(p.supply_temp_c)}/${n(p.return_temp_c)} °C`;
-    case 'smart_grid': return `↓${n(p.import_limit_kw)} ↑${n(p.export_limit_kw)} kW`;
+    case 'smart_grid': {
+      const lim = (v: unknown) => (Number(v) > 0 ? `${n(v)} kW` : 'no limit');
+      return `↓ ${lim(p.import_limit_kw)} · ↑ ${lim(p.export_limit_kw)}`;
+    }
     case 'ev_charger': return `${n(p.num_ports)} × ${n(p.power_per_port_kw)} kW${p.v2g_enabled ? ' · V2G' : ''}`;
     case 'heat_pump': return `${n(p.capacity_kw)} kW · COP ${n(p.cop)}`;
     case 'chp_unit': return `${n(p.electrical_kw)} kWe · ${n(p.thermal_kw)} kWth`;

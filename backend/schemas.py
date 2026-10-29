@@ -82,6 +82,10 @@ class RunCompareRequest(BaseModel):
         True,
         description="If true, truncate every run to the minimum available step count.",
     )
+    full_period: bool = Field(
+        False,
+        description="Compare the whole dataset period of every run (no live session needed).",
+    )
 
 
 class RunCompareRow(BaseModel):
@@ -98,6 +102,12 @@ class RunCompareRow(BaseModel):
     total_demand_mwh: Optional[float] = None
     ped_absolute_mwh: Optional[float] = None
     ped_ratio: Optional[float] = None
+    total_energy_ped_ratio: Optional[float] = None
+    self_sufficiency_ratio: Optional[float] = None
+    grid_purchase_mwh: Optional[float] = None
+    export_delivered_mwh: Optional[float] = None
+    heat_demand_mwh: Optional[float] = None
+    design: Optional[str] = None
 
 
 class RunCompareResponse(BaseModel):
@@ -185,3 +195,40 @@ class DigitalTwinUpdate(BaseModel):
     description: Optional[str] = None
     components: Optional[list[DTComponentSchema]] = None
     connections: Optional[list[DTConnectionSchema]] = None
+
+
+class ComponentRef(BaseModel):
+    """Component as currently edited (may be newer than the saved twin)."""
+
+    type: str
+    params: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ProfileUpload(BaseModel):
+    # Two-column CSV (time, value) as text, or gzip-compressed and base64-encoded
+    csv_text: Optional[str] = None
+    csv_gzip_b64: Optional[str] = None
+    filename: Optional[str] = Field(None, max_length=200)
+    unit: str = 'kW'
+    time_column: Optional[str] = None
+    value_column: Optional[str] = None
+    timezone: str = 'local'
+    scale: bool = True
+    component: Optional[ComponentRef] = None
+
+
+class ProfileSettings(BaseModel):
+    scale: Optional[bool] = None
+
+
+class SyntheticPreviewRequest(BaseModel):
+    component: ComponentRef
+    channel: str
+    year: Optional[int] = None
+
+
+class TwinEvaluateRequest(BaseModel):
+    """A design as currently edited; ``twin_id`` lets saved uploads take part."""
+
+    components: list[Dict[str, Any]] = Field(default_factory=list)
+    twin_id: Optional[str] = None
