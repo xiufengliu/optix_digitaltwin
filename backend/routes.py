@@ -1077,7 +1077,7 @@ async def upload_component_data(dt_id: str, component_id: str, channel: str, pay
     import base64
     import gzip
 
-    from . import profile_store
+    from . import data_review, profile_store
     from .components import params_of
 
     with session_scope() as db:
@@ -1097,12 +1097,38 @@ async def upload_component_data(dt_id: str, component_id: str, channel: str, pay
     else:
         raise HTTPException(status_code=400, detail='The upload is empty')
 
-    def work():
-        series, info = profile_store.parse_upload(
+    is_price = ch.unit == 'DKK/MWh'
+    units = list(profile_store.PRICE_UNITS) if is_price else list(profile_store.POWER_UNITS) + list(profile_store.ENERGY_UNITS)
+
+    def parse(unit: str, tz: str):
+        return profile_store.parse_upload(
             text, time_column=payload.time_column, value_column=payload.value_column,
-            unit=payload.unit, tz=payload.timezone, is_price=ch.unit == 'DKK/MWh',
+            unit=unit, tz=tz, is_price=is_price,
         )
-        if ch.unit != 'DKK/MWh' and float(series.min()) < -1e-6:
+
+    def prepare():
+        series, info = parse(payload.unit, payload.timezone)
+        df = _dataset_frame()
+        context = None
+        if payload.ai_review:
+            from .components import synthetic
+
+            size = ch.size(params_of(comp)) if ch.size else None
+            context = {
+                'component_type': comp.get('type'),
+                'component_parameters': params_of(comp),
+                'channel': ch.label,
+                'stored_unit': ch.unit,
+                'component_size': f'{size:g} {ch.size_label}' if size else None,
+                'filename': (payload.filename or '')[:100],
+                'unit_chosen_by_user': payload.unit,
+                'timezone_chosen_by_user': payload.timezone,
+                'upload': data_review.summarize(series, info, synthetic(df, comp['type'], channel, params_of(comp)), df['timestamp']),
+            }
+        return series, info, df, context
+
+    def finish(series, info, df, unit: str, tz: str, review: dict | None):
+        if not is_price and float(series.min()) < -1e-6:
             raise profile_store.UploadError('Values must not be negative (power in kW)')
         ref = ch.size(params_of(comp)) if ch.size else None
         meta = {
@@ -1110,23 +1136,43 @@ async def upload_component_data(dt_id: str, component_id: str, channel: str, pay
             'channel': channel,
             'component_type': comp.get('type'),
             'filename': payload.filename,
-            'unit_uploaded': payload.unit,
+            'unit_uploaded': unit,
             'unit': ch.unit,
-            'timezone': payload.timezone,
+            'timezone': tz,
             'ref_size': ref if ref and ref > 0 else None,
             'size_label': ch.size_label,
             'scale': bool(payload.scale),
             'mean': float(series.mean()),
             'max': float(series.max()),
+            'review': review,
         }
-        df = _dataset_frame()
         values, covered = profile_store.align(series, df['timestamp'])
         meta['coverage'] = covered
         meta = profile_store.save(dt_id, component_id, channel, series, meta)
         return {'meta': meta, 'preview': _profile_preview(df, values, ch, None)}
 
     try:
-        return await asyncio.to_thread(work)
+        series, info, df, context = await asyncio.to_thread(prepare)
+        unit, tz, review = payload.unit, payload.timezone, None
+        if context is not None:
+            plan, note = await data_review.review(context, units)
+            if plan is None:
+                review = {'status': 'skipped', 'note': note}
+            elif plan.reject:
+                problems = ' '.join(i.message for i in plan.issues if i.severity == 'error')
+                raise HTTPException(status_code=400, detail=f'AI data check rejected the file: {plan.summary} {problems}'.strip())
+            else:
+                reparse = lambda u, t, unit=unit, tz=tz: parse(u or unit, t or tz)  # noqa: E731
+                series, info, actions = await asyncio.to_thread(data_review.apply, series, info, plan, reparse)
+                unit, tz = plan.unit or unit, plan.timezone or tz
+                review = {
+                    'status': 'checked',
+                    'model': data_review.MODEL,
+                    'summary': plan.summary,
+                    'issues': [i.model_dump() for i in plan.issues],
+                    'actions': actions,
+                }
+        return await asyncio.to_thread(finish, series, info, df, unit, tz, review)
     except profile_store.UploadError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 

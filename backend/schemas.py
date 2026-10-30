@@ -214,6 +214,8 @@ class ProfileUpload(BaseModel):
     value_column: Optional[str] = None
     timezone: str = 'local'
     scale: bool = True
+    # Let Claude check the data and clean it before it is stored
+    ai_review: bool = True
     component: Optional[ComponentRef] = None
 
 

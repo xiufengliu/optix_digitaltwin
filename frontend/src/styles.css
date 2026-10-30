@@ -968,6 +968,13 @@ kbd { font-family: inherit; font-size: 0.72rem; background: var(--surface-2); bo
 .bn-data-form { display: flex; flex-direction: column; gap: 8px; border-top: 1px dashed var(--border); padding-top: 8px; }
 .bn-data-preview { display: flex; flex-direction: column; gap: 6px; border-top: 1px dashed var(--border); padding-top: 8px; }
 .bn-data-error { color: var(--bad); margin: 0; }
+.bn-review summary { cursor: pointer; }
+.bn-review p { margin: 6px 0; }
+.bn-review ul { margin: 4px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 3px; }
+.bn-review li.is-fix::marker { color: var(--accent); }
+.bn-review li.is-warning::marker { color: var(--warn); }
+.bn-review li.is-error::marker { color: var(--bad); }
+.bn-review li.is-info { color: var(--text-muted); }
 .run-item-design { margin: 2px 0 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .compare-kv { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; }
 .compare-kv b { color: var(--text); font-weight: 600; }

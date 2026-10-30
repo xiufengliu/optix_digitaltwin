@@ -140,11 +140,14 @@ def parse_upload(text: str, *, time_column: Optional[str], value_column: Optiona
             raise UploadError(f"No numeric value column found; columns are {cols}")
 
     t, had_offset = _parse_time(df[time_column])
-    v = _to_number(df[value_column], decimal_comma)
-    s = pd.Series(v.to_numpy(dtype=float), index=pd.DatetimeIndex(t)).dropna()
+    v = _to_number(df[value_column], decimal_comma).to_numpy(dtype=float)
+    non_finite = int(np.isinf(v).sum())
+    s = pd.Series(np.where(np.isfinite(v), v, np.nan), index=pd.DatetimeIndex(t)).dropna()
     s = s[s.index.notna()]
     if len(s) < 2:
         raise UploadError("Fewer than two valid rows")
+    skipped = len(df) - len(s)
+    duplicates = int(s.index.duplicated().sum())
     s = s.groupby(level=0).mean().sort_index()
 
     if had_offset:
@@ -183,6 +186,9 @@ def parse_upload(text: str, *, time_column: Optional[str], value_column: Optiona
         "end": str(s.index[-1]),
         "step_minutes": round(step_h * 60, 3),
         "decimal_comma": decimal_comma,
+        "skipped_rows": int(skipped),
+        "non_finite_rows": non_finite,
+        "duplicate_timestamps": duplicates,
     }
     return s, info
 

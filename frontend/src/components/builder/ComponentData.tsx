@@ -42,6 +42,14 @@ interface Meta {
   scale: boolean;
   unit_uploaded: string;
   uploaded_at?: string;
+  review?: Review | null;
+}
+interface Review {
+  status: 'checked' | 'skipped';
+  note?: string;
+  summary?: string;
+  issues?: { severity: 'error' | 'warning' | 'info'; message: string }[];
+  actions?: string[];
 }
 interface Preview {
   year: number;
@@ -216,6 +224,7 @@ function ChannelCard({ apiBase, twinId, readOnly, component, channel, meta, onCh
   const [unit, setUnit] = useState(channel.unit === 'DKK/MWh' ? 'DKK/MWh' : 'kWh');
   const [tz, setTz] = useState('local');
   const [scale, setScale] = useState(true);
+  const [aiReview, setAiReview] = useState(true);
   const isPrice = channel.unit === 'DKK/MWh';
   const base = `/digital-twins/${encodeURIComponent(twinId ?? '')}/components/${encodeURIComponent(component.id)}/data/${channel.key}`;
 
@@ -276,6 +285,7 @@ function ChannelCard({ apiBase, twinId, readOnly, component, channel, meta, onCh
           unit,
           timezone: tz,
           scale,
+          ai_review: aiReview,
           time_column: file.columns[file.timeCol],
           value_column: file.columns[file.valueCol],
           component: { type: component.type, params: component.params },
@@ -329,6 +339,7 @@ function ChannelCard({ apiBase, twinId, readOnly, component, channel, meta, onCh
         <div className="small bn-data-meta">
           <div>{meta.filename || 'Uploaded file'} · {fmt(meta.rows)} rows · {fmt(meta.step_minutes)} min steps</div>
           <div className="muted">{meta.start.slice(0, 10)} → {meta.end.slice(0, 10)}; covers {fmt(meta.coverage * 100)} % of the simulated period, the rest repeats its typical week</div>
+          <ReviewNote review={meta.review} />
           {meta.ref_size != null && (
             <label className="bn-switch small">
               <input type="checkbox" checked={meta.scale} onChange={(e) => void toggleScale(e.target.checked)} />
@@ -395,8 +406,12 @@ function ChannelCard({ apiBase, twinId, readOnly, component, channel, meta, onCh
               <span>Scale with component size</span>
             </label>
           )}
+          <label className="bn-switch small">
+            <input type="checkbox" checked={aiReview} onChange={(e) => setAiReview(e.target.checked)} />
+            <span>Check and clean the data with AI (Claude)</span>
+          </label>
           <div className="bn-data-actions">
-            <button className="btn btn-primary btn-sm" disabled={busy} onClick={() => void upload()}>{busy ? 'Uploading…' : 'Upload'}</button>
+            <button className="btn btn-primary btn-sm" disabled={busy} onClick={() => void upload()}>{busy ? (aiReview ? 'Checking data with AI…' : 'Uploading…') : 'Upload'}</button>
             <button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => setFile(null)}>Cancel</button>
           </div>
         </div>
@@ -429,6 +444,29 @@ function ChannelCard({ apiBase, twinId, readOnly, component, channel, meta, onCh
         </div>
       )}
     </div>
+  );
+}
+
+function ReviewNote({ review }: { review?: Review | null }) {
+  if (!review) return null;
+  if (review.status === 'skipped') return <div className="muted">{review.note}</div>;
+  const issues = review.issues ?? [];
+  const warnings = issues.filter((i) => i.severity !== 'info').length;
+  const actions = review.actions ?? [];
+  return (
+    <details className="bn-review" open={warnings > 0}>
+      <summary>
+        AI data check: {actions.length ? `${actions.length} fix${actions.length > 1 ? 'es' : ''} applied` : 'no changes'}
+        {warnings ? ` · ${warnings} warning${warnings > 1 ? 's' : ''}` : ''}
+      </summary>
+      {review.summary && <p>{review.summary}</p>}
+      {actions.length > 0 && (
+        <ul>{actions.map((a, i) => <li key={i} className="is-fix">{a}</li>)}</ul>
+      )}
+      {issues.length > 0 && (
+        <ul>{issues.map((it, i) => <li key={i} className={`is-${it.severity}`}>{it.message}</li>)}</ul>
+      )}
+    </details>
   );
 }
 
